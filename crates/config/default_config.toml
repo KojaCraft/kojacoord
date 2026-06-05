@@ -1,0 +1,54 @@
+[proxy]
+bind = "0.0.0.0:25565"
+online_mode = true
+compression_threshold = 256
+max_players = 1000
+prevent_proxy_connections = false
+session_timeout_secs = 5
+
+[listeners]
+motd = "KojacoordNetwork"
+# Optional: Use JSON text component for colored/styled MOTD
+# Example: motd_json = { text = "KojacoordNetwork", color = "gold", bold = true }
+# motd_json = """["", {"text": "Kojacoord", "color": "gold"}, {"text": "Network", "color": "yellow"}]"""
+# Optional: Server lore displayed in player hover/sample
+# server_lore = "Welcome to our server!"
+tab_list = "GLOBAL_PING"
+
+[forwarding]
+mode = "bungeecord"
+velocity_secret = "changeme"
+
+[anticheat]
+enabled = true
+max_speed_blocks_per_tick = 0.7
+max_cps = 20
+store_violations = true
+
+[database]
+url = "mysql://root:password@localhost/kojacoord"
+max_connections = 10
+
+[[servers]]
+name = "lobby"
+address = "127.0.0.1:25566"
+restricted = false
+# backend_type = "spigot"  # Options: spigot (default), forge, hybrid
+# --- Shown in the KojaCraft client server selector ---
+display_name = "Lobby"
+motd = "The KojaCraft hub — pick a game to play!"
+game_type = "lobby"
+# modpack = "kojacraft"
+# modpack_version = "1.0.0"
+# max_players = 200
+
+[[servers]]
+name = "survival"
+address = "127.0.0.1:25567"
+backend_type = "spigot"  # Options: spigot (default), forge, hybrid
+display_name = "Survival"
+motd = "Hardcore survival with custom mechanics"
+game_type = "survival"
+modpack = "kojacraft"
+modpack_version = "1.0.0"
+max_players = 100

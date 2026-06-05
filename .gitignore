@@ -1,0 +1,160 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Editor backups
+*~
+.#*
+\#*#
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+/target/
+**/*.o
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+
+# Documentation
+/doc/
+/docs/
+
+# Testing
+*.profraw
+*.profdata
+**/test-results/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.sql
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Configuration (with secrets)
+config.toml
+dashboard.toml
+*.local.toml
+config.local.toml
+config.prod.toml
+config.dev.toml
+.env
+.env.local
+.env.*.local
+secrets/
+*.key
+*.pem
+*.crt
+
+# Plugin files
+plugins/
+*.kpl
+*.dll
+*.so
+*.dylib
+
+# Dashboard UI
+dashboard-ui/node_modules/
+dashboard-ui/.next/
+dashboard-ui/out/
+dashboard-ui/build/
+dashboard-ui/dist/
+
+# Coverage
+*.profraw
+*.profdata
+coverage/
+*.lcov
+.tarpaulin/
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Archive files
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Cache directories
+.cache/
+.cache-*/
+.cargo/
+.rustup/
+
+# Build directories
+build/
+bin/
+obj/
+
+# Release artifacts
+*.tar.gz
+*.zip
+*.msi
+*.dmg
+*.deb
+*.rpm
+
+# Development
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Testing
+.test-results/
+coverage/
+
+# Documentation
+/docs/_build/
+/docs/site/
+
+# Misc
+*.pid
+*.seed
+*.pid.lock
+
+# Kubernetes
+*.kubeconfig
+kubeconfig
+.kube/
+
+# Docker
+.dockerignore.local

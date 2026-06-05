@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kojacoord-proxy
+  namespace: default
+  labels:
+    app: kojacoord-proxy
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kojacoord-proxy
+  template:
+    metadata:
+      labels:
+        app: kojacoord-proxy
+        version: v1
+    spec:
+      containers:
+      - name: kojacoord-proxy
+        image: kojacoord/proxy:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: minecraft
+          containerPort: 25577
+          protocol: TCP
+        - name: server-mgmt
+          containerPort: 8080
+          protocol: TCP
+        - name: http-api
+          containerPort: 8081
+          protocol: TCP
+        env:
+        - name: SQLX_OFFLINE
+          value: "true"
+        - name: RUST_LOG
+          value: "info"
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.toml
+          subPath: config.toml
+        - name: data
+          mountPath: /app/data
+        - name: plugins
+          mountPath: /app/plugins
+        - name: logs
+          mountPath: /app/logs
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: config
+        configMap:
+          name: kojacoord-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: kojacoord-data
+      - name: plugins
+        persistentVolumeClaim:
+          claimName: kojacoord-plugins
+      - name: logs
+        persistentVolumeClaim:
+          claimName: kojacoord-logs
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - kojacoord-proxy
+              topologyKey: kubernetes.io/hostname
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kojacoord-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kojacoord-plugins
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kojacoord-logs
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: standard

@@ -1,0 +1,68 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# CI/CD
+.github/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+target/
+**/*.o
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Configuration with secrets
+config.toml
+config.local.toml
+config.prod.toml
+.env
+*.key
+*.pem
+*.crt
+
+# Plugin files
+plugins/
+*.kpl
+
+# Dashboard UI (will be built separately)
+dashboard-ui/node_modules/
+dashboard-ui/.next/
+dashboard-ui/out/
+dashboard-ui/build/
+
+# Testing
+test-results/
+coverage/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db

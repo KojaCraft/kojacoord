@@ -1,0 +1,161 @@
+mod items;
+pub mod modern_to_v1_8;
+mod safe;
+pub mod v1_6_4_to_v1_12_2;
+pub mod v1_6_4_to_v1_16_5;
+pub mod v1_7_to_v1_8;
+pub mod v1_8_to_modern;
+pub mod v1_8_to_v1_7;
+
+use bytes::Bytes;
+use kojacoord_protocol::ProtocolVersion;
+
+pub enum ConversionResult {
+    Passthrough,
+    Converted(Vec<Bytes>),
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ConversionDirection {
+    ServerToClient {
+        server_proto: u32,
+        client_proto: u32,
+    },
+    ClientToServer {
+        client_proto: u32,
+        server_proto: u32,
+    },
+}
+
+pub struct PacketConverter;
+
+impl PacketConverter {
+    pub fn convert(payload: Bytes, direction: ConversionDirection) -> ConversionResult {
+        safe::guard("convert", move || Self::convert_inner(payload, direction))
+    }
+
+    fn convert_inner(payload: Bytes, direction: ConversionDirection) -> ConversionResult {
+        match direction {
+            ConversionDirection::ServerToClient {
+                server_proto,
+                client_proto,
+            } => match (nearest(server_proto), nearest(client_proto)) {
+                (ProtocolVersion::V1_8, ProtocolVersion::V1_7_10) => {
+                    v1_8_to_v1_7::convert_s2c(payload)
+                },
+                (sv, ProtocolVersion::V1_8)
+                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
+                {
+                    modern_to_v1_8::convert_s2c(payload, server_proto)
+                },
+                (sv, ProtocolVersion::V1_7_10)
+                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
+                {
+                    match modern_to_v1_8::convert_s2c(payload, server_proto) {
+                        ConversionResult::Passthrough => ConversionResult::Passthrough,
+                        ConversionResult::Drop => ConversionResult::Drop,
+                        ConversionResult::Converted(pkts) => {
+                            let mut out = Vec::new();
+                            for pkt in pkts {
+                                match v1_8_to_v1_7::convert_s2c(pkt) {
+                                    ConversionResult::Converted(p2) => out.extend(p2),
+                                    ConversionResult::Passthrough => {},
+                                    ConversionResult::Drop => {},
+                                }
+                            }
+                            if out.is_empty() {
+                                ConversionResult::Drop
+                            } else {
+                                ConversionResult::Converted(out)
+                            }
+                        },
+                    }
+                },
+                (ProtocolVersion::V1_7_10, ProtocolVersion::V1_8) => {
+                    v1_7_to_v1_8::convert_s2c(payload)
+                },
+                (ProtocolVersion::V1_6_4, ProtocolVersion::V1_12_2) => {
+                    v1_6_4_to_v1_12_2::convert_s2c(payload)
+                },
+                (ProtocolVersion::V1_6_4, ProtocolVersion::V1_16_5) => {
+                    v1_6_4_to_v1_16_5::convert_s2c(payload)
+                },
+                _ => ConversionResult::Passthrough,
+            },
+
+            ConversionDirection::ClientToServer {
+                client_proto,
+                server_proto,
+            } => match (nearest(client_proto), nearest(server_proto)) {
+                (ProtocolVersion::V1_7_10, ProtocolVersion::V1_8) => {
+                    v1_7_to_v1_8::convert_c2s(payload)
+                },
+
+                (ProtocolVersion::V1_8, ProtocolVersion::V1_7_10) => {
+                    v1_8_to_v1_7::convert_c2s(payload)
+                },
+                (ProtocolVersion::V1_8, sv)
+                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
+                {
+                    v1_8_to_modern::convert_c2s(payload, server_proto)
+                },
+
+                (ProtocolVersion::V1_7_10, sv)
+                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
+                {
+                    match v1_7_to_v1_8::convert_c2s(payload) {
+                        ConversionResult::Passthrough => ConversionResult::Passthrough,
+                        ConversionResult::Drop => ConversionResult::Drop,
+                        ConversionResult::Converted(pkts) => {
+                            let mut out = Vec::new();
+                            for pkt in pkts {
+                                match v1_8_to_modern::convert_c2s(pkt, server_proto) {
+                                    ConversionResult::Converted(p2) => out.extend(p2),
+                                    ConversionResult::Passthrough => {},
+                                    ConversionResult::Drop => {},
+                                }
+                            }
+                            if out.is_empty() {
+                                ConversionResult::Drop
+                            } else {
+                                ConversionResult::Converted(out)
+                            }
+                        },
+                    }
+                },
+                (ProtocolVersion::V1_6_4, ProtocolVersion::V1_12_2) => {
+                    v1_6_4_to_v1_12_2::convert_c2s(payload)
+                },
+                (ProtocolVersion::V1_6_4, ProtocolVersion::V1_16_5) => {
+                    v1_6_4_to_v1_16_5::convert_c2s(payload)
+                },
+                _ => ConversionResult::Passthrough,
+            },
+        }
+    }
+}
+
+fn nearest(raw: u32) -> ProtocolVersion {
+    kojacoord_protocol::VersionRegistry::nearest(raw)
+}
+
+use bytes::BytesMut;
+use kojacoord_protocol::codec::Encode;
+
+pub(crate) fn build_payload(id: u8, body: &[u8]) -> Bytes {
+    let mut buf = BytesMut::new();
+    kojacoord_protocol::types::VarInt(id as i32)
+        .encode(&mut buf)
+        .unwrap();
+    buf.extend_from_slice(body);
+    buf.freeze()
+}
+
+pub(crate) fn split_id(mut payload: Bytes) -> Option<(u8, Bytes)> {
+    use kojacoord_protocol::codec::Decode;
+    let id = kojacoord_protocol::types::VarInt::decode(&mut payload)
+        .ok()?
+        .0;
+    Some((id as u8, payload))
+}

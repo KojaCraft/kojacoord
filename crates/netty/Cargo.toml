@@ -1,0 +1,17 @@
+[package]
+name = "kojacoord-netty"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+flate2 = { workspace = true }
+aes = { workspace = true }
+cfb-mode = { workspace = true }
+cipher = "0.4"
+kojacoord-protocol = { path = "../protocol" }

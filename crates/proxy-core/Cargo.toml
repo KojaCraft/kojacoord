@@ -1,0 +1,40 @@
+[package]
+name = "kojacoord-proxy-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rsa = { workspace = true }
+reqwest = { workspace = true }
+kojacoord-protocol = { path = "../protocol" }
+kojacoord-netty = { path = "../netty" }
+kojacoord-auth = { workspace = true }
+kojacoord-anticheat = { path = "../anticheat" }
+kojacoord-config = { path = "../config" }
+kojacoord-api = { path = "../api" }
+kojacoord-plugin-system = { path = "../plugin-system" }
+kojacoord-cluster = { path = "../cluster" }
+kojacoord-metrics = { path = "../metrics" }
+sha1 = { version = "0.10", features = ["oid"] }
+flate2 = "1"
+lazy_static = "1"
+dashmap = { workspace = true }
+aes = { workspace = true }
+cfb-mode = { workspace = true }
+cfb8 = "0.8"
+cipher = "0.3"
+sqlx = { version = "0.8", features = ["mysql", "sqlite", "runtime-tokio-rustls", "chrono", "uuid"] }
+chrono = { version = "0.4", features = ["serde"] }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+[build-dependencies]
+anyhow = "1"
