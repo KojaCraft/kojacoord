@@ -44,14 +44,10 @@ impl PacketConverter {
                 (ProtocolVersion::V1_8, ProtocolVersion::V1_7_10) => {
                     v1_8_to_v1_7::convert_s2c(payload)
                 },
-                (sv, ProtocolVersion::V1_8)
-                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
-                {
+                (sv, ProtocolVersion::V1_8) if sv.id() > ProtocolVersion::V1_8.id() => {
                     modern_to_v1_8::convert_s2c(payload, server_proto)
                 },
-                (sv, ProtocolVersion::V1_7_10)
-                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
-                {
+                (sv, ProtocolVersion::V1_7_10) if sv.id() > ProtocolVersion::V1_8.id() => {
                     match modern_to_v1_8::convert_s2c(payload, server_proto) {
                         ConversionResult::Passthrough => ConversionResult::Passthrough,
                         ConversionResult::Drop => ConversionResult::Drop,
@@ -95,15 +91,11 @@ impl PacketConverter {
                 (ProtocolVersion::V1_8, ProtocolVersion::V1_7_10) => {
                     v1_8_to_v1_7::convert_c2s(payload)
                 },
-                (ProtocolVersion::V1_8, sv)
-                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
-                {
+                (ProtocolVersion::V1_8, sv) if sv.id() > ProtocolVersion::V1_8.id() => {
                     v1_8_to_modern::convert_c2s(payload, server_proto)
                 },
 
-                (ProtocolVersion::V1_7_10, sv)
-                    if sv.id() as u32 > ProtocolVersion::V1_8.id() as u32 =>
-                {
+                (ProtocolVersion::V1_7_10, sv) if sv.id() > ProtocolVersion::V1_8.id() => {
                     match v1_7_to_v1_8::convert_c2s(payload) {
                         ConversionResult::Passthrough => ConversionResult::Passthrough,
                         ConversionResult::Drop => ConversionResult::Drop,

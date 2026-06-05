@@ -171,6 +171,7 @@ impl AsyncWrite for EncryptedStream {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum McStream {
     Empty,
     Plain(TcpStream),
@@ -276,9 +277,8 @@ impl ClientConnection {
         let handshake = self
             .read_packet::<ServerboundHandshake>()
             .await
-            .map_err(|e| {
+            .inspect_err(|_| {
                 self.state.metrics.record_failed_connection();
-                e
             })?;
 
         self.protocol_version = handshake.protocol_version.0 as u32;
@@ -1488,6 +1488,7 @@ impl ClientConnection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_backend_handshake(
         &self,
         conn: &mut TcpStream,
@@ -1910,7 +1911,7 @@ impl ClientConnection {
                         let resp_chan = String::decode(&mut rcursor).unwrap_or_default();
                         modloader::log_neo_config_packet(
                             &resp_chan,
-                            &rcursor.to_vec(),
+                            rcursor.as_ref(),
                             "C→S",
                             proto,
                         );

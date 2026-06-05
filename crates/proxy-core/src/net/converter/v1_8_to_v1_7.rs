@@ -71,7 +71,7 @@ pub fn convert_s2c(payload: Bytes) -> ConversionResult {
 }
 
 fn s2c_login(body: Bytes) -> ConversionResult {
-    if body.len() < 1 {
+    if body.is_empty() {
         return ConversionResult::Passthrough;
     }
     let trimmed = body.slice(..body.len().saturating_sub(1));

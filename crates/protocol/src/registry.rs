@@ -70,11 +70,14 @@ impl PacketRegistry {
         let mut best_proto: Option<u32> = None;
         let mut best_id: Option<u8> = None;
         for (&(p, s, d, n), meta) in &self.map {
-            if s == state && d == dir && n == name && p <= proto {
-                if best_proto.map_or(true, |bp| p > bp) {
-                    best_proto = Some(p);
-                    best_id = Some(meta.id);
-                }
+            if s == state
+                && d == dir
+                && n == name
+                && p <= proto
+                && best_proto.is_none_or(|bp| p > bp)
+            {
+                best_proto = Some(p);
+                best_id = Some(meta.id);
             }
         }
         best_id
@@ -96,11 +99,14 @@ impl PacketRegistry {
         let mut best_proto: Option<u32> = None;
         let mut best_name: Option<&'static str> = None;
         for (&(p, s, d, _), meta) in &self.map {
-            if s == state && d == dir && meta.id == id && p <= proto {
-                if best_proto.map_or(true, |bp| p > bp) {
-                    best_proto = Some(p);
-                    best_name = Some(meta.name);
-                }
+            if s == state
+                && d == dir
+                && meta.id == id
+                && p <= proto
+                && best_proto.is_none_or(|bp| p > bp)
+            {
+                best_proto = Some(p);
+                best_name = Some(meta.name);
             }
         }
         best_name

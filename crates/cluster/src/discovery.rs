@@ -1,8 +1,6 @@
 use crate::node::ClusterNode;
 use dashmap::DashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub struct ServiceDiscovery {

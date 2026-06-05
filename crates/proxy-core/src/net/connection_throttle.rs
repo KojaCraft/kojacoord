@@ -20,6 +20,12 @@ pub struct ConnectionThrottle {
     records: Arc<Mutex<HashMap<IpAddr, IpRecord>>>,
 }
 
+impl Default for ConnectionThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionThrottle {
     pub fn new() -> Self {
         Self {
@@ -69,7 +75,7 @@ impl ConnectionThrottle {
         let mut map = self.records.lock().await;
         let now = Instant::now();
         map.retain(|_, rec| {
-            rec.banned_until.map_or(false, |u| now < u)
+            rec.banned_until.is_some_and(|u| now < u)
                 || now.duration_since(rec.window_start) < CONNECTION_WINDOW * 2
         });
     }

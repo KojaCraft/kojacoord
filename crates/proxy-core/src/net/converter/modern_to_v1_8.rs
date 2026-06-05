@@ -425,10 +425,8 @@ fn s2c_set_slot(body: Bytes, ver: ProtocolVersion) -> ConversionResult {
     let Some(window) = r.i8() else {
         return ConversionResult::Passthrough;
     };
-    if super::items::has_state_id(ver) {
-        if r.varint().is_none() {
-            return ConversionResult::Passthrough;
-        }
+    if super::items::has_state_id(ver) && r.varint().is_none() {
+        return ConversionResult::Passthrough;
     }
     let Some(slot_idx) = r.i16() else {
         return ConversionResult::Passthrough;
@@ -480,7 +478,7 @@ fn s2c_window_items(body: Bytes, ver: ProtocolVersion) -> ConversionResult {
             None => return ConversionResult::Passthrough,
         }
     };
-    if count < 0 || count > 4096 {
+    if !(0..=4096).contains(&count) {
         return ConversionResult::Passthrough;
     }
 
@@ -534,10 +532,7 @@ fn s2c_entity_equipment(body: Bytes, ver: ProtocolVersion) -> ConversionResult {
     }
 
     let mut packets = Vec::new();
-    loop {
-        let Some(raw_slot) = r.i8() else {
-            break;
-        };
+    while let Some(raw_slot) = r.i8() {
         let has_more = (raw_slot as u8) & 0x80 != 0;
         let idx = (raw_slot as u8) & 0x7F;
         let Some(slot) = r.slot() else {

@@ -1394,7 +1394,7 @@ mod packets {
                 z: src.get_i32(),
                 action_id: src.get_i8(),
                 action_param: src.get_i8(),
-                block_type: VarInt::decode(src)?.0 as i32,
+                block_type: VarInt::decode(src)?.0,
             })
         }
     }
@@ -2038,7 +2038,7 @@ mod packets {
                 x: src.get_i32(),
                 y: src.get_i8(),
                 z: src.get_i32(),
-                block_id: VarInt::decode(src)?.0 as i32,
+                block_id: VarInt::decode(src)?.0,
                 block_metadata: src.get_i8(),
             })
         }

@@ -108,11 +108,13 @@ fn save_config(config: &kojacoord_config::ProxyConfig, path: &str) -> anyhow::Re
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn is_running_as_elevated() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 fn is_running_as_elevated() -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_QUERY};

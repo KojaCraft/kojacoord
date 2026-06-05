@@ -106,7 +106,7 @@ impl PluginManager {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == "dll" || ext == "so" || ext == "dylib")
+                .is_some_and(|ext| ext == "dll" || ext == "so" || ext == "dylib")
             {
                 let plugin_name = path
                     .file_stem()

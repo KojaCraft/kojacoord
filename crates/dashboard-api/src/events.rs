@@ -4,6 +4,7 @@ use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 pub enum DashboardEvent {
     WrongModpack {
         player_uuid: String,

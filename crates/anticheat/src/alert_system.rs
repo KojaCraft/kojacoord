@@ -99,12 +99,8 @@ impl AlertSystem {
         let mut messages = Vec::new();
 
         let main_alert = format!(
-            "§c[{}] §f{} §7failed §c{} §7({}) §8[{}x]",
-            self.anticheat_name,
-            name,
-            check_name,
-            category,
-            format!("{:.1}", severity_text),
+            "§c[{}] §f{} §7failed §c{} §7({}) §8[{:.1}x]",
+            self.anticheat_name, name, check_name, category, severity_text,
         );
         messages.push(main_alert);
 
@@ -117,7 +113,7 @@ impl AlertSystem {
         }
 
         if severity >= 5.0 {
-            let warning = format!("§7  └─ §c⚠ HIGH VIOLATION - Possible cheat detected!");
+            let warning = "§7  └─ §c⚠ HIGH VIOLATION - Possible cheat detected!".to_string();
             messages.push(warning);
         }
 

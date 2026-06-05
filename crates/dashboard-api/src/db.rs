@@ -2,6 +2,7 @@ use sqlx::{MySql, Pool};
 
 pub type DbPool = Pool<MySql>;
 
+#[allow(dead_code)]
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<DbPool> {
     Ok(sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(max)

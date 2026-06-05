@@ -10,6 +10,7 @@ pub struct ModpackDownloader {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModpackInfo {
     pub name: String,
     pub version: String,
@@ -19,6 +20,7 @@ pub struct ModpackInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModpackFile {
     pub path: String,
     pub url: String,

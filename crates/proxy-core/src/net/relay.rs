@@ -46,6 +46,7 @@ pub struct PacketRelay {
     pub backend_protocol: u32,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum RelayExit {
     Disconnected,
 
@@ -90,7 +91,7 @@ impl PacketRelay {
                 data: new_data,
             } => {
                 let mut new_packet = BytesMut::new();
-                let _ = VarInt(new_id as i32).encode(&mut new_packet);
+                let _ = VarInt(new_id).encode(&mut new_packet);
                 new_packet.extend_from_slice(&new_data);
                 Ok(new_packet.freeze())
             },
@@ -274,7 +275,7 @@ impl PacketRelay {
                             let mut cw = cw_s2c.lock().await;
                             for pkt in packets {
                                 let mut pkt_id_decoded = pkt.clone();
-                                let pkt_id = VarInt::decode(&mut pkt_id_decoded).map(|v| v.0 as i32).unwrap_or(pkt_id as i32);
+                                let pkt_id = VarInt::decode(&mut pkt_id_decoded).map(|v| v.0).unwrap_or(pkt_id as i32);
                                 match Self::process_packet_hooks(
                                     &state_s2c,
                                     proto,
@@ -412,7 +413,7 @@ impl PacketRelay {
                                 );
                             }
                         },
-                        AnticheatPacket::Chat { message } => if message.starts_with('/') {},
+                        AnticheatPacket::Chat { message } if message.starts_with('/') => {},
                         _ => {},
                     }
 

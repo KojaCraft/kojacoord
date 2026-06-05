@@ -158,10 +158,7 @@ pub async fn upload_server_files(
             None
         }
     } else {
-        server_files
-            .keys()
-            .find(|k| k.ends_with(".jar"))
-            .map(|k| k.clone())
+        server_files.keys().find(|k| k.ends_with(".jar")).cloned()
     };
 
     let result = sqlx::query(

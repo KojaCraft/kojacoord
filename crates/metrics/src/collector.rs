@@ -1,6 +1,4 @@
-use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Registry};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, Registry};
 
 pub struct MetricsCollector {
     registry: Registry,
