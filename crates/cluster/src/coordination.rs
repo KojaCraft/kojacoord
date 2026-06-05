@@ -60,17 +60,32 @@ impl ClusterCoordinator {
                 let is_us = current_leader.as_deref() == Some(&self.local_node_id.to_string());
 
                 if is_us {
-                    // We are the leader, renew the lease
-                    let _: () = redis::cmd("SET")
+                    // We are the leader, renew the lease atomically
+                    let lua_script = r#"
+                        local key = KEYS[1]
+                        local expected_value = ARGV[1]
+                        local ttl = ARGV[2]
+                        local current = redis.call('GET', key)
+                        if current == expected_value then
+                            redis.call('SETEX', key, ttl, expected_value)
+                            return 1
+                        else
+                            return 0
+                        end
+                    "#;
+
+                    let result: Result<i32, _> = redis::cmd("EVAL")
+                        .arg(lua_script)
+                        .arg(1)
                         .arg("cluster_leader_lock")
                         .arg(self.local_node_id.to_string())
-                        .arg("XX")
-                        .arg("EX")
                         .arg(10)
                         .query_async(&mut conn)
-                        .await
-                        .unwrap_or(());
-                    leader_id = Some(self.local_node_id);
+                        .await;
+
+                    if result.unwrap_or(0) == 1 {
+                        leader_id = Some(self.local_node_id);
+                    }
                 } else {
                     // We are not leader, try to acquire lock if it's expired
                     let acquired: bool = redis::cmd("SET")
