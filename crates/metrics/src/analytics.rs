@@ -1,11 +1,12 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct AnalyticsEngine {
-    events: Arc<RwLock<Vec<AnalyticsEvent>>>,
+    hourly_buckets: Arc<DashMap<String, (u64, u64)>>, // (Joins, Leaves)
     aggregates: Arc<RwLock<AnalyticsAggregates>>,
     retention_hours: u64,
 }
@@ -40,7 +41,7 @@ pub struct AnalyticsAggregates {
 impl AnalyticsEngine {
     pub fn new(retention_hours: u64) -> Self {
         Self {
-            events: Arc::new(RwLock::new(Vec::new())),
+            hourly_buckets: Arc::new(DashMap::new()),
             aggregates: Arc::new(RwLock::new(AnalyticsAggregates {
                 total_players: 0,
                 peak_players: 0,
@@ -54,18 +55,20 @@ impl AnalyticsEngine {
     }
 
     pub async fn record_event(&self, event: AnalyticsEvent) {
-        let mut events = self.events.write().await;
-        events.push(event.clone());
+        let hour_key = event.timestamp.format("%Y-%m-%d-%H").to_string();
+        let mut entry = self.hourly_buckets.entry(hour_key).or_insert((0, 0));
 
         let mut aggregates = self.aggregates.write().await;
         match &event.event_type {
             EventType::PlayerJoin => {
+                entry.0 += 1;
                 aggregates.total_players += 1;
                 if aggregates.total_players > aggregates.peak_players {
                     aggregates.peak_players = aggregates.total_players;
                 }
             },
             EventType::PlayerLeave => {
+                entry.1 += 1;
                 aggregates.total_players = aggregates.total_players.saturating_sub(1);
             },
             EventType::Violation => {
@@ -80,21 +83,10 @@ impl AnalyticsEngine {
             _ => {},
         }
 
+        // Cleanup old buckets (roughly by checking keys)
         let cutoff = Utc::now() - chrono::Duration::hours(self.retention_hours as i64);
-        events.retain(|e| e.timestamp > cutoff);
-    }
-
-    pub async fn get_events(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Vec<AnalyticsEvent> {
-        let events = self.events.read().await;
-        events
-            .iter()
-            .filter(|e| e.timestamp >= start && e.timestamp <= end)
-            .cloned()
-            .collect()
+        let cutoff_str = cutoff.format("%Y-%m-%d-%H").to_string();
+        self.hourly_buckets.retain(|k, _| *k >= cutoff_str);
     }
 
     pub async fn get_aggregates(&self) -> AnalyticsAggregates {
@@ -109,27 +101,27 @@ impl AnalyticsEngine {
     }
 
     pub async fn get_player_history(&self, hours: u64) -> Vec<(DateTime<Utc>, u64)> {
-        let events = self.events.read().await;
         let mut history = Vec::new();
-
         let now = Utc::now();
+
         for i in 0..hours {
-            let hour_start = now - chrono::Duration::hours(i as i64 + 1);
-            let hour_end = now - chrono::Duration::hours(i as i64);
+            let hour_time = now - chrono::Duration::hours(i as i64);
+            let hour_key = hour_time.format("%Y-%m-%d-%H").to_string();
 
-            let joins = events
-                .iter()
-                .filter(|e| e.timestamp >= hour_start && e.timestamp < hour_end)
-                .filter(|e| matches!(e.event_type, EventType::PlayerJoin))
-                .count() as u64;
+            let mut joins = 0;
+            let mut leaves = 0;
+            if let Some(entry) = self.hourly_buckets.get(&hour_key) {
+                joins = entry.0;
+                leaves = entry.1;
+            }
 
-            let leaves = events
-                .iter()
-                .filter(|e| e.timestamp >= hour_start && e.timestamp < hour_end)
-                .filter(|e| matches!(e.event_type, EventType::PlayerLeave))
-                .count() as u64;
+            let hour_start = hour_time
+                .date_naive()
+                .and_hms_opt(hour_time.hour(), 0, 0)
+                .unwrap();
+            let hour_start_utc = DateTime::from_naive_utc_and_offset(hour_start, Utc);
 
-            history.push((hour_start, joins.saturating_sub(leaves)));
+            history.push((hour_start_utc, joins.saturating_sub(leaves)));
         }
 
         history.reverse();

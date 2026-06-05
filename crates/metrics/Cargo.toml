@@ -11,3 +11,4 @@ prometheus = "0.13"
 axum = { version = "0.7", features = ["macros"] }
 tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
+dashmap = { workspace = true }

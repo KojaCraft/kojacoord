@@ -1,5 +1,6 @@
 use crate::discovery::ServiceDiscovery;
 use crate::node::{ClusterNode, NodeRole};
+use redis::AsyncCommands;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,14 +10,20 @@ pub struct ClusterCoordinator {
     discovery: Arc<ServiceDiscovery>,
     leader_id: Arc<RwLock<Option<Uuid>>>,
     local_node_id: Uuid,
+    redis_client: Option<redis::Client>,
 }
 
 impl ClusterCoordinator {
     pub fn new(discovery: Arc<ServiceDiscovery>, local_node_id: Uuid) -> Self {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+        let redis_client = redis::Client::open(redis_url).ok();
+
         Self {
             discovery,
             leader_id: Arc::new(RwLock::new(None)),
             local_node_id,
+            redis_client,
         }
     }
 
@@ -41,10 +48,51 @@ impl ClusterCoordinator {
             return Ok(());
         }
 
-        let leader = nodes
-            .into_iter()
-            .min_by_key(|n| n.id)
-            .expect("At least one node exists");
+        let mut leader_id = None;
+
+        if let Some(client) = &self.redis_client {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                let acquired: bool = redis::cmd("SET")
+                    .arg("cluster_leader_lock")
+                    .arg(self.local_node_id.to_string())
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(10)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(false);
+
+                if acquired {
+                    leader_id = Some(self.local_node_id);
+                } else if let Ok(current_leader) =
+                    conn.get::<_, String>("cluster_leader_lock").await
+                {
+                    if let Ok(parsed) = Uuid::parse_str(&current_leader) {
+                        leader_id = Some(parsed);
+                    }
+                }
+            }
+        }
+
+        let leader = if let Some(id) = leader_id {
+            nodes
+                .clone()
+                .into_iter()
+                .find(|n| n.id == id)
+                .unwrap_or_else(|| {
+                    nodes
+                        .clone()
+                        .into_iter()
+                        .min_by_key(|n| n.id)
+                        .expect("At least one node exists")
+                })
+        } else {
+            nodes
+                .clone()
+                .into_iter()
+                .min_by_key(|n| n.id)
+                .expect("At least one node exists")
+        };
 
         *self.leader_id.write().await = Some(leader.id);
 

@@ -107,8 +107,10 @@ impl PacketRelay {
         )
         .await?;
 
-        let (mut cr, cw) = tokio::io::split(self.client_stream);
-        let (mut br, mut bw) = self.backend_stream.into_split();
+        let (cr, cw) = tokio::io::split(self.client_stream);
+        let mut cr = tokio::io::BufReader::with_capacity(8192, cr);
+        let (br, mut bw) = self.backend_stream.into_split();
+        let mut br = tokio::io::BufReader::with_capacity(8192, br);
 
         let cw_master = Arc::new(Mutex::new(cw));
         let cw_s2c = Arc::clone(&cw_master);
@@ -637,7 +639,7 @@ impl PacketRelay {
             match Arc::try_unwrap(cw_master) {
                 Ok(mutex) => {
                     let cw = mutex.into_inner();
-                    let client_stream = cr.unsplit(cw);
+                    let client_stream = cr.into_inner().unsplit(cw);
                     tracing::info!(target = %target, "relay: performing live server switch");
                     return Ok(RelayExit::Switch {
                         client_stream,
