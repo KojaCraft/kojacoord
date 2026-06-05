@@ -163,10 +163,20 @@ async fn ban(
     let mut reason = req
         .reason
         .unwrap_or_else(|| "Banned by an operator".to_owned());
-    reason.truncate(1024);
+    if reason.len() > 1024 {
+        reason = reason.char_indices()
+            .take_while(|(idx, _)| *idx < 1024)
+            .map(|(_, c)| c)
+            .collect();
+    }
 
     let mut banned_by = req.banned_by.unwrap_or_else(|| "dashboard".to_owned());
-    banned_by.truncate(256);
+    if banned_by.len() > 256 {
+        banned_by = banned_by.char_indices()
+            .take_while(|(idx, _)| *idx < 256)
+            .map(|(_, c)| c)
+            .collect();
+    }
 
     if let Err(e) = db.insert_ban(uuid, &reason, &banned_by, None).await {
         tracing::warn!(error = %e, "dashboard ban failed");
