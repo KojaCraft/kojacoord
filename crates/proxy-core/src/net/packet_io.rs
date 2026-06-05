@@ -5,19 +5,20 @@ use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use kojacoord_protocol::{codec::Encode, types::VarInt, Decode, ProtocolError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::buffer_pool::GLOBAL_BUFFER_POOL;
 use crate::error::ConnectionError;
 
 pub const NO_COMPRESSION: i32 = -1;
 
 pub const MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
 
-pub fn encode_frame(body: &[u8]) -> Bytes {
-    let mut out = BytesMut::with_capacity(5 + body.len());
+pub fn encode_frame(body: &[u8]) -> BytesMut {
+    let mut out = GLOBAL_BUFFER_POOL.acquire(5 + body.len());
     VarInt(body.len() as i32)
         .encode(&mut out)
         .expect("encoding a VarInt into a BytesMut never fails");
     out.put_slice(body);
-    out.freeze()
+    out
 }
 
 pub async fn read_frame<R: AsyncReadExt + Unpin>(src: &mut R) -> Result<Bytes, ConnectionError> {
@@ -33,8 +34,8 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(src: &mut R) -> Result<Bytes, C
     Ok(Bytes::from(body))
 }
 
-pub fn compress(raw: &[u8], threshold: i32) -> Bytes {
-    let mut out = BytesMut::new();
+pub fn compress(raw: &[u8], threshold: i32) -> BytesMut {
+    let mut out = GLOBAL_BUFFER_POOL.acquire(raw.len() + 5);
     if raw.len() >= threshold.max(0) as usize {
         VarInt(raw.len() as i32)
             .encode(&mut out)
@@ -51,7 +52,7 @@ pub fn compress(raw: &[u8], threshold: i32) -> Bytes {
             .expect("VarInt encode into BytesMut never fails");
         out.put_slice(raw);
     }
-    out.freeze()
+    out
 }
 
 pub fn decompress(body: Bytes) -> Result<Bytes, ConnectionError> {
@@ -77,9 +78,12 @@ pub fn decompress(body: Bytes) -> Result<Bytes, ConnectionError> {
     Ok(Bytes::from(out))
 }
 
-pub fn encode_packet(raw: &[u8], threshold: i32) -> Bytes {
+pub fn encode_packet(raw: &[u8], threshold: i32) -> BytesMut {
     if threshold >= 0 {
-        encode_frame(&compress(raw, threshold))
+        let compressed = compress(raw, threshold);
+        let frame = encode_frame(&compressed);
+        GLOBAL_BUFFER_POOL.release(compressed);
+        frame
     } else {
         encode_frame(raw)
     }
@@ -105,6 +109,7 @@ pub async fn write_packet<W: AsyncWriteExt + Unpin>(
     let frame = encode_packet(raw, threshold);
     dst.write_all(&frame).await?;
     dst.flush().await?;
+    GLOBAL_BUFFER_POOL.release(frame);
     Ok(())
 }
 
@@ -129,7 +134,7 @@ mod tests {
         let raw = b"\x00hello world";
         let frame = encode_packet(raw, NO_COMPRESSION);
 
-        let mut cur = frame.clone();
+        let mut cur = frame.freeze();
         let len = VarInt::decode(&mut cur).unwrap().0 as usize;
         assert_eq!(len, raw.len());
         assert_eq!(cur.as_ref(), raw);
@@ -158,7 +163,7 @@ mod tests {
         let raw = b"\x10tiny".to_vec();
         let frame = encode_packet(&raw, 256);
 
-        let mut cur = frame.clone();
+        let mut cur = frame.clone().freeze();
         let _frame_len = VarInt::decode(&mut cur).unwrap();
         let data_len = VarInt::decode(&mut cur).unwrap().0;
         assert_eq!(data_len, 0);

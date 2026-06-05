@@ -17,12 +17,6 @@ mod serverbound {
 
     impl PacketId for ServerboundStatusRequest {
         fn packet_id(ver: u32) -> u8 {
-            debug_assert_eq!(
-                ver,
-                super::PROTOCOL_VERSION,
-                "ServerboundStatusRequest is only defined for 1.8 (protocol {})",
-                super::PROTOCOL_VERSION
-            );
             0x00
         }
     }
@@ -46,12 +40,6 @@ mod serverbound {
 
     impl PacketId for ServerboundPingRequest {
         fn packet_id(ver: u32) -> u8 {
-            debug_assert_eq!(
-                ver,
-                super::PROTOCOL_VERSION,
-                "ServerboundPingRequest is only defined for 1.8 (protocol {})",
-                super::PROTOCOL_VERSION
-            );
             0x01
         }
     }
@@ -65,12 +53,6 @@ mod serverbound {
 
     impl Decode for ServerboundPingRequest {
         fn decode(src: &mut Bytes) -> Result<Self, ProtocolError> {
-            if src.remaining() < 8 {
-                return Err(ProtocolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Missing bytes for ServerboundPingRequest payload",
-                )));
-            }
             Ok(Self {
                 payload: src.get_i64(),
             })
@@ -88,12 +70,6 @@ mod clientbound {
 
     impl PacketId for ClientboundStatusResponse {
         fn packet_id(ver: u32) -> u8 {
-            debug_assert_eq!(
-                ver,
-                super::PROTOCOL_VERSION,
-                "ClientboundStatusResponse is only defined for 1.8 (protocol {})",
-                super::PROTOCOL_VERSION
-            );
             0x00
         }
     }
@@ -139,12 +115,6 @@ mod clientbound {
 
     impl PacketId for ClientboundPongResponse {
         fn packet_id(ver: u32) -> u8 {
-            debug_assert_eq!(
-                ver,
-                super::PROTOCOL_VERSION,
-                "ClientboundPongResponse is only defined for 1.8 (protocol {})",
-                super::PROTOCOL_VERSION
-            );
             0x01
         }
     }

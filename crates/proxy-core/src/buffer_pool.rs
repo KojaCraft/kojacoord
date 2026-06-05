@@ -1,10 +1,15 @@
 use bytes::BytesMut;
-use tokio::sync::Mutex;
+use crossbeam_queue::ArrayQueue;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref GLOBAL_BUFFER_POOL: BufferPool = BufferPool::new();
+}
 
 pub struct BufferPool {
-    small: Mutex<Vec<BytesMut>>,
-    medium: Mutex<Vec<BytesMut>>,
-    large: Mutex<Vec<BytesMut>>,
+    small: ArrayQueue<BytesMut>,
+    medium: ArrayQueue<BytesMut>,
+    large: ArrayQueue<BytesMut>,
 }
 
 const SMALL_MAX: usize = 2_048;
@@ -17,13 +22,13 @@ const LARGE_DEPTH: usize = 16;
 impl BufferPool {
     pub fn new() -> Self {
         Self {
-            small: Mutex::new(Vec::with_capacity(SMALL_DEPTH)),
-            medium: Mutex::new(Vec::with_capacity(MEDIUM_DEPTH)),
-            large: Mutex::new(Vec::with_capacity(LARGE_DEPTH)),
+            small: ArrayQueue::new(SMALL_DEPTH),
+            medium: ArrayQueue::new(MEDIUM_DEPTH),
+            large: ArrayQueue::new(LARGE_DEPTH),
         }
     }
 
-    pub async fn acquire(&self, size_hint: usize) -> BytesMut {
+    pub fn acquire(&self, size_hint: usize) -> BytesMut {
         let (pool, min_cap) = if size_hint <= SMALL_MAX {
             (&self.small, SMALL_MAX.max(size_hint))
         } else if size_hint <= MEDIUM_MAX {
@@ -32,8 +37,7 @@ impl BufferPool {
             (&self.large, size_hint)
         };
 
-        let candidate = pool.lock().await.pop();
-        match candidate {
+        match pool.pop() {
             Some(mut buf) if buf.capacity() >= size_hint => {
                 buf.clear();
                 buf
@@ -42,29 +46,23 @@ impl BufferPool {
         }
     }
 
-    pub async fn release(&self, mut buffer: BytesMut) {
+    pub fn release(&self, mut buffer: BytesMut) {
         buffer.clear();
         let cap = buffer.capacity();
-        let (pool, depth) = if cap <= SMALL_MAX {
-            (&self.small, SMALL_DEPTH)
+        let pool = if cap <= SMALL_MAX {
+            &self.small
         } else if cap <= MEDIUM_MAX {
-            (&self.medium, MEDIUM_DEPTH)
+            &self.medium
         } else {
-            (&self.large, LARGE_DEPTH)
+            &self.large
         };
 
-        let mut p = pool.lock().await;
-        if p.len() < depth {
-            p.push(buffer);
-        }
+        // If the pool is full, the buffer will simply be dropped and memory freed.
+        let _ = pool.push(buffer);
     }
 
-    pub async fn depths(&self) -> (usize, usize, usize) {
-        (
-            self.small.lock().await.len(),
-            self.medium.lock().await.len(),
-            self.large.lock().await.len(),
-        )
+    pub fn depths(&self) -> (usize, usize, usize) {
+        (self.small.len(), self.medium.len(), self.large.len())
     }
 }
 
