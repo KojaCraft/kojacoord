@@ -16,7 +16,7 @@ mod serverbound {
     pub struct ServerboundStatusRequest;
 
     impl PacketId for ServerboundStatusRequest {
-        fn packet_id(ver: u32) -> u8 {
+        fn packet_id(_ver: u32) -> u8 {
             0x00
         }
     }
@@ -39,7 +39,7 @@ mod serverbound {
     }
 
     impl PacketId for ServerboundPingRequest {
-        fn packet_id(ver: u32) -> u8 {
+        fn packet_id(_ver: u32) -> u8 {
             0x01
         }
     }
@@ -69,7 +69,7 @@ mod clientbound {
     }
 
     impl PacketId for ClientboundStatusResponse {
-        fn packet_id(ver: u32) -> u8 {
+        fn packet_id(_ver: u32) -> u8 {
             0x00
         }
     }
@@ -114,7 +114,7 @@ mod clientbound {
     }
 
     impl PacketId for ClientboundPongResponse {
-        fn packet_id(ver: u32) -> u8 {
+        fn packet_id(_ver: u32) -> u8 {
             0x01
         }
     }
