@@ -51,7 +51,7 @@ fn apply_linux_sandbox(config: &SandboxConfig) -> Result<()> {
 
     if !config.allow_filesystem {
         unsafe {
-            let mut rlim = libc::rlimit {
+            let rlim = libc::rlimit {
                 rlim_cur: 64,
                 rlim_max: 64,
             };
@@ -64,7 +64,7 @@ fn apply_linux_sandbox(config: &SandboxConfig) -> Result<()> {
         }
 
         unsafe {
-            let mut rlim = libc::rlimit {
+            let rlim = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
             };
@@ -113,7 +113,7 @@ fn apply_macos_sandbox(config: &SandboxConfig) -> Result<()> {
         warn!("Filesystem access restricted - macOS sandbox requires proper entitlements");
 
         unsafe {
-            let mut rlim = libc::rlimit {
+            let rlim = libc::rlimit {
                 rlim_cur: 64,
                 rlim_max: 64,
             };
