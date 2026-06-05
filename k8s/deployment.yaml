@@ -17,6 +17,8 @@ spec:
         app: kojacoord-proxy
         version: v1
     spec:
+      securityContext:
+        runAsNonRoot: true
       containers:
       - name: kojacoord-proxy
         image: kojacoord/proxy:latest
