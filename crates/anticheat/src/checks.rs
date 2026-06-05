@@ -408,13 +408,13 @@ impl AnticheatEngine {
         let now = Instant::now();
         let time_since_last_check: Duration = now.duration_since(state.last_aim_check);
         state.last_aim_check = now;
-        
+
         // Skip aimbot checks if they happen too frequently (< 50ms apart)
         // to avoid false positives from rapid legitimate movements
         if time_since_last_check.as_millis() < 50 {
             return None;
         }
-        
+
         let yaw_delta = (yaw - state.last_yaw).abs();
         let pitch_delta = (pitch - state.last_pitch).abs();
         let rotation_delta = (yaw_delta.powi(2) + pitch_delta.powi(2)).sqrt();
@@ -482,7 +482,9 @@ impl AnticheatEngine {
             0.0
         };
 
-        if (switches_per_second > 20.0 || avg_time_per_switch < min_switch_time_ms as f64) && !should_suppress {
+        if (switches_per_second > 20.0 || avg_time_per_switch < min_switch_time_ms as f64)
+            && !should_suppress
+        {
             let count = self.increment_violation_count(state, "AutoTool");
             if count >= MIN_AUTOTOOL_VL {
                 let v = Violation {

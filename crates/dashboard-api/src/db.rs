@@ -88,7 +88,7 @@ pub async fn list_templates(pool: &DbPool) -> Result<Vec<ServerTemplate>, sqlx::
     sqlx::query_as::<_, ServerTemplate>(
         "SELECT id, name, game_type, image, memory_mb, max_players, min_instances, \
          modpack_id, modpack_loader, modpack_mc_version, modpack_status, modpack_source \
-         FROM server_templates ORDER BY name"
+         FROM server_templates ORDER BY name",
     )
     .fetch_all(pool)
     .await
@@ -171,14 +171,13 @@ pub async fn create_admin_user(
     password_hash: &str,
     role: &str,
 ) -> anyhow::Result<i64> {
-    let res = sqlx::query(
-        "INSERT INTO admin_users (username, password_hash, role) VALUES (?, ?, ?)",
-    )
-    .bind(username)
-    .bind(password_hash)
-    .bind(role)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("INSERT INTO admin_users (username, password_hash, role) VALUES (?, ?, ?)")
+            .bind(username)
+            .bind(password_hash)
+            .bind(role)
+            .execute(pool)
+            .await?;
     Ok(res.last_insert_id() as i64)
 }
 

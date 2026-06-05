@@ -40,7 +40,7 @@ impl ModpackDownloader {
         if project_id.is_empty() {
             anyhow::bail!("project_id cannot be empty");
         }
-        
+
         tracing::info!(
             template = template_name,
             project_id = project_id,

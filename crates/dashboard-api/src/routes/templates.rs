@@ -106,9 +106,10 @@ pub async fn update_template(
     Json(body): Json<CreateTemplateBody>,
 ) -> Result<Json<Value>, AppError> {
     auth::require_admin(&auth.0)?;
-    
+
     // Validate template exists using db module
-    let templates = db::list_templates(&state.pool).await
+    let templates = db::list_templates(&state.pool)
+        .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if !templates.iter().any(|t| t.id == id) {
         return Err(AppError::NotFound(format!("template {}", id)));
@@ -201,10 +202,11 @@ pub async fn download_modpack(
                 tracing::info!("Modpack download complete for template {}", id);
             },
             Err(e) => {
-                let _ = sqlx::query("UPDATE server_templates SET modpack_status='error' WHERE id=?")
-                    .bind(id)
-                    .execute(&pool)
-                    .await;
+                let _ =
+                    sqlx::query("UPDATE server_templates SET modpack_status='error' WHERE id=?")
+                        .bind(id)
+                        .execute(&pool)
+                        .await;
                 tracing::error!("Modpack download failed: {}", e);
             },
         }

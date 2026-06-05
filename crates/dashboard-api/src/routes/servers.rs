@@ -56,7 +56,7 @@ pub async fn start_server(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("server {}", id)))?;
-    
+
     // Check if server backend exists and start it
     if let Some(backend) = state.proxy.server_registry.get(&server.name) {
         if backend.is_online() {
@@ -65,10 +65,15 @@ pub async fn start_server(
         // TODO: Implement actual server start logic via proxy
         tracing::info!(server_id = id, server_name = %server.name, "start_server requested");
     } else {
-        return Err(AppError::NotFound(format!("Server backend '{}' not found", server.name)));
+        return Err(AppError::NotFound(format!(
+            "Server backend '{}' not found",
+            server.name
+        )));
     }
-    
-    Ok(Json(json!({"status": "starting", "server_id": id, "server_name": server.name})))
+
+    Ok(Json(
+        json!({"status": "starting", "server_id": id, "server_name": server.name}),
+    ))
 }
 
 pub async fn stop_server(
@@ -83,7 +88,7 @@ pub async fn stop_server(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("server {}", id)))?;
-    
+
     // Check if server backend exists and stop it
     if let Some(backend) = state.proxy.server_registry.get(&server.name) {
         if !backend.is_online() {
@@ -92,8 +97,13 @@ pub async fn stop_server(
         // TODO: Implement actual server stop logic via proxy
         tracing::info!(server_id = id, server_name = %server.name, "stop_server requested");
     } else {
-        return Err(AppError::NotFound(format!("Server backend '{}' not found", server.name)));
+        return Err(AppError::NotFound(format!(
+            "Server backend '{}' not found",
+            server.name
+        )));
     }
-    
-    Ok(Json(json!({"status": "stopping", "server_id": id, "server_name": server.name})))
+
+    Ok(Json(
+        json!({"status": "stopping", "server_id": id, "server_name": server.name}),
+    ))
 }
