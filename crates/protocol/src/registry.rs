@@ -21,10 +21,8 @@ pub struct PacketMeta {
     pub name: &'static str,
 }
 
-type RegKey = (u32, ProtocolState, Direction, &'static str);
-
 pub struct PacketRegistry {
-    map: HashMap<RegKey, PacketMeta>,
+    map: HashMap<ProtocolState, HashMap<Direction, Vec<(u32, PacketMeta)>>>,
 }
 
 impl PacketRegistry {
@@ -42,8 +40,16 @@ impl PacketRegistry {
         name: &'static str,
         id: u8,
     ) {
-        self.map
-            .insert((proto, state, dir, name), PacketMeta { id, name });
+        let state_map = self.map.entry(state).or_default();
+        let dir_vec = state_map.entry(dir).or_default();
+        if let Some((_, meta)) = dir_vec
+            .iter_mut()
+            .find(|(p, meta)| *p == proto && meta.name == name)
+        {
+            meta.id = id;
+        } else {
+            dir_vec.push((proto, PacketMeta { id, name }));
+        }
     }
 
     pub fn get_id(
@@ -53,7 +59,12 @@ impl PacketRegistry {
         dir: Direction,
         name: &'static str,
     ) -> Option<u8> {
-        self.map.get(&(proto, state, dir, name)).map(|m| m.id)
+        let state_map = self.map.get(&state)?;
+        let dir_vec = state_map.get(&dir)?;
+        dir_vec
+            .iter()
+            .find(|(p, meta)| *p == proto && meta.name == name)
+            .map(|(_, meta)| meta.id)
     }
 
     pub fn get_id_for_version(
@@ -63,20 +74,21 @@ impl PacketRegistry {
         dir: Direction,
         name: &'static str,
     ) -> Option<u8> {
-        if let Some(id) = self.get_id(proto, state, dir, name) {
-            return Some(id);
+        let state_map = self.map.get(&state)?;
+        let dir_vec = state_map.get(&dir)?;
+
+        if let Some((_, meta)) = dir_vec
+            .iter()
+            .find(|(p, meta)| *p == proto && meta.name == name)
+        {
+            return Some(meta.id);
         }
 
         let mut best_proto: Option<u32> = None;
         let mut best_id: Option<u8> = None;
-        for (&(p, s, d, n), meta) in &self.map {
-            if s == state
-                && d == dir
-                && n == name
-                && p <= proto
-                && best_proto.is_none_or(|bp| p > bp)
-            {
-                best_proto = Some(p);
+        for (p, meta) in dir_vec {
+            if meta.name == name && *p <= proto && best_proto.is_none_or(|bp| *p > bp) {
+                best_proto = Some(*p);
                 best_id = Some(meta.id);
             }
         }
@@ -90,22 +102,21 @@ impl PacketRegistry {
         dir: Direction,
         id: u8,
     ) -> Option<&'static str> {
-        for (&(p, s, d, _), meta) in &self.map {
-            if p == proto && s == state && d == dir && meta.id == id {
-                return Some(meta.name);
-            }
+        let state_map = self.map.get(&state)?;
+        let dir_vec = state_map.get(&dir)?;
+
+        if let Some((_, meta)) = dir_vec
+            .iter()
+            .find(|(p, meta)| *p == proto && meta.id == id)
+        {
+            return Some(meta.name);
         }
 
         let mut best_proto: Option<u32> = None;
         let mut best_name: Option<&'static str> = None;
-        for (&(p, s, d, _), meta) in &self.map {
-            if s == state
-                && d == dir
-                && meta.id == id
-                && p <= proto
-                && best_proto.is_none_or(|bp| p > bp)
-            {
-                best_proto = Some(p);
+        for (p, meta) in dir_vec {
+            if meta.id == id && *p <= proto && best_proto.is_none_or(|bp| *p > bp) {
+                best_proto = Some(*p);
                 best_name = Some(meta.name);
             }
         }
