@@ -111,6 +111,37 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("{} not found — dashboard API disabled", dash_config);
     }
 
+    let watcher_state = Arc::clone(&state);
+    let watcher_path = config_path.clone();
+    tokio::task::spawn_blocking(move || {
+        use notify::{EventKind, RecursiveMode, Watcher};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        })
+        .unwrap();
+
+        let _ = watcher.watch(
+            std::path::Path::new(&watcher_path),
+            RecursiveMode::NonRecursive,
+        );
+
+        for event in rx {
+            if matches!(event.kind, EventKind::Modify(_)) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(new_cfg) = kojacoord_config::ProxyConfig::from_file(&watcher_path) {
+                    tracing::info!("Config file modified, hot-reloading servers...");
+                    let st = Arc::clone(&watcher_state);
+                    tokio::spawn(async move {
+                        st.reload_servers(&new_cfg).await;
+                    });
+                }
+            }
+        }
+    });
+
     kojacoord_proxy_core::proxy::accept_loop(state).await
 }
 

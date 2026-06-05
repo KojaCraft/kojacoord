@@ -96,6 +96,12 @@ pub struct ProxyState {
     pub tps_tracker: Arc<TpsTracker>,
 
     pub connection_throttle: Arc<ConnectionThrottle>,
+
+    pub cached_status: arc_swap::ArcSwap<CachedStatus>,
+}
+
+pub struct CachedStatus {
+    pub suffix: String,
 }
 
 impl ProxyState {
@@ -287,7 +293,44 @@ impl ProxyState {
             plugin_manager,
             tps_tracker,
             connection_throttle,
+            cached_status: arc_swap::ArcSwap::new(Arc::new(CachedStatus {
+                suffix:
+                    r#"},"players":{"max":0,"online":0,"sample":[]},"description":{"text":""}}"#
+                        .to_string(),
+            })),
         })
+    }
+
+    pub async fn reload_servers(&self, new_config: &kojacoord_config::ProxyConfig) {
+        let mut new_names = std::collections::HashSet::new();
+        for s in &new_config.servers {
+            new_names.insert(s.name.clone());
+            if self.server_registry.get(&s.name).is_none() {
+                if let Ok(addr) = s.address.parse() {
+                    self.server_registry
+                        .register(crate::server::BackendServer {
+                            name: s.name.clone(),
+                            address: addr,
+                            restricted: s.restricted,
+                            forwarding_override: s.forwarding_override.clone(),
+                            player_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                            connection_pool: None,
+                            backend_type: s.backend_type.clone(),
+                        })
+                        .await;
+                    tracing::info!("Hot-reloaded new server: {}", s.name);
+                }
+            }
+        }
+
+        let all_current = self.server_registry.all();
+        for current in all_current {
+            if !new_names.contains(&current.name) {
+                self.server_registry.remove(&current.name);
+                tracing::info!("Hot-reloaded (removed) server: {}", current.name);
+            }
+        }
     }
 
     pub fn send_to_player(&self, uuid: &Uuid, packet: Bytes) -> bool {
@@ -443,6 +486,75 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
                     failed = snapshot.failed_connections,
                     "Metrics snapshot"
                 );
+            }
+        }
+    });
+
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+
+                let (online_count, sample) = {
+                    let sessions = state.sessions.read().await;
+                    let count = sessions.len();
+                    let server_lore = &state.config.listeners.server_lore;
+
+                    let mut sample: Vec<serde_json::Value> = sessions
+                        .values()
+                        .take(12)
+                        .filter_map(|s| s.try_read().ok())
+                        .map(|s| {
+                            let mut player_json = serde_json::json!({
+                                "name": s.username,
+                                "id":   s.uuid.hyphenated().to_string(),
+                            });
+
+                            if let Some(lore) = server_lore {
+                                player_json["lore"] = serde_json::json!(lore);
+                            }
+
+                            player_json
+                        })
+                        .collect();
+
+                    if sample.is_empty() {
+                        if let Some(lore) = server_lore {
+                            sample.push(serde_json::json!({
+                                "name": "",
+                                "id": "",
+                                "lore": lore
+                            }));
+                        }
+                    }
+
+                    (count, sample)
+                };
+
+                let description = if let Some(ref motd_json) = state.config.listeners.motd_json {
+                    motd_json.clone()
+                } else {
+                    serde_json::json!({ "text": &state.config.listeners.motd })
+                };
+
+                let players_json = serde_json::json!({
+                    "max":    state.config.proxy.max_players,
+                    "online": online_count,
+                    "sample": sample,
+                });
+
+                let suffix = [
+                    r#"},"players":"#,
+                    &serde_json::to_string(&players_json).unwrap_or_else(|_| "{}".to_string()),
+                    r#","description":"#,
+                    &serde_json::to_string(&description).unwrap_or_else(|_| "{}".to_string()),
+                    r#"}"#,
+                ]
+                .join("");
+
+                state.cached_status.store(Arc::new(CachedStatus { suffix }));
             }
         }
     });

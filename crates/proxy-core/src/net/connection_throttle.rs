@@ -8,13 +8,14 @@ use tokio::sync::Mutex;
 /// temporary ban. Default tuned to tolerate shared/CGNAT addresses; operators
 /// can override via `proxy.max_connections_per_ip`. `0` disables throttling.
 const DEFAULT_MAX_CONNECTIONS_PER_IP: u32 = 8;
-const CONNECTION_WINDOW: Duration = Duration::from_secs(3);
+const REFILL_RATE_PER_SEC: f32 = 2.0;
+const CAPACITY: f32 = 8.0;
 const TEMP_BAN_DURATION: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 struct IpRecord {
-    count: u32,
-    window_start: Instant,
+    tokens: f32,
+    last_update: Instant,
     banned_until: Option<Instant>,
 }
 
@@ -53,8 +54,8 @@ impl ConnectionThrottle {
         let now = Instant::now();
 
         let rec = map.entry(ip).or_insert_with(|| IpRecord {
-            count: 0,
-            window_start: now,
+            tokens: CAPACITY,
+            last_update: now,
             banned_until: None,
         });
 
@@ -64,24 +65,20 @@ impl ConnectionThrottle {
                 return Err("temporarily banned");
             }
             rec.banned_until = None;
+            rec.tokens = CAPACITY;
         }
 
-        if now.duration_since(rec.window_start) >= CONNECTION_WINDOW {
-            rec.count = 0;
-            rec.window_start = now;
-        }
+        let elapsed = now.duration_since(rec.last_update).as_secs_f32();
+        rec.tokens = (rec.tokens + elapsed * REFILL_RATE_PER_SEC).min(CAPACITY);
+        rec.last_update = now;
 
-        rec.count += 1;
-
-        if rec.count > self.max_per_ip {
+        if rec.tokens < 1.0 {
             rec.banned_until = Some(now + TEMP_BAN_DURATION);
-            tracing::warn!(
-                %ip,
-                count = rec.count,
-                "throttle: too many connections — temp-banning"
-            );
+            tracing::warn!(%ip, "throttle: token bucket empty — temp-banning");
             return Err("too many connections");
         }
+
+        rec.tokens -= 1.0;
 
         Ok(())
     }
@@ -90,8 +87,10 @@ impl ConnectionThrottle {
         let mut map = self.records.lock().await;
         let now = Instant::now();
         map.retain(|_, rec| {
-            rec.banned_until.is_some_and(|u| now < u)
-                || now.duration_since(rec.window_start) < CONNECTION_WINDOW * 2
+            let active = rec.banned_until.is_some_and(|u| now < u);
+            let not_full = rec.tokens < CAPACITY;
+            let recent = now.duration_since(rec.last_update) < Duration::from_secs(10);
+            active || not_full || recent
         });
     }
 }

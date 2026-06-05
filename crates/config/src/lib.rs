@@ -56,6 +56,9 @@ pub struct ProxySection {
     #[serde(default)]
     pub prevent_proxy_connections: bool,
 
+    #[serde(default = "default_proxy_protocol")]
+    pub proxy_protocol: bool,
+
     #[serde(default = "default_session_timeout")]
     pub session_timeout_secs: u64,
 
@@ -89,6 +92,7 @@ impl Default for ProxySection {
             ip_forward: default_ip_forward(),
             max_players: default_max_players(),
             prevent_proxy_connections: false,
+            proxy_protocol: default_proxy_protocol(),
             session_timeout_secs: default_session_timeout(),
             max_connections_per_ip: default_max_conns_per_ip(),
             lobby_server_name: default_lobby_name(),
@@ -336,6 +340,9 @@ fn default_bind() -> String {
 }
 fn default_online_mode() -> bool {
     true
+}
+fn default_proxy_protocol() -> bool {
+    false
 }
 fn default_ip_forward() -> bool {
     false
