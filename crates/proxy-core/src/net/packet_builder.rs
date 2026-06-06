@@ -200,14 +200,24 @@ pub fn build_block_update_packet(x: i32, y: i32, z: i32, block_state_id: u32, pr
     use kojacoord_protocol::VersionRegistry;
     let ver = VersionRegistry::nearest(proto);
 
-    // Pack (x, y, z) into a single i64 block position (Minecraft 1.9+ format):
+    // Pack (x, y, z) into a single i64 block position.
+    // 1.14+ format (pack_pos_new):
     //   bits 63-38: X (26-bit signed)
     //   bits 37-12: Z (26-bit signed)
     //   bits 11-0:  Y (12-bit signed)
-    let pack_pos = |bx: i32, by: i32, bz: i32| -> i64 {
+    let pack_pos_new = |bx: i32, by: i32, bz: i32| -> i64 {
         (((bx & 0x3FFFFFF) as i64) << 38)
             | (((bz & 0x3FFFFFF) as i64) << 12)
             | ((by & 0xFFF) as i64)
+    };
+    // Legacy format (1.8-1.13):
+    //   bits 63-38: X (26-bit signed)
+    //   bits 37-26: Y (12-bit signed)
+    //   bits 25-0:  Z (26-bit signed)
+    let pack_pos_legacy = |bx: i32, by: i32, bz: i32| -> i64 {
+        (((bx & 0x3FFFFFF) as i64) << 38)
+            | (((by & 0xFFF) as i64) << 26)
+            | ((bz & 0x3FFFFFF) as i64)
     };
 
     let mut payload = BytesMut::new();
@@ -227,26 +237,26 @@ pub fn build_block_update_packet(x: i32, y: i32, z: i32, block_state_id: u32, pr
         ProtocolVersion::V1_8 | ProtocolVersion::V1_12_2 => {
             // 1.8/1.12: 0x23 — packed position + VarInt block data
             VarInt(0x23_i32).encode(&mut payload).unwrap();
-            let pos = pack_pos(x, y, z);
+            let pos = pack_pos_legacy(x, y, z);
             pos.encode(&mut payload).unwrap();
             VarInt(block_state_id as i32).encode(&mut payload).unwrap();
         },
         ProtocolVersion::V1_16_5 => {
             // 1.16: 0x0B — packed position + VarInt block state
             VarInt(0x0B_i32).encode(&mut payload).unwrap();
-            pack_pos(x, y, z).encode(&mut payload).unwrap();
+            pack_pos_new(x, y, z).encode(&mut payload).unwrap();
             VarInt(block_state_id as i32).encode(&mut payload).unwrap();
         },
         ProtocolVersion::V1_19_4 | ProtocolVersion::V1_20_4 | ProtocolVersion::V1_21 => {
             // 1.19-1.21: 0x09 — packed position + VarInt block state
             VarInt(0x09_i32).encode(&mut payload).unwrap();
-            pack_pos(x, y, z).encode(&mut payload).unwrap();
+            pack_pos_new(x, y, z).encode(&mut payload).unwrap();
             VarInt(block_state_id as i32).encode(&mut payload).unwrap();
         },
         _ => {
             // Unknown version: best-effort 0x09 format
             VarInt(0x09_i32).encode(&mut payload).unwrap();
-            pack_pos(x, y, z).encode(&mut payload).unwrap();
+            pack_pos_new(x, y, z).encode(&mut payload).unwrap();
             VarInt(block_state_id as i32).encode(&mut payload).unwrap();
         },
     }

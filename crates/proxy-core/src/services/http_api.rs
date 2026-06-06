@@ -226,7 +226,10 @@ async fn purchase(
         );
     };
 
-    if req.username.trim().is_empty() || req.product_slug.trim().is_empty() {
+    let username = req.username.trim();
+    let product_slug = req.product_slug.trim();
+
+    if username.is_empty() || product_slug.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "username and product_slug are required" })),
@@ -237,12 +240,23 @@ async fn purchase(
     for entry in st.proxy.sessions.iter() {
         let sess = entry.value();
         if let Ok(s) = sess.try_read() {
-            if s.username.eq_ignore_ascii_case(&req.username) {
+            if s.username.eq_ignore_ascii_case(username) {
                 online_uuid = Some(*entry.key());
                 break;
             }
         }
     }
+
+    let purchase_id = match db.add_pending_purchase(username, product_slug).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to record pending purchase in db");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "db error" })),
+            );
+        }
+    };
 
     let mut delivered = false;
     if let Some(uuid) = online_uuid {
@@ -256,36 +270,15 @@ async fn purchase(
             } else {
                 47
             };
-            let payload = req.product_slug.as_bytes();
+            let payload = product_slug.as_bytes();
             let pkt_raw = crate::packet_builder::build_serverbound_plugin_message_packet(
                 "kojacoord:purchase",
                 payload,
                 proto,
             );
             if tx.send(pkt_raw).is_ok() {
+                let _ = db.mark_purchase_delivered(purchase_id).await;
                 delivered = true;
-            }
-        }
-    }
-
-    if let Err(e) = db
-        .add_pending_purchase(&req.username, &req.product_slug)
-        .await
-    {
-        tracing::error!(error = %e, "Failed to record pending purchase in db");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "db error" })),
-        );
-    }
-
-    if delivered {
-        if let Ok(purchases) = db.get_pending_purchases(&req.username).await {
-            if let Some(p) = purchases
-                .iter()
-                .find(|x| x.product_slug == req.product_slug && !x.delivered)
-            {
-                let _ = db.mark_purchase_delivered(p.id).await;
             }
         }
     }

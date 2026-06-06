@@ -48,6 +48,20 @@ impl Db {
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(url)
             .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_purchases (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                username TEXT NOT NULL,
+                product_slug TEXT NOT NULL,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TIMESTAMP NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
             mysql_pool: Some(pool),
             sqlite_pool: None,
@@ -403,28 +417,34 @@ impl Db {
         &self,
         username: &str,
         product_slug: &str,
-    ) -> Result<(), sqlx::Error> {
-        match self.db_type {
+    ) -> Result<i64, sqlx::Error> {
+        let id = match self.db_type {
             DbType::MySql => {
                 if let Some(pool) = &self.mysql_pool {
-                    sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
+                    let result = sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
                         .bind(username)
                         .bind(product_slug)
                         .execute(pool)
                         .await?;
+                    result.last_insert_id() as i64
+                } else {
+                    return Err(sqlx::Error::Configuration("No MySQL pool".into()));
                 }
             },
             DbType::Sqlite => {
                 if let Some(pool) = &self.sqlite_pool {
-                    sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
+                    let result = sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
                         .bind(username)
                         .bind(product_slug)
                         .execute(pool)
                         .await?;
+                    result.last_insert_rowid()
+                } else {
+                    return Err(sqlx::Error::Configuration("No SQLite pool".into()));
                 }
             },
-        }
-        Ok(())
+        };
+        Ok(id)
     }
 
     pub async fn get_pending_purchases(

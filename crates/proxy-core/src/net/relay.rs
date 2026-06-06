@@ -257,9 +257,25 @@ impl PacketRelay {
                     let mut body = payload.clone();
                     let _ = VarInt::decode(&mut body);
                     if let Ok(packed) = i64::decode(&mut body) {
-                        let bx = (packed >> 38) as i32;
-                        let by = ((packed << 52) >> 52) as i32;
-                        let bz = ((packed << 26) >> 38) as i32;
+                        use kojacoord_protocol::VersionRegistry;
+                        let (bx, by, bz) = match VersionRegistry::nearest(proto) {
+                            kojacoord_protocol::ProtocolVersion::V1_7_10
+                            | kojacoord_protocol::ProtocolVersion::V1_8
+                            | kojacoord_protocol::ProtocolVersion::V1_12_2 => {
+                                // Legacy: X=63-38, Y=37-26, Z=25-0
+                                let bx = (packed >> 38) as i32;
+                                let by = ((packed >> 26) & 0xFFF) as i32;
+                                let bz = ((packed << 38) >> 38) as i32;
+                                (bx, by, bz)
+                            },
+                            _ => {
+                                // 1.14+: X=63-38, Z=37-12, Y=11-0
+                                let bx = (packed >> 38) as i32;
+                                let by = ((packed << 52) >> 52) as i32;
+                                let bz = ((packed << 26) >> 38) as i32;
+                                (bx, by, bz)
+                            }
+                        };
                         xray_s2c.remove_honeypot(player_uuid, bx, by, bz);
                     }
                 }

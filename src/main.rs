@@ -121,27 +121,42 @@ async fn main() -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         use notify::{EventKind, RecursiveMode, Watcher};
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |res| {
+        let mut watcher = match notify::recommended_watcher(move |res| {
             if let Ok(event) = res {
                 let _ = tx.send(event);
             }
-        })
-        .unwrap();
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create config file watcher");
+                return;
+            }
+        };
 
-        let _ = watcher.watch(
+        if let Err(e) = watcher.watch(
             std::path::Path::new(&watcher_path),
             RecursiveMode::NonRecursive,
-        );
+        ) {
+            tracing::error!(error = %e, path = %watcher_path, "Failed to register file watch");
+            return;
+        }
+
+        tracing::info!(path = %watcher_path, "Config file watcher active");
 
         for event in rx {
             if matches!(event.kind, EventKind::Modify(_)) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(new_cfg) = kojacoord_config::ProxyConfig::from_file(&watcher_path) {
-                    tracing::info!("Config file modified, hot-reloading servers...");
-                    let st = Arc::clone(&watcher_state);
-                    tokio::spawn(async move {
-                        st.reload_servers(&new_cfg).await;
-                    });
+                match kojacoord_config::ProxyConfig::from_file(&watcher_path) {
+                    Ok(new_cfg) => {
+                        tracing::info!("Config file modified, hot-reloading servers...");
+                        let st = Arc::clone(&watcher_state);
+                        tokio::spawn(async move {
+                            st.reload_servers(&new_cfg).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, path = %watcher_path, "Failed to parse modified config file");
+                    }
                 }
             }
         }
