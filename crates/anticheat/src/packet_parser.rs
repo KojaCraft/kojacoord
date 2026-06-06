@@ -1,3 +1,4 @@
+// Author : Starfloof.
 use bytes::Bytes;
 use kojacoord_protocol::{
     codec::Decode,
@@ -25,11 +26,27 @@ pub struct InteractData {
     pub is_attack: bool,
 }
 
+/// Data from a ServerboundPlayerAction packet (dig / block interaction).
+#[derive(Debug, Clone)]
+pub struct DigData {
+    /// 0 = START_DIGGING, 1 = CANCEL_DIGGING, 2 = FINISH_DIGGING.
+    pub status: u8,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Block face the player is mining (0=bottom … 5=east).
+    pub face: u8,
+}
+
 #[derive(Debug, Clone)]
 pub enum AnticheatPacket {
     Movement(MovementData),
     Interact(InteractData),
-    Chat { message: String },
+    /// Player started / cancelled / finished digging a block.
+    Dig(DigData),
+    Chat {
+        message: String,
+    },
     Unknown,
 }
 
@@ -103,6 +120,20 @@ pub fn parse_serverbound(payload: &Bytes, protocol_version: u32) -> AnticheatPac
         return parse_interact(&mut cursor);
     }
 
+    // ─── ServerboundPlayerAction (digging) ────────────────────────────────
+    let dig_id = match ver {
+        ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => 0x07,
+        ProtocolVersion::V1_12_2 => 0x14,
+        ProtocolVersion::V1_16_5 => 0x1A,
+        ProtocolVersion::V1_19_4 => 0x1D,
+        ProtocolVersion::V1_20_4 | ProtocolVersion::Unknown(_) | ProtocolVersion::V1_21 => 0x1C,
+        _ => 0xFF,
+    };
+
+    if packet_id == dig_id {
+        return parse_dig(&mut cursor, ver);
+    }
+
     let chat_ids: &[u8] = match ver {
         ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => &[0x01],
         ProtocolVersion::V1_12_2 => &[0x02],
@@ -143,7 +174,6 @@ fn parse_move_pos(cursor: &mut Bytes) -> AnticheatPacket {
     let x = f64::decode(cursor).unwrap_or(0.0);
     let y = f64::decode(cursor).unwrap_or(0.0);
     let z = f64::decode(cursor).unwrap_or(0.0);
-
     let on_ground = bool::decode(cursor).unwrap_or(false);
     AnticheatPacket::Movement(MovementData {
         x,
@@ -156,11 +186,50 @@ fn parse_move_pos(cursor: &mut Bytes) -> AnticheatPacket {
 
 fn parse_interact(cursor: &mut Bytes) -> AnticheatPacket {
     let entity_id = VarInt::decode(cursor).map(|v| v.0).unwrap_or(0);
-
     let action = VarInt::decode(cursor).map(|v| v.0).unwrap_or(0);
     let is_attack = action == 1;
     AnticheatPacket::Interact(InteractData {
         entity_id,
         is_attack,
+    })
+}
+
+/// Parse ServerboundPlayerAction across all supported protocol versions.
+///
+/// Format:
+/// - 1.7/1.8: status(u8) + x(i32) + y(u8) + z(i32) + face(u8)
+/// - 1.9+:    status(VarInt) + packed_pos(i64) + face(VarInt) [+ seq(VarInt) 1.19+]
+fn parse_dig(cursor: &mut Bytes, ver: ProtocolVersion) -> AnticheatPacket {
+    let status = match ver {
+        ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => u8::decode(cursor).unwrap_or(0xFF),
+        _ => VarInt::decode(cursor).map(|v| v.0 as u8).unwrap_or(0xFF),
+    };
+
+    let (bx, by, bz) = if matches!(ver, ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8) {
+        // 1.7/1.8 separate fields: x(i32) + y(u8) + z(i32)
+        let bx = i32::decode(cursor).unwrap_or(0);
+        let by = u8::decode(cursor).unwrap_or(0) as i32;
+        let bz = i32::decode(cursor).unwrap_or(0);
+        (bx, by, bz)
+    } else {
+        // 1.9+: 64-bit packed block position  X[26] Z[26] Y[12]
+        let packed = i64::decode(cursor).unwrap_or(0);
+        let bx = (packed >> 38) as i32;
+        let by = ((packed << 52) >> 52) as i32;
+        let bz = ((packed << 26) >> 38) as i32;
+        (bx, by, bz)
+    };
+
+    let face = match ver {
+        ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => u8::decode(cursor).unwrap_or(0),
+        _ => VarInt::decode(cursor).map(|v| v.0 as u8).unwrap_or(0),
+    };
+
+    AnticheatPacket::Dig(DigData {
+        status,
+        x: bx,
+        y: by,
+        z: bz,
+        face,
     })
 }

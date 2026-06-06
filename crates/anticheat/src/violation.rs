@@ -21,6 +21,7 @@ pub enum CheckCategory {
     Player,
     Network,
     Inventory,
+    World,
 }
 
 impl CheckCategory {
@@ -31,6 +32,7 @@ impl CheckCategory {
             CheckCategory::Player => "Player",
             CheckCategory::Network => "Network",
             CheckCategory::Inventory => "Inventory",
+            CheckCategory::World => "World",
         }
     }
 }

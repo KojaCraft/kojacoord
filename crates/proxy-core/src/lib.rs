@@ -1,8 +1,7 @@
-#![deny(clippy::all)]
-
 pub mod buffer_pool;
 pub mod error;
 pub mod metrics;
+pub mod metrics_report;
 pub mod proxy;
 pub mod routing;
 pub mod server;

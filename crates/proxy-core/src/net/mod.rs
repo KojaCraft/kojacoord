@@ -8,4 +8,7 @@ pub mod packet_builder;
 pub mod packet_ids;
 pub mod packet_io;
 pub mod plugin_decoder;
+
+/// Author : Starfloof.
+pub mod proxy_protocol;
 pub mod relay;

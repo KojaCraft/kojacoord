@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::permissions::RoleRegistry;
 
-use kojacoord_anticheat::AnticheatEngine;
+use kojacoord_anticheat::{AnticheatEngine, XrayEngine};
 use kojacoord_auth::{AuthConfig, AuthPipelineConfig};
 use kojacoord_cluster::{ClusterCoordinator, ServiceDiscovery};
 use kojacoord_config::ProxyConfig;
@@ -74,12 +74,15 @@ pub struct ProxyState {
     pub metrics: Arc<ProxyMetrics>,
     pub auth_pipeline_config: Arc<AuthPipelineConfig>,
     pub anticheat: Arc<AnticheatEngine>,
+    /// Author : Starfloof.
+    pub xray: Arc<XrayEngine>,
 
     pub db: Option<Arc<crate::db::Db>>,
 
     pub roles: Arc<RoleRegistry>,
 
     pub outbound: Arc<DashMap<Uuid, mpsc::UnboundedSender<Bytes>>>,
+    pub backend_outbound: Arc<DashMap<Uuid, mpsc::UnboundedSender<Bytes>>>,
 
     pub started_at: std::time::Instant,
 
@@ -95,6 +98,14 @@ pub struct ProxyState {
     pub tps_tracker: Arc<TpsTracker>,
 
     pub connection_throttle: Arc<ConnectionThrottle>,
+
+    /// Author : Starfloof.
+    pub cached_status: arc_swap::ArcSwap<CachedStatus>,
+}
+
+/// Author : Starfloof.
+pub struct CachedStatus {
+    pub suffix: String,
 }
 
 impl ProxyState {
@@ -149,6 +160,8 @@ impl ProxyState {
         )?);
 
         let anticheat = Arc::new(AnticheatEngine::new(config.anticheat.clone()));
+        // XRay honeypot engine — enabled whenever anticheat is enabled.
+        let xray = Arc::new(XrayEngine::new(config.anticheat.enabled, None));
 
         let db = if config.database.url.trim().is_empty() {
             let sqlite_path = "data/proxy.db";
@@ -286,9 +299,11 @@ impl ProxyState {
             metrics: Arc::new(ProxyMetrics::new()),
             auth_pipeline_config,
             anticheat,
+            xray,
             db,
             roles: Arc::new(roles),
             outbound: Arc::new(DashMap::new()),
+            backend_outbound: Arc::new(DashMap::new()),
             started_at: std::time::Instant::now(),
             cluster_coordinator,
             service_discovery,
@@ -297,7 +312,75 @@ impl ProxyState {
             plugin_manager,
             tps_tracker,
             connection_throttle,
+            cached_status: arc_swap::ArcSwap::new(Arc::new(CachedStatus {
+                suffix:
+                    r#"},"players":{"max":0,"online":0,"sample":[]},"description":{"text":""}}"#
+                        .to_string(),
+            })),
         })
+    }
+
+    /// Author : Starfloof.
+    pub async fn reload_servers(&self, new_config: &kojacoord_config::ProxyConfig) {
+        let mut new_names = std::collections::HashSet::new();
+        for s in &new_config.servers {
+            new_names.insert(s.name.clone());
+            let addr = match s.address.parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(name = %s.name, address = %s.address, error = %e, "Invalid server address in config, skipping");
+                    continue;
+                }
+            };
+
+            if let Some(existing) = self.server_registry.get(&s.name) {
+                let needs_update = existing.address != addr
+                    || existing.restricted != s.restricted
+                    || existing.forwarding_override != s.forwarding_override
+                    || existing.backend_type != s.backend_type;
+
+                if needs_update {
+                    let old_player_count = existing.player_count.load(std::sync::atomic::Ordering::Relaxed);
+                    let old_online = existing.online.load(std::sync::atomic::Ordering::Relaxed);
+
+                    self.server_registry
+                        .register(crate::server::BackendServer {
+                            name: s.name.clone(),
+                            address: addr,
+                            restricted: s.restricted,
+                            forwarding_override: s.forwarding_override.clone(),
+                            player_count: Arc::new(std::sync::atomic::AtomicUsize::new(old_player_count)),
+                            online: Arc::new(std::sync::atomic::AtomicBool::new(old_online)),
+                            connection_pool: None,
+                            backend_type: s.backend_type.clone(),
+                        })
+                        .await;
+                    tracing::info!("Hot-reloaded (updated) server: {}", s.name);
+                }
+            } else {
+                self.server_registry
+                    .register(crate::server::BackendServer {
+                        name: s.name.clone(),
+                        address: addr,
+                        restricted: s.restricted,
+                        forwarding_override: s.forwarding_override.clone(),
+                        player_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                        connection_pool: None,
+                        backend_type: s.backend_type.clone(),
+                    })
+                    .await;
+                tracing::info!("Hot-reloaded new server: {}", s.name);
+            }
+        }
+
+        let all_current = self.server_registry.all();
+        for current in all_current {
+            if !new_names.contains(&current.name) {
+                self.server_registry.remove(&current.name);
+                tracing::info!("Hot-reloaded (removed) server: {}", current.name);
+            }
+        }
     }
 
     pub fn send_to_player(&self, uuid: &Uuid, packet: Bytes) -> bool {
@@ -424,6 +507,9 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         });
     }
 
+    // Start modpack online counts background reporting loop
+    crate::metrics_report::start_reporting(Arc::clone(&state));
+
     // Periodically evict stale per-IP throttle records so the map cannot grow
     // unbounded (e.g. from a wide IPv6 source range).
     tokio::spawn({
@@ -452,6 +538,76 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
                     failed = snapshot.failed_connections,
                     "Metrics snapshot"
                 );
+            }
+        }
+    });
+
+    // Author : Starfloof.
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+
+                let (online_count, sample) = {
+                    let count = state.sessions.len();
+                    let server_lore = &state.config.listeners.server_lore;
+
+                    let mut sample: Vec<serde_json::Value> = state
+                        .sessions
+                        .iter()
+                        .take(12)
+                        .filter_map(|entry| {
+                            let s = entry.value();
+                            s.try_read().ok().map(|g| {
+                                let mut player_json = serde_json::json!({
+                                    "name": g.username,
+                                    "id": g.uuid.hyphenated().to_string()
+                                });
+                                if let Some(lore) = server_lore {
+                                    player_json["lore"] = serde_json::json!(lore);
+                                }
+                                player_json
+                            })
+                        })
+                        .collect();
+
+                    if sample.is_empty() {
+                        if let Some(lore) = server_lore {
+                            sample.push(serde_json::json!({
+                                "name": "",
+                                "id": "",
+                                "lore": lore
+                            }));
+                        }
+                    }
+
+                    (count, sample)
+                };
+
+                let description = if let Some(ref motd_json) = state.config.listeners.motd_json {
+                    motd_json.clone()
+                } else {
+                    serde_json::json!({ "text": &state.config.listeners.motd })
+                };
+
+                let players_json = serde_json::json!({
+                    "max":    state.config.proxy.max_players,
+                    "online": online_count,
+                    "sample": sample,
+                });
+
+                let suffix = [
+                    r#"},"players":"#,
+                    &serde_json::to_string(&players_json).unwrap_or_else(|_| "{}".to_string()),
+                    r#","description":"#,
+                    &serde_json::to_string(&description).unwrap_or_else(|_| "{}".to_string()),
+                    r#"}"#,
+                ]
+                .join("");
+
+                state.cached_status.store(Arc::new(CachedStatus { suffix }));
             }
         }
     });

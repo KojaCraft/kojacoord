@@ -34,6 +34,7 @@ tracing-appender = "0.2"
 flate2 = "1.0"
 chrono = { workspace = true }
 toml = { workspace = true }
+notify = "6.1.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = ["Win32_Security_Authorization", "Win32_Security", "Win32_System_Threading", "Win32_Foundation"] }
@@ -109,6 +110,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.private_api]
+inherits = "release"
 
 # cargo-binstall: install prebuilt release binaries with `cargo binstall kojacoord-proxy`.
 # The release uploads raw binaries (not archives), so pkg-fmt = "bin" and each

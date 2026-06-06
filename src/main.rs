@@ -115,6 +115,57 @@ async fn main() -> anyhow::Result<()> {
     // [telemetry] enabled in the config; never blocks or fails the proxy.
     kojacoord_proxy_core::telemetry::spawn(Arc::clone(&state));
 
+    // Author : Starfloof.
+    let watcher_state = Arc::clone(&state);
+    let watcher_path = config_path.clone();
+    tokio::task::spawn_blocking(move || {
+        use notify::{EventKind, RecursiveMode, Watcher};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create config file watcher");
+                return;
+            }
+        };
+
+        let config_path_buf = std::path::PathBuf::from(&watcher_path);
+        let parent_dir = config_path_buf.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+        if let Err(e) = watcher.watch(parent_dir, RecursiveMode::NonRecursive) {
+            tracing::error!(error = %e, path = %watcher_path, "Failed to register file watch");
+            return;
+        }
+
+        tracing::info!(path = %watcher_path, "Config file watcher active");
+
+        for event in rx {
+            let target_modified = event.paths.iter().any(|p| {
+                p.file_name() == config_path_buf.file_name()
+            });
+
+            if target_modified && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match kojacoord_config::ProxyConfig::from_file(&watcher_path) {
+                    Ok(new_cfg) => {
+                        tracing::info!("Config file modified, hot-reloading servers...");
+                        let st = Arc::clone(&watcher_state);
+                        tokio::spawn(async move {
+                            st.reload_servers(&new_cfg).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, path = %watcher_path, "Failed to parse modified config file");
+                    }
+                }
+            }
+        }
+    });
+
     kojacoord_proxy_core::proxy::accept_loop(state).await
 }
 

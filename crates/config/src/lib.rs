@@ -37,6 +37,9 @@ pub struct ProxyConfig {
 
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    #[serde(default)]
+    pub metrics_backend: MetricsBackendConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +62,10 @@ pub struct ProxySection {
     #[serde(default)]
     pub prevent_proxy_connections: bool,
 
+    /// Author : Starfloof.
+    #[serde(default = "default_proxy_protocol")]
+    pub proxy_protocol: bool,
+
     #[serde(default = "default_session_timeout")]
     pub session_timeout_secs: u64,
 
@@ -70,9 +77,12 @@ pub struct ProxySection {
 
     #[serde(default = "default_lobby_name")]
     pub lobby_server_name: String,
+
     #[serde(default)]
     pub lobby_server_protocol: u32,
 
+    /// Stable node identity — generated once on first run and persisted to the
+    /// config file. Never regenerated unless the field is manually cleared.
     #[serde(default)]
     pub server_id: String,
 
@@ -92,11 +102,14 @@ impl Default for ProxySection {
             ip_forward: default_ip_forward(),
             max_players: default_max_players(),
             prevent_proxy_connections: false,
+            proxy_protocol: default_proxy_protocol(),
             session_timeout_secs: default_session_timeout(),
             max_connections_per_ip: default_max_conns_per_ip(),
             lobby_server_name: default_lobby_name(),
             lobby_server_protocol: 47,
-            server_id: generate_server_id(),
+            // Empty on first construction — ensure_server_id() fills and
+            // persists the value before Figment reads the file.
+            server_id: String::new(),
             eula_accepted: false,
             auth_url: default_auth_url(),
         }
@@ -289,8 +302,9 @@ impl Default for TelemetryConfig {
 }
 
 fn default_telemetry_endpoint() -> String {
-    "https://metric.kojacoord.net".into()
+    "https://metrics.kojacraft.net".into()
 }
+
 fn default_telemetry_interval() -> u64 {
     // Every 30 minutes is plenty for adoption metrics and is gentle on the endpoint.
     1800
@@ -321,6 +335,7 @@ impl Default for HttpApiConfig {
 fn default_http_bind() -> String {
     "127.0.0.1:8081".into()
 }
+
 fn default_http_token() -> String {
     // Intentionally empty: a real secret must be configured (or is auto-generated
     // on first run). Validation rejects empty/placeholder tokens at startup.
@@ -352,6 +367,9 @@ pub struct AnticheatConfig {
 
     pub bridge_endpoint: Option<String>,
 
+    #[serde(default)]
+    pub bridge_token: String,
+
     #[serde(default = "bool_true")]
     pub store_violations: bool,
 }
@@ -363,16 +381,32 @@ impl Default for AnticheatConfig {
             max_speed_blocks_per_tick: default_max_speed(),
             max_cps: default_max_cps(),
             bridge_endpoint: None,
+            bridge_token: String::new(),
             store_violations: true,
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MetricsBackendConfig {
+    #[serde(default)]
+    pub url: String,
+
+    #[serde(default)]
+    pub token: String,
+}
+
+// ── Default value functions ────────────────────────────────────────────────────
 
 fn default_bind() -> String {
     "0.0.0.0:25565".into()
 }
 fn default_online_mode() -> bool {
     true
+}
+/// Author : Starfloof.
+fn default_proxy_protocol() -> bool {
+    false
 }
 fn default_ip_forward() -> bool {
     false
@@ -404,7 +438,6 @@ fn default_max_cps() -> u32 {
 fn bool_true() -> bool {
     true
 }
-
 fn default_lobby_name() -> String {
     "lobby".into()
 }
@@ -420,6 +453,14 @@ fn default_management_auth_token() -> String {
     // Intentionally empty: see default_http_token().
     String::new()
 }
+fn default_auth_url() -> String {
+    "https://sessionserver.mojang.com/session/minecraft/hasJoined".into()
+}
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9090".into()
+}
+
+// ── Secret utilities ───────────────────────────────────────────────────────────
 
 /// Generate a cryptographically-strong random secret suitable for auth tokens.
 pub fn generate_secret() -> String {
@@ -430,13 +471,7 @@ pub fn generate_secret() -> String {
     )
 }
 
-fn default_auth_url() -> String {
-    "https://sessionserver.mojang.com/session/minecraft/hasJoined".into()
-}
-fn default_metrics_bind() -> String {
-    "127.0.0.1:9090".into()
-}
-
+/// Generate a stable node identity UUID.
 fn generate_server_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -491,12 +526,59 @@ fn validate_secret(name: &str, value: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+// ── ProxyConfig impl ───────────────────────────────────────────────────────────
+
 impl ProxyConfig {
+    /// Ensures a stable `proxy.server_id` exists in the TOML file on disk.
+    ///
+    /// - If the field is already present and non-empty the existing value is
+    ///   returned unchanged.
+    /// - If the field is absent or empty a new UUID v4 is generated, written
+    ///   back to the file, and returned.
+    ///
+    /// Must be called before [`from_file`] so that Figment picks up the
+    /// persisted value on the same load.
+    pub fn ensure_server_id(path: impl AsRef<Path>) -> Result<String, anyhow::Error> {
+        use std::fs;
+
+        let raw = fs::read_to_string(path.as_ref()).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = raw.parse()?;
+
+        // Check whether proxy.server_id is already a non-empty string.
+        if let Some(proxy) = doc.get("proxy") {
+            if let Some(id) = proxy.get("server_id") {
+                if let Some(s) = id.as_str() {
+                    if !s.trim().is_empty() {
+                        return Ok(s.to_string());
+                    }
+                }
+            }
+        }
+
+        // Generate, write back, and return the new ID.
+        let new_id = generate_server_id();
+
+        // Ensure the [proxy] table exists before writing into it.
+        if doc.get("proxy").is_none() {
+            doc["proxy"] = toml_edit::table();
+        }
+        doc["proxy"]["server_id"] = toml_edit::value(new_id.clone());
+
+        fs::write(path.as_ref(), doc.to_string())?;
+        tracing::info!("Generated and persisted new server_id = {}", new_id);
+
+        Ok(new_id)
+    }
+
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, anyhow::Error> {
         use figment::{
             providers::{Env, Format, Toml},
             Figment,
         };
+
+        // Persist server_id first so Figment reads the stable value from disk.
+        Self::ensure_server_id(path.as_ref())?;
+
         // Environment overrides use `__` to denote nesting so secrets can be
         // injected without baking them into the TOML, e.g.
         //   KOJA_HTTP_API__AUTH_TOKEN, KOJA_SERVER_MANAGEMENT__AUTH_TOKEN,
@@ -505,6 +587,7 @@ impl ProxyConfig {
             .merge(Toml::file(path.as_ref()))
             .merge(Env::prefixed("KOJA_").split("__").global())
             .extract()?;
+
         config.validate()?;
         Ok(config)
     }
@@ -535,6 +618,14 @@ impl ProxyConfig {
     /// Fail fast on insecure security-sensitive configuration so the proxy never
     /// starts with publicly-known credentials or a forgeable forwarding secret.
     pub fn validate(&self) -> Result<(), anyhow::Error> {
+        // server_id must be present and non-empty after ensure_server_id().
+        if self.proxy.server_id.trim().is_empty() {
+            anyhow::bail!(
+                "proxy.server_id is empty; this should have been populated by \
+                 ensure_server_id() — check file write permissions."
+            );
+        }
+
         // Server-management control plane: only enforce when the feature is on.
         if self.server_management.enabled {
             validate_secret(
@@ -583,5 +674,28 @@ mod tests {
         assert_eq!(cfg.proxy.bind, "0.0.0.0:25565");
         assert!(cfg.proxy.online_mode);
         assert_eq!(cfg.proxy.compression_threshold, 256);
+    }
+
+    #[test]
+    fn ensure_server_id_is_stable() {
+        use std::fs;
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        // Write a minimal config with no server_id
+        fs::write(path, "[proxy]\nbind = \"0.0.0.0:25565\"\n").unwrap();
+
+        let id1 = ProxyConfig::ensure_server_id(path).unwrap();
+        let id2 = ProxyConfig::ensure_server_id(path).unwrap();
+
+        // Must be a valid UUID and stable across calls
+        assert!(!id1.is_empty());
+        assert_eq!(id1, id2, "server_id must not change between calls");
+
+        // Must be present in the written file
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains(&id1), "server_id must be persisted to disk");
     }
 }
