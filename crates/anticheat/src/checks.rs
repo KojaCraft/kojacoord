@@ -350,26 +350,29 @@ impl AnticheatEngine {
         // NoFall hacks keep dy at exactly 0.0 (or even slightly positive) even
         // after extended fall time. We flag if after 20+ air ticks the last
         // 5 dy samples are ALL > -0.3 (far too shallow for a real fall).
-        if violation_to_report.is_none() && !on_ground && !should_suppress_nofall {
-            if state.air_ticks > 20 && state.dy_history.len() >= 5 {
-                let shallow_fall = state.dy_history.iter().rev().take(5).all(|&d| d > -0.3);
-                if shallow_fall {
-                    let count = self.increment_vl(&mut state, "NoFall");
-                    if count >= VL_NOFALL {
-                        violation_to_report = Some(Violation {
-                            player_uuid: uuid,
-                            check_name: "NoFall".into(),
-                            check_category: CheckCategory::Movement,
-                            value: state.dy_history.back().copied().unwrap_or(0.0),
-                            threshold: -0.3,
-                            timestamp: chrono::Utc::now(),
-                            server_id: None,
-                            suppressed: false,
-                        });
-                    }
-                } else {
-                    self.decay_vl(&mut state, "NoFall");
+        if violation_to_report.is_none()
+            && !on_ground
+            && !should_suppress_nofall
+            && state.air_ticks > 20
+            && state.dy_history.len() >= 5
+        {
+            let shallow_fall = state.dy_history.iter().rev().take(5).all(|&d| d > -0.3);
+            if shallow_fall {
+                let count = self.increment_vl(&mut state, "NoFall");
+                if count >= VL_NOFALL {
+                    violation_to_report = Some(Violation {
+                        player_uuid: uuid,
+                        check_name: "NoFall".into(),
+                        check_category: CheckCategory::Movement,
+                        value: state.dy_history.back().copied().unwrap_or(0.0),
+                        threshold: -0.3,
+                        timestamp: chrono::Utc::now(),
+                        server_id: None,
+                        suppressed: false,
+                    });
                 }
+            } else {
+                self.decay_vl(&mut state, "NoFall");
             }
         }
 

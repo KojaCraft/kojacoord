@@ -255,7 +255,7 @@ async fn purchase(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "db error" })),
             );
-        }
+        },
     };
 
     let mut delivered = false;
