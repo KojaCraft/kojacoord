@@ -25,3 +25,6 @@ thiserror = { workspace = true }
 figment = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+toml_edit = "0.22"
+tempfile  = { version = "3", dev-dependencies = true }
+

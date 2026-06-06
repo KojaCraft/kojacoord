@@ -42,6 +42,7 @@ pub async fn serve(proxy: Arc<ProxyState>, bind: String, token: String) -> anyho
         .route("/health", get(health))
         .route("/api/players", get(players))
         .route("/api/ban", post(ban))
+        .route("/api/purchase", post(purchase))
         .nest_service("/", dashboard_service)
         .layer(cors)
         .with_state(ApiState { proxy, token });
@@ -164,7 +165,8 @@ async fn ban(
         .reason
         .unwrap_or_else(|| "Banned by an operator".to_owned());
     if reason.len() > 1024 {
-        reason = reason.char_indices()
+        reason = reason
+            .char_indices()
             .take_while(|(idx, _)| *idx < 1024)
             .map(|(_, c)| c)
             .collect();
@@ -172,7 +174,8 @@ async fn ban(
 
     let mut banned_by = req.banned_by.unwrap_or_else(|| "dashboard".to_owned());
     if banned_by.len() > 256 {
-        banned_by = banned_by.char_indices()
+        banned_by = banned_by
+            .char_indices()
             .take_while(|(idx, _)| *idx < 256)
             .map(|(_, c)| c)
             .collect();
@@ -196,5 +199,99 @@ async fn ban(
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "uuid": uuid.hyphenated().to_string() })),
+    )
+}
+
+#[derive(Deserialize)]
+struct PurchaseRequest {
+    username: String,
+    product_slug: String,
+}
+
+async fn purchase(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<PurchaseRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &st.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(db) = &st.proxy.db else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no database" })),
+        );
+    };
+
+    if req.username.trim().is_empty() || req.product_slug.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "username and product_slug are required" })),
+        );
+    }
+
+    let mut online_uuid = None;
+    for entry in st.proxy.sessions.iter() {
+        let sess = entry.value();
+        if let Ok(s) = sess.try_read() {
+            if s.username.eq_ignore_ascii_case(&req.username) {
+                online_uuid = Some(*entry.key());
+                break;
+            }
+        }
+    }
+
+    let mut delivered = false;
+    if let Some(uuid) = online_uuid {
+        if let Some(tx) = st.proxy.backend_outbound.get(&uuid) {
+            let proto = if let Some(sess) = st.proxy.sessions.get(&uuid) {
+                if let Ok(s) = sess.try_read() {
+                    s.protocol_version
+                } else {
+                    47
+                }
+            } else {
+                47
+            };
+            let payload = req.product_slug.as_bytes();
+            let pkt_raw = crate::packet_builder::build_serverbound_plugin_message_packet(
+                "kojacoord:purchase",
+                payload,
+                proto,
+            );
+            if tx.send(pkt_raw).is_ok() {
+                delivered = true;
+            }
+        }
+    }
+
+    if let Err(e) = db
+        .add_pending_purchase(&req.username, &req.product_slug)
+        .await
+    {
+        tracing::error!(error = %e, "Failed to record pending purchase in db");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "db error" })),
+        );
+    }
+
+    if delivered {
+        if let Ok(purchases) = db.get_pending_purchases(&req.username).await {
+            if let Some(p) = purchases
+                .iter()
+                .find(|x| x.product_slug == req.product_slug && !x.delivered)
+            {
+                let _ = db.mark_purchase_delivered(p.id).await;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "delivered": delivered })),
     )
 }

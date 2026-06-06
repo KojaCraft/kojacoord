@@ -272,6 +272,19 @@ impl ClientConnection {
     }
 
     pub async fn run(mut self) -> Result<(), ConnectionError> {
+        if self.state.config.proxy.proxy_protocol {
+            match crate::net::proxy_protocol::read_proxy_header(&mut self.stream, self.addr).await {
+                Ok(real_addr) => {
+                    tracing::debug!(original = %self.addr, real = %real_addr, "parsed proxy protocol header");
+                    self.addr = real_addr;
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse proxy protocol header");
+                    return Err(e);
+                },
+            }
+        }
+
         self.state.metrics.record_connection();
 
         let handshake = match tokio::time::timeout(
@@ -357,59 +370,13 @@ impl ClientConnection {
         let _len = read_varint(&mut self.stream).await?;
         let _id = read_varint(&mut self.stream).await?;
 
-        let (online_count, sample) = {
-            let count = self.state.sessions.len();
-            let server_lore = &self.state.config.listeners.server_lore;
-
-            let mut sample: Vec<serde_json::Value> = self
-                .state
-                .sessions
-                .iter()
-                .take(12)
-                .filter_map(|entry| {
-                    let s = entry.value();
-                    s.try_read().ok().map(|g| {
-                        let mut player_json = serde_json::json!({
-                            "name": g.username,
-                            "id": g.uuid.hyphenated().to_string()
-                        });
-                        if let Some(lore) = server_lore {
-                            player_json["lore"] = serde_json::json!(lore);
-                        }
-                        player_json
-                    })
-                })
-                .collect();
-
-            if sample.is_empty() {
-                if let Some(lore) = server_lore {
-                    sample.push(serde_json::json!({
-                        "name": "",
-                        "id": "",
-                        "lore": lore
-                    }));
-                }
-            }
-
-            (count, sample)
-        };
-
-        let description = if let Some(ref motd_json) = self.state.config.listeners.motd_json {
-            motd_json.clone()
-        } else {
-            serde_json::json!({ "text": &self.state.config.listeners.motd })
-        };
-
-        let json = serde_json::json!({
-            "version": { "name": "Koja", "protocol": self.protocol_version },
-            "players": {
-                "max":    self.state.config.proxy.max_players,
-                "online": online_count,
-                "sample": sample,
-            },
-            "description": description,
-        })
-        .to_string();
+        let cached = self.state.cached_status.load();
+        let json = [
+            r#"{"version":{"name":"Koja","protocol":"#,
+            &self.protocol_version.to_string(),
+            &cached.suffix,
+        ]
+        .join("");
 
         self.write_packet(&ClientboundStatusResponse {
             json_response: json,

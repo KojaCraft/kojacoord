@@ -90,6 +90,8 @@ impl ModCompatibility {
         }
 
         if self.strict_mode {
+            // In strict mode only suppress a check when the specific trusted mod
+            // that could legitimately cause the anomaly is present.
             let has_only_trusted = state
                 .detected_mods
                 .iter()
@@ -97,19 +99,29 @@ impl ModCompatibility {
 
             if has_only_trusted {
                 match check_name {
+                    // Performance mods (Sodium/Lithium) can alter tick-rate
+                    // behaviour slightly on older hardware → minor speed jitter.
+                    // ReplayMod can also send packets at non-standard rates.
                     "Speed" | "Timer" => state.detected_mods.iter().any(|m| {
-                        m.contains("sodium") || m.contains("lithium") || m.contains("rubidium")
+                        m.contains("sodium")
+                            || m.contains("lithium")
+                            || m.contains("rubidium")
+                            || m.contains("replaymod")
                     }),
+                    // OptiFine/Iris change entity rendering distance which can
+                    // affect the reported hit-distance in some versions.
                     "Reach" => state
                         .detected_mods
                         .iter()
                         .any(|m| m.contains("optifine") || m.contains("iris")),
+                    // No other checks should be suppressed for trusted mods.
                     _ => false,
                 }
             } else {
                 false
             }
         } else {
+            // Lenient mode: suppress all checks for any player with a trusted mod.
             state.detected_mods.iter().any(|m| self.is_trusted_mod(m))
         }
     }

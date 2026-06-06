@@ -17,6 +17,14 @@ pub struct Db {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingPurchase {
+    pub id: i64,
+    pub username: String,
+    pub product_slug: String,
+    pub delivered: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RoleRow {
     pub name: String,
     pub display_name: String,
@@ -59,6 +67,19 @@ impl Db {
                 username TEXT PRIMARY KEY,
                 uuid TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                product_slug TEXT NOT NULL,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TIMESTAMP NULL
             )",
         )
         .execute(&pool)
@@ -190,81 +211,80 @@ impl Db {
     }
 
     pub async fn player_rank(&self, uuid: Uuid) -> Result<Option<String>, sqlx::Error> {
-        let rank_str = if let Some(pool) = &self.mysql_pool {
-            let row = sqlx::query("SELECT `rank` FROM players WHERE uuid = ?")
-                .bind(uuid.hyphenated().to_string())
-                .fetch_optional(pool)
-                .await?;
-            row.map(|r| r.get::<String, _>("rank"))
-        } else if let Some(pool) = &self.sqlite_pool {
-            let row = sqlx::query("SELECT `rank` FROM players WHERE uuid = ?")
-                .bind(uuid.hyphenated().to_string())
-                .fetch_optional(pool)
-                .await?;
-            row.map(|r| r.get::<String, _>("rank"))
-        } else {
-            return Ok(None);
-        };
-        Ok(rank_str)
+        let uuid_str = uuid.hyphenated().to_string();
+        match self.db_type {
+            DbType::MySql => {
+                let Some(pool) = &self.mysql_pool else {
+                    return Ok(None);
+                };
+                let row = sqlx::query("SELECT role FROM players WHERE uuid = ? LIMIT 1")
+                    .bind(&uuid_str)
+                    .fetch_optional(pool)
+                    .await?;
+                Ok(row.map(|r| r.get::<String, _>("role")))
+            },
+            DbType::Sqlite => {
+                let Some(pool) = &self.sqlite_pool else {
+                    return Ok(None);
+                };
+                let row = sqlx::query("SELECT role FROM players WHERE uuid = ? LIMIT 1")
+                    .bind(&uuid_str)
+                    .fetch_optional(pool)
+                    .await?;
+                Ok(row.map(|r| r.get::<String, _>("role")))
+            },
+        }
     }
 
     pub async fn load_roles(&self) -> Result<Vec<RoleRow>, sqlx::Error> {
+        macro_rules! map_rows {
+            ($rows:expr) => {
+                $rows
+                    .into_iter()
+                    .map(|r| {
+                        use sqlx::Row;
+                        let permissions = r
+                            .get::<Option<String>, _>("permissions")
+                            .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+                            .unwrap_or_default();
+                        RoleRow {
+                            name: r.get::<String, _>("name"),
+                            display_name: r.get::<String, _>("display_name"),
+                            prefix: r.get::<String, _>("prefix"),
+                            color: r.get::<String, _>("color"),
+                            weight: r.get::<i32, _>("weight"),
+                            permissions,
+                        }
+                    })
+                    .collect()
+            };
+        }
+
         let rows: Vec<RoleRow> = match self.db_type {
             DbType::MySql => {
-                if let Some(pool) = &self.mysql_pool {
-                    let rows = sqlx::query(
-                        "SELECT name, display_name, prefix, color, weight, permissions FROM roles",
-                    )
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|r| {
-                            let permissions = r
-                                .get::<Option<String>, _>("permissions")
-                                .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
-                                .unwrap_or_default();
-                            RoleRow {
-                                name: r.get::<String, _>("name"),
-                                display_name: r.get::<String, _>("display_name"),
-                                prefix: r.get::<String, _>("prefix"),
-                                color: r.get::<String, _>("color"),
-                                weight: r.get::<i32, _>("weight"),
-                                permissions,
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
+                let Some(pool) = &self.mysql_pool else {
+                    return Ok(vec![]);
+                };
+                let rows = sqlx::query(
+                    "SELECT name, display_name, prefix, color, weight, CAST(permissions AS CHAR) as permissions FROM roles",
+                )
+                .fetch_all(pool)
+                .await?;
+                map_rows!(rows)
             },
             DbType::Sqlite => {
-                if let Some(pool) = &self.sqlite_pool {
-                    let rows = sqlx::query(
-                        "SELECT name, display_name, prefix, color, weight, permissions FROM roles",
-                    )
-                    .fetch_all(pool)
-                    .await?;
-                    rows.into_iter()
-                        .map(|r| {
-                            let permissions = r
-                                .get::<Option<String>, _>("permissions")
-                                .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
-                                .unwrap_or_default();
-                            RoleRow {
-                                name: r.get::<String, _>("name"),
-                                display_name: r.get::<String, _>("display_name"),
-                                prefix: r.get::<String, _>("prefix"),
-                                color: r.get::<String, _>("color"),
-                                weight: r.get::<i32, _>("weight"),
-                                permissions,
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
+                let Some(pool) = &self.sqlite_pool else {
+                    return Ok(vec![]);
+                };
+                let rows = sqlx::query(
+                    "SELECT name, display_name, prefix, color, weight, permissions FROM roles",
+                )
+                .fetch_all(pool)
+                .await?;
+                map_rows!(rows)
             },
         };
+
         Ok(rows)
     }
 
@@ -377,5 +397,98 @@ impl Db {
                 Ok(None)
             },
         }
+    }
+
+    pub async fn add_pending_purchase(
+        &self,
+        username: &str,
+        product_slug: &str,
+    ) -> Result<(), sqlx::Error> {
+        match self.db_type {
+            DbType::MySql => {
+                if let Some(pool) = &self.mysql_pool {
+                    sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
+                        .bind(username)
+                        .bind(product_slug)
+                        .execute(pool)
+                        .await?;
+                }
+            },
+            DbType::Sqlite => {
+                if let Some(pool) = &self.sqlite_pool {
+                    sqlx::query("INSERT INTO pending_purchases (username, product_slug, delivered) VALUES (?, ?, 0)")
+                        .bind(username)
+                        .bind(product_slug)
+                        .execute(pool)
+                        .await?;
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub async fn get_pending_purchases(
+        &self,
+        username: &str,
+    ) -> Result<Vec<PendingPurchase>, sqlx::Error> {
+        let mut list = Vec::new();
+        match self.db_type {
+            DbType::MySql => {
+                if let Some(pool) = &self.mysql_pool {
+                    let rows = sqlx::query("SELECT id, username, product_slug, delivered FROM pending_purchases WHERE username = ? AND delivered = 0")
+                        .bind(username)
+                        .fetch_all(pool)
+                        .await?;
+                    for r in rows {
+                        list.push(PendingPurchase {
+                            id: r.get::<i64, _>("id"),
+                            username: r.get::<String, _>("username"),
+                            product_slug: r.get::<String, _>("product_slug"),
+                            delivered: r.get::<i8, _>("delivered") != 0,
+                        });
+                    }
+                }
+            },
+            DbType::Sqlite => {
+                if let Some(pool) = &self.sqlite_pool {
+                    let rows = sqlx::query("SELECT id, username, product_slug, delivered FROM pending_purchases WHERE username = ? AND delivered = 0")
+                        .bind(username)
+                        .fetch_all(pool)
+                        .await?;
+                    for r in rows {
+                        let delivered_val: i32 = r.get("delivered");
+                        list.push(PendingPurchase {
+                            id: r.get::<i64, _>("id"),
+                            username: r.get::<String, _>("username"),
+                            product_slug: r.get::<String, _>("product_slug"),
+                            delivered: delivered_val != 0,
+                        });
+                    }
+                }
+            },
+        }
+        Ok(list)
+    }
+
+    pub async fn mark_purchase_delivered(&self, id: i64) -> Result<(), sqlx::Error> {
+        match self.db_type {
+            DbType::MySql => {
+                if let Some(pool) = &self.mysql_pool {
+                    sqlx::query("UPDATE pending_purchases SET delivered = 1, delivered_at = CURRENT_TIMESTAMP WHERE id = ?")
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                }
+            },
+            DbType::Sqlite => {
+                if let Some(pool) = &self.sqlite_pool {
+                    sqlx::query("UPDATE pending_purchases SET delivered = 1, delivered_at = CURRENT_TIMESTAMP WHERE id = ?")
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                }
+            },
+        }
+        Ok(())
     }
 }

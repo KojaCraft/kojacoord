@@ -1,5 +1,3 @@
-#![deny(clippy::all)]
-
 pub mod codec;
 pub mod error;
 pub mod negotiation;

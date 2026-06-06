@@ -29,9 +29,10 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(src: &mut R) -> Result<Bytes, C
             MAX_PACKET_SIZE,
         )));
     }
-    let mut body = vec![0u8; len as usize];
+    let mut body = GLOBAL_BUFFER_POOL.acquire(len as usize);
+    body.resize(len as usize, 0);
     src.read_exact(&mut body).await?;
-    Ok(Bytes::from(body))
+    Ok(body.freeze())
 }
 
 pub fn compress(raw: &[u8], threshold: i32) -> BytesMut {
@@ -71,11 +72,12 @@ pub fn decompress(body: Bytes) -> Result<Bytes, ConnectionError> {
         )));
     }
 
-    let mut out = Vec::with_capacity(data_len as usize);
+    let mut out = GLOBAL_BUFFER_POOL.acquire(data_len as usize);
+    out.resize(data_len as usize, 0);
     ZlibDecoder::new(cursor.as_ref())
-        .read_to_end(&mut out)
+        .read_exact(&mut out)
         .map_err(ConnectionError::Io)?;
-    Ok(Bytes::from(out))
+    Ok(out.freeze())
 }
 
 pub fn encode_packet(raw: &[u8], threshold: i32) -> BytesMut {
