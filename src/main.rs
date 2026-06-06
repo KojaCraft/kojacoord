@@ -130,11 +130,13 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create config file watcher");
                 return;
-            }
+            },
         };
 
         let config_path_buf = std::path::PathBuf::from(&watcher_path);
-        let parent_dir = config_path_buf.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent_dir = config_path_buf
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
 
         if let Err(e) = watcher.watch(parent_dir, RecursiveMode::NonRecursive) {
             tracing::error!(error = %e, path = %watcher_path, "Failed to register file watch");
@@ -144,11 +146,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %watcher_path, "Config file watcher active");
 
         for event in rx {
-            let target_modified = event.paths.iter().any(|p| {
-                p.file_name() == config_path_buf.file_name()
-            });
+            let target_modified = event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == config_path_buf.file_name());
 
-            if target_modified && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+            if target_modified && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+            {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 match kojacoord_config::ProxyConfig::from_file(&watcher_path) {
                     Ok(new_cfg) => {
@@ -157,10 +161,10 @@ async fn main() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             st.reload_servers(&new_cfg).await;
                         });
-                    }
+                    },
                     Err(e) => {
                         tracing::error!(error = %e, path = %watcher_path, "Failed to parse modified config file");
-                    }
+                    },
                 }
             }
         }

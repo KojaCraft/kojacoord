@@ -2,11 +2,7 @@ use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use kojacoord_protocol::{
-    codec::Encode,
-    types::VarInt,
-    Decode,
-};
+use kojacoord_protocol::{codec::Encode, types::VarInt, Decode};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 

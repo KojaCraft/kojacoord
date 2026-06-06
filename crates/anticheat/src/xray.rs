@@ -284,7 +284,7 @@ impl XrayEngine {
         }
 
         let py = player_y as i32;
-        if py > HONEYPOT_MAX_Y || py < HONEYPOT_MIN_Y {
+        if !(HONEYPOT_MIN_Y..=HONEYPOT_MAX_Y).contains(&py) {
             return Vec::new();
         }
 

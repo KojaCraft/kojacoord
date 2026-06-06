@@ -65,7 +65,10 @@ impl TpsTracker {
     /// store, no locks, no allocations.
     #[inline]
     pub fn record_packet(&self) {
-        let idx = self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % RING_SIZE;
+        let idx = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % RING_SIZE;
         let micros = self.epoch.elapsed().as_micros() as u64;
         // Avoid writing the sentinel value (extremely unlikely, only at t=0).
         let val = if micros == EMPTY_SLOT { 1 } else { micros };
@@ -370,7 +373,7 @@ impl ProxyState {
                 Err(e) => {
                     tracing::warn!(name = %s.name, address = %s.address, error = %e, "Invalid server address in config, skipping");
                     continue;
-                }
+                },
             };
 
             if let Some(existing) = self.server_registry.get(&s.name) {
@@ -380,7 +383,9 @@ impl ProxyState {
                     || existing.backend_type != s.backend_type;
 
                 if needs_update {
-                    let old_player_count = existing.player_count.load(std::sync::atomic::Ordering::Relaxed);
+                    let old_player_count = existing
+                        .player_count
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     let old_online = existing.online.load(std::sync::atomic::Ordering::Relaxed);
 
                     self.server_registry
@@ -389,7 +394,9 @@ impl ProxyState {
                             address: addr,
                             restricted: s.restricted,
                             forwarding_override: s.forwarding_override.clone(),
-                            player_count: Arc::new(std::sync::atomic::AtomicUsize::new(old_player_count)),
+                            player_count: Arc::new(std::sync::atomic::AtomicUsize::new(
+                                old_player_count,
+                            )),
                             online: Arc::new(std::sync::atomic::AtomicBool::new(old_online)),
                             connection_pool: None,
                             backend_type: s.backend_type.clone(),
