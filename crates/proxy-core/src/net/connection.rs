@@ -8,7 +8,7 @@ use uuid::Uuid;
 use aes::cipher::BlockEncrypt;
 use aes::Aes128;
 use bytes::{Bytes, BytesMut};
-use kojacoord_protocol::ProtocolVersion;
+use kojacoord_protocol::{CanonicalVersion, ProtocolVersion};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use kojacoord_protocol::{
     codec::{Decode, Encode, PacketId},
     types::VarInt,
-    versions::v1_8::{
+    versions::v1_8_x::{
         handshake::ServerboundHandshake,
         login::ServerboundLoginStart,
         status::{ClientboundPongResponse, ClientboundStatusResponse, ServerboundPingRequest},
@@ -411,7 +411,14 @@ impl ClientConnection {
         };
         let username = login_start.username.clone();
 
-        let client_uuid = if self.protocol_version >= 761 {
+        // The UUID field in LoginStart appeared in 1.19.3 (proto 761) as an
+        // optional `(bool, Option<UUID>)`, and became mandatory in 1.20.2
+        // (proto 764). These feature boundaries don't align with epoch
+        // boundaries (1.20 / 1.20.1 are inside the V1_20_4 canonical bucket
+        // but still use the optional form), so we compare wire IDs via the
+        // named `ProtocolVersion` constants rather than canonical buckets.
+        let proto_id = self.protocol_version;
+        let client_uuid = if proto_id >= ProtocolVersion::V1_19_3.id() {
             let mut cursor = self.read_raw_packet_bytes().await?;
 
             let _ = VarInt::decode(&mut cursor).ok();
@@ -419,7 +426,9 @@ impl ClientConnection {
 
             let uuid_decode_err = || ConnectionError::Auth("failed to decode client UUID".into());
 
-            if self.protocol_version <= 763 {
+            // 1.20 (763) is the last version with the optional encoding;
+            // 1.20.2 (764) and later send the UUID unconditionally.
+            if proto_id < ProtocolVersion::V1_20_2.id() {
                 let has_uuid = bool::decode(&mut cursor).unwrap_or(false);
                 if has_uuid {
                     let hi = i64::decode(&mut cursor).ok().ok_or_else(uuid_decode_err)? as u64;
@@ -787,8 +796,9 @@ impl ClientConnection {
     ) -> Result<(TcpStream, i32), ConnectionError> {
         let props = session.read().await.properties.clone();
 
-        // Hold the player in limbo while we (re)connect. The limbo handler sends a
-        // fresh JoinGame + Respawn, which resets the client's world so the new
+        // Hold the player in limbo while we (re)connect. The limbo handler sends
+        // a fresh JoinGame + Respawn, which resets the client's world so the new
+        // backend feels like a clean server switch.
 
         let mut limbo = crate::limbo::LimboHandler::new(
             &mut self.stream,
@@ -809,6 +819,7 @@ impl ClientConnection {
             .map(|b| b.backend_type.clone())
             .unwrap_or_default();
 
+        let backend_protocol = self.backend_handshake_protocol(Some(target));
         self.send_backend_handshake(
             &mut backend,
             original_host,
@@ -817,6 +828,7 @@ impl ClientConnection {
             &props,
             &mode,
             &backend_type,
+            backend_protocol,
         )
         .await?;
         let backend_threshold = self.complete_backend_login(&mut backend).await?;
@@ -842,9 +854,9 @@ impl ClientConnection {
         let proto = self.protocol_version;
         let ver = nearest(proto);
         let pid = cb_login(proto, "ClientboundSetCompression");
-        match ver {
-            ProtocolVersion::V1_6_4 | ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::login::ClientboundSetCompression;
+        match ver.canonical_typed_packet_version() {
+            CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8 => {
+                use kojacoord_protocol::versions::v1_8_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -853,8 +865,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::login::ClientboundSetCompression;
+            CanonicalVersion::V1_12_2 => {
+                use kojacoord_protocol::versions::v1_12_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -863,8 +875,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::login::ClientboundSetCompression;
+            CanonicalVersion::V1_16_5 => {
+                use kojacoord_protocol::versions::v1_16_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -873,8 +885,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::login::ClientboundSetCompression;
+            CanonicalVersion::V1_19_4 => {
+                use kojacoord_protocol::versions::v1_19_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -883,8 +895,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::login::ClientboundSetCompression;
+            CanonicalVersion::V1_20_4 => {
+                use kojacoord_protocol::versions::v1_20_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -893,8 +905,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::login::ClientboundSetCompression;
+            CanonicalVersion::V1_21 => {
+                use kojacoord_protocol::versions::v1_21_x::login::ClientboundSetCompression;
                 self.write_login_packet(
                     ClientboundSetCompression {
                         threshold: VarInt(threshold),
@@ -902,12 +914,6 @@ impl ClientConnection {
                     pid,
                 )
                 .await
-            },
-            ProtocolVersion::Unknown(v) => {
-                tracing::error!(protocol = ?v, "Unknown protocol version for set compression");
-                Err(ConnectionError::Protocol(
-                    kojacoord_protocol::ProtocolError::VarIntOverflow(0),
-                ))
             },
         }
     }
@@ -928,9 +934,9 @@ impl ClientConnection {
             packet_id = pid,
             "sending LoginSuccess"
         );
-        match ver {
-            ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::login::LoginRequestS2C;
+        match ver.canonical_typed_packet_version() {
+            CanonicalVersion::V1_6_4 => {
+                use kojacoord_protocol::versions::v1_6_x::login::LoginRequestS2C;
                 self.write_login_packet(
                     LoginRequestS2C {
                         entity_id: 0,
@@ -945,8 +951,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_10::login::ClientboundLoginSuccess;
+            CanonicalVersion::V1_7_10 => {
+                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginSuccess;
                 self.write_login_packet(
                     ClientboundLoginSuccess {
                         uuid,
@@ -956,8 +962,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::login::ClientboundLoginSuccess;
+            CanonicalVersion::V1_8 => {
+                use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginSuccess;
                 self.write_login_packet(
                     ClientboundLoginSuccess {
                         uuid,
@@ -967,8 +973,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::login::{
+            CanonicalVersion::V1_12_2 => {
+                use kojacoord_protocol::versions::v1_12_x::login::{
                     ClientboundLoginSuccess, ProfileProperty,
                 };
                 self.write_login_packet(
@@ -988,8 +994,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::login::{
+            CanonicalVersion::V1_19_4 => {
+                use kojacoord_protocol::versions::v1_19_x::login::{
                     ClientboundLoginSuccess, ProfileProperty,
                 };
                 self.write_login_packet(
@@ -1009,8 +1015,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::login::{
+            CanonicalVersion::V1_16_5 => {
+                use kojacoord_protocol::versions::v1_16_x::login::{
                     ClientboundLoginSuccess, ProfileProperty,
                 };
                 self.write_login_packet(
@@ -1030,8 +1036,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::login::{
+            CanonicalVersion::V1_20_4 => {
+                use kojacoord_protocol::versions::v1_20_x::login::{
                     ClientboundLoginSuccess, ProfileProperty,
                 };
                 self.write_login_packet(
@@ -1052,8 +1058,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::login::{
+            CanonicalVersion::V1_21 => {
+                use kojacoord_protocol::versions::v1_21_x::login::{
                     ClientboundLoginSuccess, ProfileProperty,
                 };
                 self.write_login_packet(
@@ -1073,12 +1079,6 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::Unknown(v) => {
-                tracing::error!(protocol = ?v, "Unknown protocol version for login success");
-                Err(ConnectionError::Protocol(
-                    kojacoord_protocol::ProtocolError::VarIntOverflow(0),
-                ))
-            },
         }
     }
 
@@ -1090,10 +1090,10 @@ impl ClientConnection {
         let proto = self.protocol_version;
         let ver = nearest(proto);
         let pid = cb_login(proto, "ClientboundEncryptionRequest");
-        match ver {
-            ProtocolVersion::V1_6_4 => Ok(()),
-            ProtocolVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_10::login::ClientboundEncryptionRequest;
+        match ver.canonical_typed_packet_version() {
+            CanonicalVersion::V1_6_4 => Ok(()),
+            CanonicalVersion::V1_7_10 => {
+                use kojacoord_protocol::versions::v1_7_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1104,8 +1104,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::login::ClientboundEncryptionRequest;
+            CanonicalVersion::V1_8 => {
+                use kojacoord_protocol::versions::v1_8_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1116,8 +1116,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::login::ClientboundEncryptionRequest;
+            CanonicalVersion::V1_12_2 => {
+                use kojacoord_protocol::versions::v1_12_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1128,21 +1128,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                        should_authenticate: true,
-                    },
-                    pid,
-                )
-                .await
-            },
-            ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::login::ClientboundEncryptionRequest;
+            CanonicalVersion::V1_16_5 => {
+                use kojacoord_protocol::versions::v1_16_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1154,8 +1141,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::login::ClientboundEncryptionRequest;
+            CanonicalVersion::V1_19_4 => {
+                use kojacoord_protocol::versions::v1_19_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1167,8 +1154,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::login::ClientboundEncryptionRequest;
+            CanonicalVersion::V1_20_4 => {
+                use kojacoord_protocol::versions::v1_20_x::login::ClientboundEncryptionRequest;
                 self.write_login_packet(
                     ClientboundEncryptionRequest {
                         server_id: "".to_string(),
@@ -1180,11 +1167,18 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::Unknown(v) => {
-                tracing::error!(protocol = ?v, "Unknown protocol version for encryption request");
-                Err(ConnectionError::Protocol(
-                    kojacoord_protocol::ProtocolError::VarIntOverflow(0),
-                ))
+            CanonicalVersion::V1_21 => {
+                use kojacoord_protocol::versions::v1_21_x::login::ClientboundEncryptionRequest;
+                self.write_login_packet(
+                    ClientboundEncryptionRequest {
+                        server_id: "".to_string(),
+                        public_key: der_public_key.to_vec(),
+                        verify_token: verify_token.to_vec(),
+                        should_authenticate: true,
+                    },
+                    pid,
+                )
+                .await
             },
         }
     }
@@ -1204,9 +1198,9 @@ impl ClientConnection {
         let proto = self.protocol_version;
         let ver = nearest(proto);
         let pid = cb_login(proto, "ClientboundLoginDisconnect");
-        match ver {
-            ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_7_10::login::ClientboundLoginDisconnect;
+        match ver.canonical_typed_packet_version() {
+            CanonicalVersion::V1_6_4 => {
+                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1215,8 +1209,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_10::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_7_10 => {
+                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1225,8 +1219,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_8 => {
+                use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1235,8 +1229,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_12_2 => {
+                use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1245,8 +1239,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_16_5 => {
+                use kojacoord_protocol::versions::v1_16_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1255,8 +1249,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_19_4 => {
+                use kojacoord_protocol::versions::v1_19_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1265,8 +1259,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_20_4 => {
+                use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1275,8 +1269,8 @@ impl ClientConnection {
                 )
                 .await
             },
-            ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::login::ClientboundLoginDisconnect;
+            CanonicalVersion::V1_21 => {
+                use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginDisconnect;
                 self.write_login_packet(
                     ClientboundLoginDisconnect {
                         reason: reason_json.to_owned(),
@@ -1284,12 +1278,6 @@ impl ClientConnection {
                     pid,
                 )
                 .await
-            },
-            ProtocolVersion::Unknown(v) => {
-                tracing::error!(protocol = ?v, "Unknown protocol version for login disconnect");
-                Err(ConnectionError::Protocol(
-                    kojacoord_protocol::ProtocolError::VarIntOverflow(0),
-                ))
             },
         }
     }
@@ -1305,68 +1293,62 @@ impl ClientConnection {
         let mut payload = BytesMut::new();
         VarInt(pid as i32).encode(&mut payload)?;
 
-        match ver {
-            ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundDisconnect;
+        match ver.canonical_typed_packet_version() {
+            CanonicalVersion::V1_6_4 => {
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_10::play::ClientboundDisconnect;
+            CanonicalVersion::V1_7_10 => {
+                use kojacoord_protocol::versions::v1_7_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundDisconnect;
+            CanonicalVersion::V1_8 => {
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundDisconnect;
+            CanonicalVersion::V1_12_2 => {
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundDisconnect;
+            CanonicalVersion::V1_16_5 => {
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundDisconnect;
+            CanonicalVersion::V1_19_4 => {
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundDisconnect;
+            CanonicalVersion::V1_20_4 => {
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
             },
-            ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundDisconnect;
+            CanonicalVersion::V1_21 => {
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundDisconnect;
                 let pkt = ClientboundDisconnect {
                     reason: reason_json.to_owned(),
                 };
                 pkt.encode(&mut payload)?;
-            },
-            ProtocolVersion::Unknown(v) => {
-                tracing::error!(protocol = ?v, "Unknown protocol version for play disconnect");
-                return Err(ConnectionError::Protocol(
-                    kojacoord_protocol::ProtocolError::VarIntOverflow(0),
-                ));
             },
         }
 
@@ -1410,6 +1392,7 @@ impl ClientConnection {
 
                         let mode = self.effective_forwarding_mode(b.forwarding_override.clone());
                         let backend_type = b.backend_type.clone();
+                        let backend_protocol = self.backend_handshake_protocol(Some(&server_name));
                         if let Err(e) = self
                             .send_backend_handshake(
                                 &mut conn,
@@ -1419,6 +1402,7 @@ impl ClientConnection {
                                 &props,
                                 &mode,
                                 &backend_type,
+                                backend_protocol,
                             )
                             .await
                         {
@@ -1501,6 +1485,8 @@ impl ClientConnection {
             .as_ref()
             .map(|b| b.backend_type.clone())
             .unwrap_or_default();
+        let backend_protocol =
+            self.backend_handshake_protocol(selected_server.as_ref().map(|b| b.name.as_str()));
         self.send_backend_handshake(
             &mut backend,
             fwd_host,
@@ -1509,6 +1495,7 @@ impl ClientConnection {
             &props,
             &mode,
             &backend_type,
+            backend_protocol,
         )
         .await?;
         let backend_threshold = self.complete_backend_login(&mut backend).await?;
@@ -1542,6 +1529,39 @@ impl ClientConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Computes the protocol version we should advertise to the backend in the
+    /// handshake. When the converter is active (client speaks a version the
+    /// backend does not), we spoof this to the backend's expected version so
+    /// the backend does not respond with "Outdated client / server" disconnect.
+    fn backend_handshake_protocol(&self, target_server: Option<&str>) -> u32 {
+        let client_proto = self.protocol_version;
+        let lobby_name = self.state.config.proxy.lobby_server_name.clone();
+        let is_lobby = target_server.map(|n| n == lobby_name).unwrap_or(false);
+
+        if is_lobby {
+            return self.state.config.proxy.lobby_server_protocol;
+        }
+        if let Some(name) = target_server {
+            if let Some(srv) = self.state.config.servers.iter().find(|s| s.name == name) {
+                if srv.backend_protocol > 0 {
+                    return srv.backend_protocol;
+                }
+            }
+        }
+        // Legacy clients (1.7.x, 1.8.x canonical buckets) default to 1.12.2
+        // (340) backend when no explicit override is configured — mirrors the
+        // start_relay logic.
+        let client_canonical = nearest(client_proto).canonical_typed_packet_version();
+        if matches!(
+            client_canonical,
+            CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
+        ) {
+            return ProtocolVersion::V1_12_2.id();
+        }
+        client_proto
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn send_backend_handshake(
         &self,
         conn: &mut TcpStream,
@@ -1551,8 +1571,16 @@ impl ClientConnection {
         properties: &[kojacoord_auth::ProfileProperty],
         mode: &kojacoord_config::ForwardingMode,
         backend_type: &kojacoord_config::BackendType,
+        backend_protocol: u32,
     ) -> Result<(), ConnectionError> {
-        let proto = self.protocol_version;
+        let proto = backend_protocol;
+        if proto != self.protocol_version {
+            tracing::debug!(
+                client_proto = self.protocol_version,
+                backend_proto = proto,
+                "spoofing handshake protocol_version for backend"
+            );
+        }
 
         let clean_host = server_address
             .split('\0')
@@ -1633,20 +1661,20 @@ impl ClientConnection {
                 ver,
                 ProtocolVersion::V1_19_4 | ProtocolVersion::V1_20_4 | ProtocolVersion::V1_21
             ) {
-                use kojacoord_protocol::versions::v1_20_4::login::ServerboundLoginStart;
+                use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginStart;
                 ServerboundLoginStart {
                     username: username.to_string(),
                     uuid,
                 }
                 .encode(&mut ls_payload)?;
             } else if matches!(ver, ProtocolVersion::V1_16_5) {
-                use kojacoord_protocol::versions::v1_16_5::login::ServerboundLoginStart;
+                use kojacoord_protocol::versions::v1_16_x::login::ServerboundLoginStart;
                 ServerboundLoginStart {
                     username: username.to_string(),
                 }
                 .encode(&mut ls_payload)?;
             } else {
-                use kojacoord_protocol::versions::v1_8::login::ServerboundLoginStart;
+                use kojacoord_protocol::versions::v1_8_x::login::ServerboundLoginStart;
                 ServerboundLoginStart {
                     username: username.to_string(),
                 }
@@ -1692,7 +1720,7 @@ impl ClientConnection {
             if packet_id == id_encryption_request {
                 let ver = nearest(proto);
                 if matches!(ver, ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8) {
-                    use kojacoord_protocol::versions::v1_16_5::login::ClientboundEncryptionRequest;
+                    use kojacoord_protocol::versions::v1_16_x::login::ClientboundEncryptionRequest;
                     let pkt = ClientboundEncryptionRequest::decode(&mut cursor)
                         .map_err(ConnectionError::Protocol)?;
 
@@ -1700,7 +1728,7 @@ impl ClientConnection {
                     VarInt(id_encryption_request as i32).encode(&mut new_payload)?;
 
                     if matches!(ver, ProtocolVersion::V1_7_10) {
-                        use kojacoord_protocol::versions::v1_7_10::login::ClientboundEncryptionRequest as V1_7_Enc;
+                        use kojacoord_protocol::versions::v1_7_x::login::ClientboundEncryptionRequest as V1_7_Enc;
                         let client_pkt = V1_7_Enc {
                             server_id: pkt.server_id,
                             public_key: pkt.public_key,
@@ -1708,7 +1736,7 @@ impl ClientConnection {
                         };
                         client_pkt.encode(&mut new_payload)?;
                     } else {
-                        use kojacoord_protocol::versions::v1_8::login::ClientboundEncryptionRequest as V1_8_Enc;
+                        use kojacoord_protocol::versions::v1_8_x::login::ClientboundEncryptionRequest as V1_8_Enc;
                         let client_pkt = V1_8_Enc {
                             server_id: pkt.server_id,
                             public_key: pkt.public_key,
@@ -1735,28 +1763,49 @@ impl ClientConnection {
                 tracing::debug!(threshold, "backend enabled compression");
             } else if packet_id == id_login_success {
                 tracing::debug!("backend sent LoginSuccess — login sequence complete");
-                let ver = nearest(proto);
-                match ver {
-                    ProtocolVersion::V1_8 => {
-                        use kojacoord_protocol::versions::v1_8::login::ClientboundLoginSuccess;
+                // LoginSuccess wire shape changed across releases:
+                //   1.7.10 / 1.8: UUID-as-string + username
+                //   1.12.2:       UUID-bytes (16) + username
+                //   1.16.5:       same as 1.12.2 (codebase fork)
+                //   1.19+:        UUID-bytes + username + properties array
+                //   1.20.5/1.21+: + strict-error-handling bool
+                // Every CanonicalVersion gets its own decode so the cursor
+                // advances by the right amount; the previous code fell back to
+                // the v1_12_x shape for V1_16_5/V1_19_4/V1_20_4/V1_21 which
+                // under-read the body on 1.19+ and left bytes in the cursor.
+                match nearest(proto).canonical_typed_packet_version() {
+                    CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 => {
+                        use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginSuccess;
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
                     },
-                    ProtocolVersion::V1_7_10 => {
-                        use kojacoord_protocol::versions::v1_7_10::login::ClientboundLoginSuccess;
+                    CanonicalVersion::V1_8 => {
+                        use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginSuccess;
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
                     },
-                    ProtocolVersion::V1_12_2 => {
-                        use kojacoord_protocol::versions::v1_12_2::login::ClientboundLoginSuccess;
+                    CanonicalVersion::V1_12_2 => {
+                        use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginSuccess;
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
                     },
-                    _ => {
-                        use kojacoord_protocol::versions::v1_12_2::login::ClientboundLoginSuccess;
+                    CanonicalVersion::V1_16_5 => {
+                        use kojacoord_protocol::versions::v1_16_x::login::ClientboundLoginSuccess;
+                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
+                    },
+                    CanonicalVersion::V1_19_4 => {
+                        use kojacoord_protocol::versions::v1_19_x::login::ClientboundLoginSuccess;
+                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
+                    },
+                    CanonicalVersion::V1_20_4 => {
+                        use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginSuccess;
+                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
+                    },
+                    CanonicalVersion::V1_21 => {
+                        use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginSuccess;
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
                     },
                 }
                 break;
             } else if packet_id == id_login_plugin {
-                use kojacoord_protocol::versions::v1_20_4::login::ServerboundLoginPluginResponse;
+                use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginPluginResponse;
 
                 let message_id = VarInt::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
                 let channel = String::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
@@ -1845,11 +1894,18 @@ impl ClientConnection {
             }
         }
 
-        let ver = nearest(proto);
-        if matches!(
-            ver,
-            ProtocolVersion::V1_19_4 | ProtocolVersion::V1_20_4 | ProtocolVersion::V1_21
-        ) {
+        // Configuration phase was introduced in 1.20.2 (proto 764) — i.e.
+        // every CanonicalVersion >= V1_20_4. 1.19.x and 1.20/1.20.1 do not
+        // have it. The legacy gate of `V1_19_4 | V1_20_4 | V1_21` was both
+        // too broad (it included 1.19.4) and too narrow (would miss future
+        // canonical-version additions). We now route everything through the
+        // canonical bucket so subversion fallback is automatic.
+        let canonical = nearest(proto).canonical_typed_packet_version();
+        let has_config_phase = matches!(
+            canonical,
+            CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21
+        );
+        if has_config_phase {
             {
                 let actual =
                     crate::packet_io::read_packet(&mut self.stream, self.compression_threshold)
@@ -1871,7 +1927,7 @@ impl ClientConnection {
             }
 
             {
-                use kojacoord_protocol::versions::v1_20_4::login::ServerboundLoginAcknowledged;
+                use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginAcknowledged;
                 let pkt = ServerboundLoginAcknowledged {};
                 let mut ack = BytesMut::new();
                 VarInt(id_login_ack as i32).encode(&mut ack)?;
@@ -1886,7 +1942,7 @@ impl ClientConnection {
             self.relay_config_phase(conn, backend_threshold).await?;
 
             {
-                use kojacoord_protocol::versions::v1_20_4::config::ServerboundAcknowledgeFinishConfiguration;
+                use kojacoord_protocol::versions::v1_20_x::config::ServerboundAcknowledgeFinishConfiguration;
                 let pkt = ServerboundAcknowledgeFinishConfiguration {};
                 let mut cfg_ack_buf = BytesMut::new();
                 VarInt(id_cfg_ack as i32).encode(&mut cfg_ack_buf)?;
@@ -1938,7 +1994,15 @@ impl ClientConnection {
                 if modloader::is_neo_config_channel(&channel) {
                     modloader::log_neo_config_packet(&channel, &chan_data, "S→C", proto);
 
-                    if self.ml_session.kind == modloader::ModloaderKind::Unknown {
+                    // Strongest signal first: Quilt-specific channels always win,
+                    // even if we previously tagged the session as Fabric/Unknown,
+                    // because Quilt clients also advertise Fabric channels.
+                    if modloader::is_quilt_channel(&channel)
+                        && self.ml_session.kind != modloader::ModloaderKind::Quilt
+                    {
+                        tracing::debug!(channel = %channel, "promoted modloader to Quilt from config-phase channel");
+                        self.ml_session.kind = modloader::ModloaderKind::Quilt;
+                    } else if self.ml_session.kind == modloader::ModloaderKind::Unknown {
                         self.ml_session.kind = if channel.starts_with("neoforge:") {
                             tracing::debug!("detected NeoForge from config-phase channel");
                             modloader::ModloaderKind::NeoForge
@@ -1948,6 +2012,30 @@ impl ClientConnection {
                         } else {
                             self.ml_session.kind
                         };
+                    }
+
+                    // REGISTER bodies carry a NUL-separated list of every
+                    // channel the peer supports; scan that to catch Quilt even
+                    // when the channel name itself is the generic REGISTER
+                    // sentinel (Fabric/NeoForge/Quilt all use REGISTER for
+                    // their batched advertisements).
+                    if matches!(
+                        channel.as_str(),
+                        modloader::FABRIC_REGISTER
+                            | modloader::NEO_REGISTER
+                            | modloader::MC_REGISTER
+                            | modloader::QUILTED_FABRIC_API_REGISTER
+                    ) {
+                        if let Some(kind) = modloader::detect_kind_from_channel_list(&chan_data) {
+                            if kind == modloader::ModloaderKind::Quilt
+                                && self.ml_session.kind != modloader::ModloaderKind::Quilt
+                            {
+                                tracing::debug!(
+                                    "promoted modloader to Quilt via REGISTER channel list"
+                                );
+                                self.ml_session.kind = modloader::ModloaderKind::Quilt;
+                            }
+                        }
                     }
 
                     crate::packet_io::write_packet(&mut self.stream, &raw_payload, client_thresh)
@@ -1992,7 +2080,7 @@ impl ClientConnection {
         }
 
         {
-            use kojacoord_protocol::versions::v1_20_4::config::ClientboundFinishConfiguration;
+            use kojacoord_protocol::versions::v1_20_x::config::ClientboundFinishConfiguration;
             let finish_cb_id = cb_config(proto, "FinishConfiguration");
             let pkt = ClientboundFinishConfiguration {};
             let mut p = BytesMut::new();
@@ -2050,16 +2138,24 @@ impl ClientConnection {
                     }
                 });
 
-            if self.protocol_version == 5 || self.protocol_version == 47 {
-                server_protocol.unwrap_or(340)
+            let client_canonical = nearest(self.protocol_version).canonical_typed_packet_version();
+            if matches!(
+                client_canonical,
+                CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
+            ) {
+                // Legacy clients (1.7.x, 1.8.x) default to a 1.12.2 backend.
+                server_protocol.unwrap_or(ProtocolVersion::V1_12_2.id())
             } else {
                 server_protocol.unwrap_or(self.protocol_version)
             }
         };
 
+        let client_canonical = nearest(self.protocol_version).canonical_typed_packet_version();
         let conversion_enabled = (is_lobby && backend_protocol != self.protocol_version)
-            || self.protocol_version == 5
-            || self.protocol_version == 47;
+            || matches!(
+                client_canonical,
+                CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
+            );
 
         if conversion_enabled {
             tracing::debug!(

@@ -58,7 +58,7 @@ impl BufferPool {
         } else if cap <= LARGE_MAX {
             let _ = self.large.push(buffer);
         }
-        // If cap > LARGE_MAX, buffer is dropped (not cached)
+        // Anything bigger than our large tier isn't worth keeping around — just let it go.
     }
 
     pub fn depths(&self) -> (usize, usize, usize) {

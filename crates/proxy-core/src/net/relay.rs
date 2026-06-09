@@ -127,6 +127,10 @@ impl PacketRelay {
 
         let player_uuid = self.session.read().await.uuid;
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        // Keep a clone in-scope for converter-driven s2c injection from the c2s
+        // task (e.g. synthesizing FinishConfiguration after we swallow a
+        // LoginAcknowledged from a 1.20.2+ client).
+        let inject_s2c_tx = out_tx.clone();
         self.state.outbound.insert(player_uuid, out_tx);
 
         let (backend_out_tx, mut backend_out_rx) =
@@ -328,6 +332,9 @@ impl PacketRelay {
                         }
                         ConversionResult::Drop => {
                             tracing::trace!(pkt_id, "S→C dropped by converter");
+                        }
+                        ConversionResult::InjectS2C(_) => {
+                            tracing::warn!(pkt_id, "S→C converter returned InjectS2C — only valid in C→S direction; dropping");
                         }
                     }
                 } else {
@@ -628,6 +635,12 @@ impl PacketRelay {
                             },
                             ConversionResult::Drop => {
                                 tracing::trace!(pkt_id, "C→S dropped by converter");
+                            },
+                            ConversionResult::InjectS2C(packets) => {
+                                tracing::trace!(pkt_id, count = packets.len(), "C→S swallowed; injecting s2c packets back to client");
+                                for pkt in packets {
+                                    let _ = inject_s2c_tx.send(pkt);
+                                }
                             },
                         }
                     } else {

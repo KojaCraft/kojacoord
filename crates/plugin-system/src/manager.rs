@@ -1,6 +1,6 @@
 use crate::api::{
-    PacketData, PacketEvent, PacketHookResult, Plugin, PluginContext, PluginEvent, PluginMetadata,
-    PluginResponse,
+    PacketData, PacketEvent, PacketHookResult, Plugin, PluginCommand, PluginContext, PluginEvent,
+    PluginMetadata, PluginResponse,
 };
 use crate::loader::PluginLoader;
 use crate::sandbox::{apply_sandbox, SandboxConfig};
@@ -20,6 +20,10 @@ pub struct PluginManager {
     packet_hooks: Arc<RwLock<Vec<PacketEvent>>>,
     sandbox_enabled: bool,
     sandbox_config: SandboxConfig,
+    /// Receivers for plugin command channels. Each plugin gets its own
+    /// channel so the proxy can route responses per plugin if needed.
+    pub command_receivers:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedReceiver<PluginCommand>>>,
 }
 
 impl PluginManager {
@@ -31,6 +35,7 @@ impl PluginManager {
             packet_hooks: Arc::new(RwLock::new(Vec::new())),
             sandbox_enabled: true,
             sandbox_config: SandboxConfig::default(),
+            command_receivers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,10 +69,13 @@ impl PluginManager {
             .unwrap_or("unknown")
             .to_string();
 
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PluginCommand>();
+
         let context = PluginContext {
             plugin_id: plugin_name.clone(),
             version: "1.0.0".to_string(),
             config,
+            command_tx: Some(cmd_tx),
         };
 
         let (mut plugin, metadata) = self.loader.load_plugin(path, &context)?;
@@ -104,6 +112,13 @@ impl PluginManager {
             (Arc::new(Mutex::new(plugin)), metadata.clone()),
         );
         self.plugin_configs.insert(plugin_name.clone(), context);
+        {
+            let mut rx_lock = self
+                .command_receivers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            rx_lock.insert(plugin_name.clone(), cmd_rx);
+        }
 
         log::info!(
             "Loaded plugin: {} v{} by {}",

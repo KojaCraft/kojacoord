@@ -12,7 +12,7 @@ use kojacoord_auth::{AuthConfig, AuthPipelineConfig};
 use kojacoord_cluster::{ClusterCoordinator, ServiceDiscovery};
 use kojacoord_config::ProxyConfig;
 use kojacoord_metrics::{AnalyticsEngine, MetricsCollector, MetricsExporter};
-use kojacoord_plugin_system::{PluginEvent, PluginManager, PluginResponse};
+use kojacoord_plugin_system::{PluginCommand, PluginEvent, PluginManager, PluginResponse};
 
 use crate::buffer_pool::BufferPool;
 use crate::connection_throttle::ConnectionThrottle;
@@ -137,11 +137,11 @@ pub struct ProxyState {
 
     pub connection_throttle: Arc<ConnectionThrottle>,
 
-    /// Author : Starfloof.
+    /// Pre-built JSON suffix for status responses, regenerated every second.
     pub cached_status: arc_swap::ArcSwap<CachedStatus>,
 }
 
-/// Author : Starfloof.
+/// Snapshot of the status-response JSON suffix (players + description).
 pub struct CachedStatus {
     pub suffix: String,
 }
@@ -352,7 +352,7 @@ impl ProxyState {
         })
     }
 
-    /// Author : Starfloof.
+    /// Hot-reload the server registry when the config file changes on disk.
     pub async fn reload_servers(&self, new_config: &kojacoord_config::ProxyConfig) {
         let mut new_names = std::collections::HashSet::new();
         for s in &new_config.servers {
@@ -509,6 +509,153 @@ impl ProxyState {
             self.send_to_player(uuid, raw);
         }
     }
+
+    /// Spawn background tasks that listen to each loaded plugin's command
+    /// channel and execute the requested privileged operations.
+    pub fn start_plugin_command_processors(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut handles = vec![];
+            let receivers = {
+                let mut lock = state
+                    .plugin_manager
+                    .command_receivers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *lock)
+            };
+            for (name, mut rx) in receivers {
+                let state_clone = Arc::clone(&state);
+                let name_clone = name.clone();
+                let handle = tokio::spawn(async move {
+                    while let Some(cmd) = rx.recv().await {
+                        state_clone.process_plugin_command(&name_clone, cmd).await;
+                    }
+                    tracing::info!("Plugin command channel closed for {}", name_clone);
+                });
+                handles.push(handle);
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    }
+
+    async fn process_plugin_command(&self, plugin_name: &str, cmd: PluginCommand) {
+        match cmd {
+            PluginCommand::RegisterServer {
+                name,
+                address,
+                port,
+                max_players: _,
+            } => {
+                let addr = match format!("{}:{}", address, port).parse::<std::net::SocketAddr>() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(plugin = %plugin_name, name = %name, error = %e, "Plugin requested invalid server address");
+                        return;
+                    },
+                };
+                if self.server_registry.get(&name).is_some() {
+                    self.server_registry.remove(&name);
+                }
+                let server = crate::server::BackendServer {
+                    name: name.clone(),
+                    address: addr,
+                    restricted: false,
+                    forwarding_override: None,
+                    player_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    connection_pool: None,
+                    backend_type: kojacoord_config::BackendType::default(),
+                };
+                self.server_registry.register(server).await;
+                tracing::info!(plugin = %plugin_name, "Registered server {} at {}:{}", name, address, port);
+            },
+            PluginCommand::DeregisterServer { name } => {
+                if self.server_registry.get(&name).is_some() {
+                    let default_server = self
+                        .config
+                        .servers
+                        .first()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "lobby".to_owned());
+                    self.evacuate_players(&name, &default_server).await;
+                    self.server_registry.remove(&name);
+                    tracing::info!(plugin = %plugin_name, "Deregistered server {}", name);
+                }
+            },
+            PluginCommand::TransferPlayer { uuid, server } => {
+                if let Some(target) = self.sessions.get(&uuid) {
+                    if let Some(old_name) = target.read().await.current_server.clone() {
+                        if let Some(old) = self.server_registry.get(&old_name) {
+                            old.player_count
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    if let Some(new_srv) = self.server_registry.get(&server) {
+                        new_srv
+                            .player_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    target.write().await.current_server = Some(server.clone());
+                    tracing::info!(plugin = %plugin_name, "Transferred player {} to {}", uuid, server);
+                }
+            },
+            PluginCommand::KickPlayer { uuid, reason } => {
+                let json = serde_json::json!({ "text": reason }).to_string();
+                self.kick_player(&uuid, &json).await;
+                tracing::info!(plugin = %plugin_name, "Kicked player {}: {}", uuid, reason);
+            },
+            PluginCommand::SendSystemMessage { uuid, message } => {
+                self.send_system_message_to(&uuid, &message).await;
+            },
+            PluginCommand::UpdatePlayerStatus {
+                uuid,
+                server,
+                online,
+            } => {
+                if let Some(db) = &self.db {
+                    let server_name = server.unwrap_or_default();
+                    if let Err(e) = db.update_player_status(uuid, &server_name, online).await {
+                        tracing::warn!(plugin = %plugin_name, error = %e, "Failed to update player status");
+                    }
+                }
+            },
+        }
+    }
+
+    /// Move all players currently on `from_server` to `to_server`.
+    async fn evacuate_players(&self, from_server: &str, to_server: &str) -> usize {
+        let mut evacuated = 0usize;
+        for entry in self.sessions.iter() {
+            let uuid = *entry.key();
+            let session = entry.value();
+            let current = {
+                let s = session.read().await;
+                s.current_server.clone()
+            };
+            if current.as_deref() == Some(from_server) {
+                {
+                    let mut s = session.write().await;
+                    s.current_server = Some(to_server.to_owned());
+                }
+                if let Some(old) = self.server_registry.get(from_server) {
+                    old.player_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(new_srv) = self.server_registry.get(to_server) {
+                    new_srv
+                        .player_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let reason = r#"{"text":"§cThe server you were on has shut down. Reconnecting you to the lobby..."}"#;
+                self.kick_player(&uuid, reason).await;
+                evacuated += 1;
+            }
+        }
+        evacuated
+    }
 }
 
 pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
@@ -578,7 +725,8 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         }
     });
 
-    // Author : Starfloof.
+    // Refresh the cached status response every second so the MOTD and player
+    // list shown to pingers stays up-to-date without blocking the accept loop.
     tokio::spawn({
         let state = Arc::clone(&state);
         async move {

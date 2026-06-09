@@ -37,6 +37,14 @@ pub const NEO_SETUP_FAILED: &str = "neoforge:modded_network_setup_failed";
 pub const FABRIC_REGISTER: &str = "fabric-networking-api-v1:register_channel";
 pub const FABRIC_UNREGISTER: &str = "fabric-networking-api-v1:unregister_channel";
 
+// Quilt is a Fabric fork. The runtime ships its own networking lib (QSL) on
+// top of Fabric's, and clients sometimes advertise both. We sniff any of these
+// to flag a connection as Quilt rather than plain Fabric.
+pub const QUILT_INIT_CHANNEL: &str = "quilt:init";
+pub const QUILT_REGISTER: &str = "quilt:register";
+pub const QUILT_QSL_NETWORKING: &str = "qsl:networking";
+pub const QUILTED_FABRIC_API_REGISTER: &str = "quilted_fabric_networking_api_v1:register_channel";
+
 pub const CONFIG_PING_ID: u8 = 0x01;
 pub const CONFIG_PONG_ID: u8 = 0x00;
 
@@ -74,6 +82,7 @@ pub enum ModloaderKind {
     Fml3,
     NeoForge,
     Fabric,
+    Quilt,
     Vanilla,
 }
 
@@ -163,9 +172,30 @@ pub fn is_neo_config_channel(channel: &str) -> bool {
             | NEO_SETUP_FAILED
             | FABRIC_REGISTER
             | FABRIC_UNREGISTER
+            | QUILT_INIT_CHANNEL
+            | QUILT_REGISTER
+            | QUILT_QSL_NETWORKING
+            | QUILTED_FABRIC_API_REGISTER
     ) || channel.starts_with("neoforge:")
         || channel.starts_with("fml:")
         || channel.starts_with("forge:")
+        || channel.starts_with("quilt:")
+        || channel.starts_with("qsl:")
+        || channel.starts_with("quilted_fabric_")
+}
+
+/// Returns true if the channel name unambiguously identifies a Quilt client.
+/// Used by the config-phase sniffer to promote a connection from
+/// `Fabric`/`Unknown` to `Quilt`.
+#[inline]
+pub fn is_quilt_channel(channel: &str) -> bool {
+    channel == QUILT_INIT_CHANNEL
+        || channel == QUILT_REGISTER
+        || channel == QUILT_QSL_NETWORKING
+        || channel == QUILTED_FABRIC_API_REGISTER
+        || channel.starts_with("quilt:")
+        || channel.starts_with("qsl:")
+        || channel.starts_with("quilted_fabric_")
 }
 
 fn frame_bytes(payload: Bytes) -> Bytes {
@@ -213,7 +243,7 @@ pub fn log_fml3_login_packet(channel: &str, body: &[u8], direction: &str, proto:
 
 pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto: u32) {
     match channel {
-        NEO_REGISTER | MC_REGISTER | FABRIC_REGISTER => {
+        NEO_REGISTER | MC_REGISTER | FABRIC_REGISTER | QUILTED_FABRIC_API_REGISTER => {
             let channels = parse_nul_list(body);
             info!(proto, direction, channel, registered_channels = ?channels, "Modloader config-phase channel registration");
         },
@@ -222,6 +252,9 @@ pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto:
         },
         COMMON_REGISTER => {
             debug!(proto, direction, "Modloader c:register negotiation");
+        },
+        QUILT_INIT_CHANNEL | QUILT_REGISTER | QUILT_QSL_NETWORKING => {
+            info!(proto, direction, channel, "Quilt modloader plugin channel");
         },
         _ => {
             debug!(
@@ -233,6 +266,30 @@ pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto:
             );
         },
     }
+}
+
+/// Inspect a config-phase REGISTER body's NUL-separated channel list and
+/// return the strongest modloader signal it contains. Used during the
+/// configuration-phase relay to upgrade `Fabric` → `Quilt` when the client
+/// advertises Quilt-specific channels.
+pub fn detect_kind_from_channel_list(body: &[u8]) -> Option<ModloaderKind> {
+    let channels = parse_nul_list(body);
+    if channels.iter().any(|c| is_quilt_channel(c)) {
+        return Some(ModloaderKind::Quilt);
+    }
+    if channels
+        .iter()
+        .any(|c| c.starts_with("neoforge:") || c == NEO_REGISTER || c == NEO_TIER_SORTING)
+    {
+        return Some(ModloaderKind::NeoForge);
+    }
+    if channels
+        .iter()
+        .any(|c| c.starts_with("fabric-") || c == FABRIC_REGISTER)
+    {
+        return Some(ModloaderKind::Fabric);
+    }
+    None
 }
 
 pub fn parse_nul_list(data: &[u8]) -> Vec<String> {
@@ -247,4 +304,64 @@ pub fn parse_nul_list(data: &[u8]) -> Vec<String> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quilt_channels_are_recognized() {
+        assert!(is_quilt_channel(QUILT_INIT_CHANNEL));
+        assert!(is_quilt_channel("qsl:networking"));
+        assert!(is_quilt_channel("quilt:something_custom"));
+        assert!(is_quilt_channel("quilted_fabric_api_v1:event"));
+        assert!(!is_quilt_channel(
+            "fabric-networking-api-v1:register_channel"
+        ));
+        assert!(!is_quilt_channel("neoforge:register"));
+    }
+
+    #[test]
+    fn quilt_channels_also_count_as_neo_config_channels() {
+        // Quilt channels need to flow through the same config-phase relay
+        // code path that Fabric/NeoForge channels use.
+        assert!(is_neo_config_channel(QUILT_INIT_CHANNEL));
+        assert!(is_neo_config_channel("quilt:foo"));
+        assert!(is_neo_config_channel("qsl:networking"));
+    }
+
+    #[test]
+    fn register_list_with_quilt_channel_is_detected() {
+        // A REGISTER body is a NUL-separated list of channel names.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fabric-networking-api-v1:event");
+        body.push(0);
+        body.extend_from_slice(b"qsl:networking");
+        body.push(0);
+        body.extend_from_slice(b"minecraft:brand");
+        assert_eq!(
+            detect_kind_from_channel_list(&body),
+            Some(ModloaderKind::Quilt)
+        );
+    }
+
+    #[test]
+    fn register_list_with_only_fabric_is_fabric() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fabric-networking-api-v1:event");
+        body.push(0);
+        body.extend_from_slice(b"minecraft:brand");
+        assert_eq!(
+            detect_kind_from_channel_list(&body),
+            Some(ModloaderKind::Fabric)
+        );
+    }
+
+    #[test]
+    fn quilt_kind_does_not_get_fml_marker_appended() {
+        let result = apply_fml_marker("server.example.com", ModloaderKind::Quilt);
+        assert_eq!(result, "server.example.com");
+        assert!(!result.contains('\0'));
+    }
 }

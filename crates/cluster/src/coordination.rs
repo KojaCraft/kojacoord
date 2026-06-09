@@ -60,7 +60,7 @@ impl ClusterCoordinator {
                 let is_us = current_leader.as_deref() == Some(&self.local_node_id.to_string());
 
                 if is_us {
-                    // We are the leader, renew the lease atomically
+                    // If we're already the leader, renew our Redis lease so we keep the role.
                     let lua_script = r#"
                         local key = KEYS[1]
                         local expected_value = ARGV[1]
@@ -87,7 +87,7 @@ impl ClusterCoordinator {
                         leader_id = Some(self.local_node_id);
                     }
                 } else {
-                    // We are not leader, try to acquire lock if it's expired
+                    // Otherwise, try to snatch the lock if the previous leader let it expire.
                     let acquired: bool = redis::cmd("SET")
                         .arg("cluster_leader_lock")
                         .arg(self.local_node_id.to_string())

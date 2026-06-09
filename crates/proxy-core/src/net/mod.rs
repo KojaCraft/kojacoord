@@ -9,6 +9,6 @@ pub mod packet_ids;
 pub mod packet_io;
 pub mod plugin_decoder;
 
-/// Author : Starfloof.
+/// PROXY protocol support for reading real client IPs from upstream load balancers.
 pub mod proxy_protocol;
 pub mod relay;

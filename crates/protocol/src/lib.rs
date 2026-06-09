@@ -7,6 +7,6 @@ pub mod versions;
 
 pub use codec::{Decode, Encode, PacketId};
 pub use error::ProtocolError;
-pub use negotiation::{ProtocolVersion, VersionRegistry};
+pub use negotiation::{CanonicalVersion, Epoch, ProtocolVersion, VersionRegistry};
 pub use registry::{build_default_registry, Direction, PacketMeta, PacketRegistry, ProtocolState};
 pub use types::{Position, Slot, VarInt, VarLong};

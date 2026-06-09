@@ -62,6 +62,50 @@ impl Db {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS players (
+                uuid VARCHAR(36) NOT NULL PRIMARY KEY,
+                username VARCHAR(16) NOT NULL,
+                role VARCHAR(32) NOT NULL DEFAULT 'PLAYER',
+                online TINYINT(1) NOT NULL DEFAULT 0,
+                server VARCHAR(64) NULL,
+                first_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_players_username (username)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS player_bans (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                player_uuid VARCHAR(36) NOT NULL,
+                reason TEXT NOT NULL,
+                banned_by VARCHAR(64) NOT NULL,
+                banned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NULL,
+                active TINYINT(1) DEFAULT 1,
+                INDEX idx_ban_uuid (player_uuid),
+                INDEX idx_ban_active (active)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name VARCHAR(32) NOT NULL PRIMARY KEY,
+                display_name VARCHAR(64) NOT NULL,
+                prefix VARCHAR(32) NOT NULL DEFAULT '',
+                color VARCHAR(16) NOT NULL DEFAULT 'WHITE',
+                weight INT NOT NULL DEFAULT 0,
+                permissions JSON
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
             mysql_pool: Some(pool),
             sqlite_pool: None,
@@ -94,6 +138,56 @@ impl Db {
                 delivered INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 delivered_at TIMESTAMP NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS players (
+                uuid TEXT NOT NULL PRIMARY KEY,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'PLAYER',
+                online INTEGER NOT NULL DEFAULT 0,
+                server TEXT,
+                first_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_players_username ON players(username)")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS player_bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_uuid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                banned_by TEXT NOT NULL,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NULL,
+                active INTEGER DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ban_uuid ON player_bans(player_uuid)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ban_active ON player_bans(active)")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name TEXT NOT NULL PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                prefix TEXT NOT NULL DEFAULT '',
+                color TEXT NOT NULL DEFAULT 'WHITE',
+                weight INTEGER NOT NULL DEFAULT 0,
+                permissions TEXT
             )",
         )
         .execute(&pool)
@@ -508,6 +602,42 @@ impl Db {
                         .bind(id)
                         .execute(pool)
                         .await?;
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub async fn update_player_status(
+        &self,
+        uuid: Uuid,
+        server: &str,
+        online: bool,
+    ) -> Result<(), sqlx::Error> {
+        let uuid_str = uuid.hyphenated().to_string();
+        match self.db_type {
+            DbType::MySql => {
+                if let Some(pool) = &self.mysql_pool {
+                    sqlx::query(
+                        "UPDATE players SET online = ?, last_seen = NOW(), server = ? WHERE uuid = ?"
+                    )
+                    .bind(online)
+                    .bind(server)
+                    .bind(&uuid_str)
+                    .execute(pool)
+                    .await?;
+                }
+            },
+            DbType::Sqlite => {
+                if let Some(pool) = &self.sqlite_pool {
+                    sqlx::query(
+                        "UPDATE players SET online = ?, last_seen = CURRENT_TIMESTAMP, server = ? WHERE uuid = ?"
+                    )
+                    .bind(online)
+                    .bind(server)
+                    .bind(&uuid_str)
+                    .execute(pool)
+                    .await?;
                 }
             },
         }

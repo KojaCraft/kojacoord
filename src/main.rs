@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("KojacoordProxy starting…");
 
-    // rest of your main unchanged below
+    // Standard startup flow: load config, initialise state, spawn background tasks.
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_owned());
@@ -96,11 +96,15 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to initialize proxy state")?,
     );
 
+    // Start listening to plugin command channels.
+    state.start_plugin_command_processors();
+
     // Anonymous, opt-out usage telemetry (metric.kojacoord.net). Honours
     // [telemetry] enabled in the config; never blocks or fails the proxy.
     kojacoord_proxy_core::telemetry::spawn(Arc::clone(&state));
 
-    // Author : Starfloof.
+    // Watch the config file for changes and hot-reload the server list
+    // without restarting the proxy.
     let watcher_state = Arc::clone(&state);
     let watcher_path = config_path.clone();
     tokio::task::spawn_blocking(move || {

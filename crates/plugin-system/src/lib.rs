@@ -7,8 +7,8 @@ pub mod manager;
 pub mod sandbox;
 
 pub use api::{
-    PacketData, PacketDirection, PacketEvent, PacketFilter, PacketHookResult, Plugin,
-    PluginContext, PluginEvent, PluginMetadata, PluginResponse,
+    PacketData, PacketDirection, PacketEvent, PacketFilter, PacketHookFn, PacketHookResult, Plugin,
+    PluginCommand, PluginContext, PluginEvent, PluginMetadata, PluginResponse,
 };
 pub use integrity::PluginVerifier;
 pub use loader::PluginLoader;

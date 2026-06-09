@@ -13,7 +13,7 @@ pub fn start_reporting(state: Arc<ProxyState>) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         loop {
-            // Check counts and send report every 30 seconds
+            // Report modpack player counts every 30 seconds.
             tokio::time::sleep(Duration::from_secs(30)).await;
 
             for s in &state.config.servers {

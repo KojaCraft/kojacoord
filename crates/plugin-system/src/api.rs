@@ -3,10 +3,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Commands a plugin can send to the proxy to request privileged operations.
+#[derive(Debug, Clone)]
+pub enum PluginCommand {
+    RegisterServer {
+        name: String,
+        address: String,
+        port: u16,
+        max_players: u32,
+    },
+    DeregisterServer {
+        name: String,
+    },
+    TransferPlayer {
+        uuid: Uuid,
+        server: String,
+    },
+    KickPlayer {
+        uuid: Uuid,
+        reason: String,
+    },
+    SendSystemMessage {
+        uuid: Uuid,
+        message: String,
+    },
+    UpdatePlayerStatus {
+        uuid: Uuid,
+        server: Option<String>,
+        online: bool,
+    },
+}
+
 pub struct PluginContext {
     pub plugin_id: String,
     pub version: String,
     pub config: HashMap<String, String>,
+    /// Channel for sending privileged commands to the proxy. Set by the proxy
+    /// when the plugin is loaded.
+    pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<PluginCommand>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

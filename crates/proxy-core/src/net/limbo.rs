@@ -152,8 +152,16 @@ impl<'a> LimboHandler<'a> {
         }
     }
 
+    /// Returns the [`ProtocolVersion`] whose typed-packet module limbo should
+    /// use for this connection. Routed through `canonical_typed_packet_version`
+    /// so every subversion (1.9, 1.10, 1.13, 1.14, …) falls onto one of the
+    /// concrete variants the match arms below already handle. Without this,
+    /// any modern subversion would silently fall through `_ => Ok(())` and the
+    /// client would land in limbo without a JoinGame and time out.
     fn ver(&self) -> ProtocolVersion {
         VersionRegistry::nearest(self.protocol_version)
+            .canonical_typed_packet_version()
+            .as_protocol_version()
     }
 
     fn play_id(&self, name: &'static str) -> u8 {
@@ -189,7 +197,7 @@ impl<'a> LimboHandler<'a> {
         match ver {
             ProtocolVersion::V1_6_4 => Ok(()),
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundJoinGame;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundJoinGame;
                 let pid = self.play_id("ClientboundJoinGame");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.8 JoinGame format");
                 let pkt = ClientboundJoinGame {
@@ -204,7 +212,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundJoinGame;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundJoinGame;
                 let pid = self.play_id("ClientboundJoinGame");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.12.2 JoinGame format");
                 let pkt = ClientboundJoinGame {
@@ -219,7 +227,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundJoinGame;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundJoinGame;
                 let pid = self.play_id("ClientboundJoinGame");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.16.5 JoinGame format");
                 let pkt = ClientboundJoinGame {
@@ -241,7 +249,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundLogin;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundLogin;
                 let pid = self.play_id("ClientboundLogin");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.19.4 Login format");
                 let pkt = ClientboundLogin {
@@ -266,7 +274,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundLogin;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundLogin;
                 let pid = self.play_id("ClientboundLogin");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.20.4 Login format");
                 let pkt = ClientboundLogin {
@@ -292,7 +300,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundLogin;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundLogin;
                 let pid = self.play_id("ClientboundLogin");
                 tracing::debug!(packet_id = pid, version = ?ver, "Using 1.21 Login format");
                 let pkt = ClientboundLogin {
@@ -328,7 +336,7 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -342,7 +350,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -356,7 +364,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -370,7 +378,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -388,7 +396,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -407,7 +415,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -427,7 +435,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundRespawn;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundRespawn;
                 let pid = self.play_id("ClientboundRespawn");
                 if pid == 0xFF {
                     return Ok(());
@@ -459,6 +467,9 @@ impl<'a> LimboHandler<'a> {
             modloader::ModloaderKind::Fml3 => "forge",
             modloader::ModloaderKind::NeoForge => "neoforge",
             modloader::ModloaderKind::Fabric => "fabric",
+            // Quilt clients accept "fabric" as the brand without complaint —
+            // QSL piggybacks on Fabric's brand handshake.
+            modloader::ModloaderKind::Quilt => "quilt",
             modloader::ModloaderKind::Unknown | modloader::ModloaderKind::Vanilla => "Kojacoord",
         };
 
@@ -472,7 +483,7 @@ impl<'a> LimboHandler<'a> {
         match ver {
             ProtocolVersion::V1_6_4 => Ok(()),
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundPluginMessage;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundPluginMessage;
                 let pid = self.play_id("ClientboundPluginMessage");
                 let pkt = ClientboundPluginMessage {
                     channel: "MC|Brand".to_owned(),
@@ -485,7 +496,7 @@ impl<'a> LimboHandler<'a> {
             | ProtocolVersion::V1_19_4
             | ProtocolVersion::V1_20_4
             | ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundPluginMessage;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundPluginMessage;
                 let pid = self.play_id("ClientboundPluginMessage");
                 let pkt = ClientboundPluginMessage {
                     channel: "minecraft:brand".to_owned(),
@@ -508,7 +519,7 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -517,7 +528,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_10::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_7_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -526,7 +537,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -535,7 +546,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -544,7 +555,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -553,7 +564,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -562,7 +573,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     flags: 0x06,
                     flying_speed: 0.0,
@@ -571,7 +582,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundPlayerAbilities;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundPlayerAbilities;
                 let pkt = ClientboundPlayerAbilities {
                     raw: vec![0x06, 0, 0],
                 };
@@ -592,37 +603,37 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundHeldItemChange;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundHeldItemChange;
                 let pkt = ClientboundHeldItemChange { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundSetHeldItem;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundSetHeldItem;
                 let pkt = ClientboundSetHeldItem { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundSetCarriedItem;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundSetCarriedItem;
                 let pkt = ClientboundSetCarriedItem { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundHeldItemChange;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundHeldItemChange;
                 let pkt = ClientboundHeldItemChange { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundSetCarriedItem;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundSetCarriedItem;
                 let pkt = ClientboundSetCarriedItem { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundSetCarriedItem;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundSetCarriedItem;
                 let pkt = ClientboundSetCarriedItem { slot: 0 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundSetCarriedItem;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundSetCarriedItem;
                 let pkt = ClientboundSetCarriedItem { raw: vec![0] };
                 self.write_play_packet(pid, &pkt).await
             },
@@ -636,7 +647,7 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -650,7 +661,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -663,7 +674,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -677,7 +688,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -691,7 +702,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -705,7 +716,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -719,7 +730,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundPlayerPosition;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundPlayerPosition;
                 let pid = self.play_id("ClientboundPlayerPosition");
                 let pkt = ClientboundPlayerPosition {
                     x: LIMBO_X,
@@ -742,7 +753,7 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundChatMessage;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundChatMessage;
                 let pid = self.play_id("ClientboundChatMessage");
                 if pid == 0xFF {
                     return Ok(());
@@ -753,7 +764,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundChatMessage;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundChatMessage;
                 let pid = self.play_id("ClientboundChatMessage");
                 if pid == 0xFF {
                     return Ok(());
@@ -765,7 +776,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundChatMessage;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundChatMessage;
                 let pid = self.play_id("ClientboundChatMessage");
                 if pid == 0xFF {
                     return Ok(());
@@ -777,7 +788,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundChatMessage;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundChatMessage;
                 let pid = self.play_id("ClientboundChatMessage");
                 if pid == 0xFF {
                     return Ok(());
@@ -790,7 +801,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundSystemChat;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundSystemChat;
                 let pid = self.play_id("ClientboundSystemChat");
                 if pid == 0xFF {
                     return Ok(());
@@ -802,7 +813,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundSystemChat;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundSystemChat;
                 let pid = self.play_id("ClientboundSystemChat");
                 if pid == 0xFF {
                     return Ok(());
@@ -814,7 +825,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundSystemChat;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundSystemChat;
                 let pid = self.play_id("ClientboundSystemChat");
                 if pid == 0xFF {
                     return Ok(());
@@ -835,7 +846,7 @@ impl<'a> LimboHandler<'a> {
         match ver {
             ProtocolVersion::V1_6_4 => Ok(()),
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundSound;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundSound;
                 let pid = self.play_id("ClientboundSound");
                 if pid == 0xFF {
                     return Ok(());
@@ -851,7 +862,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundSound;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundSound;
                 let pid = self.play_id("ClientboundSound");
                 if pid == 0xFF {
                     return Ok(());
@@ -869,7 +880,7 @@ impl<'a> LimboHandler<'a> {
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundNamedSoundEffect;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundNamedSoundEffect;
                 let pid = self.play_id("ClientboundNamedSoundEffect");
                 if pid == 0xFF {
                     return Ok(());
@@ -887,7 +898,7 @@ impl<'a> LimboHandler<'a> {
             },
 
             ProtocolVersion::V1_19_4 | ProtocolVersion::V1_20_4 | ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundSound;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundSound;
                 let pid = self.play_id("ClientboundSound");
                 if pid == 0xFF {
                     return Ok(());
@@ -910,7 +921,7 @@ impl<'a> LimboHandler<'a> {
     }
 
     async fn send_bossbar_add(&mut self) -> Result<(), ConnectionError> {
-        use kojacoord_protocol::versions::v1_20_4::play::{BossBarAction, ClientboundBossBar};
+        use kojacoord_protocol::versions::v1_20_x::play::{BossBarAction, ClientboundBossBar};
         let pid = self.play_id("ClientboundBossBar");
         if pid == 0xFF {
             return Ok(());
@@ -929,7 +940,7 @@ impl<'a> LimboHandler<'a> {
     }
 
     async fn send_bossbar_remove(&mut self) -> Result<(), ConnectionError> {
-        use kojacoord_protocol::versions::v1_20_4::play::{BossBarAction, ClientboundBossBar};
+        use kojacoord_protocol::versions::v1_20_x::play::{BossBarAction, ClientboundBossBar};
         let pid = self.play_id("ClientboundBossBar");
         if pid == 0xFF {
             return Ok(());
@@ -953,41 +964,41 @@ impl<'a> LimboHandler<'a> {
 
         match ver {
             ProtocolVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_4::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_6_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive {
                     keep_alive_id: id as i32,
                 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_8_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive {
                     keep_alive_id: VarInt(id as i32),
                 };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_2::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_12_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive { keep_alive_id: id };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_5::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_16_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive { keep_alive_id: id };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_4::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_19_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive { id };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_4::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_20_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive { id };
                 self.write_play_packet(pid, &pkt).await
             },
             ProtocolVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21::play::ClientboundKeepAlive;
+                use kojacoord_protocol::versions::v1_21_x::play::ClientboundKeepAlive;
                 let pkt = ClientboundKeepAlive { keep_alive_id: id };
                 self.write_play_packet(pid, &pkt).await
             },

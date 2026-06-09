@@ -19,7 +19,7 @@ struct IpRecord {
     banned_until: Option<Instant>,
 }
 
-/// Author : Starfloof.
+/// Per-IP token-bucket throttle with automatic temp-ban on exhaustion.
 #[derive(Clone, Debug)]
 pub struct ConnectionThrottle {
     records: Arc<Mutex<HashMap<IpAddr, IpRecord>>>,

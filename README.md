@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Website](https://img.shields.io/badge/website-kojacraft.net-blue?style=for-the-badge)](https://www.kojacraft.net)
-[![Discord](https://img.shields.io/badge/discord-join-purple?style=for-the-badge&logo=discord)](https://discord.gg/kojacraft)
+[![Discord](https://img.shields.io/badge/discord-join-purple?style=for-the-badge&logo=discord)](https://discord.gg/Xp6wFH3nM6)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Crates.io](https://img.shields.io/crates/v/kojacoord-proxy)](https://crates.io/crates/kojacoord-proxy)

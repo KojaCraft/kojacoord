@@ -59,7 +59,8 @@ pub struct ProxySection {
     #[serde(default)]
     pub prevent_proxy_connections: bool,
 
-    /// Author : Starfloof.
+    /// Enable HAProxy PROXY protocol v1/v2 support so the real client IP is
+    /// forwarded from an upstream load balancer (e.g. HAProxy, nginx, Traefik).
     #[serde(default = "default_proxy_protocol")]
     pub proxy_protocol: bool,
 
@@ -368,7 +369,7 @@ fn default_bind() -> String {
 fn default_online_mode() -> bool {
     true
 }
-/// Author : Starfloof.
+/// HAProxy PROXY protocol is off by default — most home/small setups don't need it.
 fn default_proxy_protocol() -> bool {
     false
 }

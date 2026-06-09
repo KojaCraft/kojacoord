@@ -1,4 +1,7 @@
-/// Author : Starfloof.
+//! HAProxy PROXY protocol v1/v2 parser.
+//!
+//! When the proxy sits behind a load balancer that sends a PROXY header, this
+//! module extracts the real client address before the Minecraft handshake begins.
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::AsyncReadExt;
 
@@ -7,7 +10,6 @@ use crate::error::ConnectionError;
 const V2_SIG: &[u8] = b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
 const V1_SIG: &[u8] = b"PROXY ";
 
-/// Author : Starfloof.
 /// Reads a PROXY protocol v1 or v2 header from the stream if present, and returns
 /// the original client's SocketAddr. If no PROXY header is present (and it was
 /// expected), it returns an error.

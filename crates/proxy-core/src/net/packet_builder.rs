@@ -16,7 +16,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
 
     match nearest(proto) {
         ProtocolVersion::V1_6_4 | ProtocolVersion::V1_7_10 => {
-            use kojacoord_protocol::versions::v1_7_10::play::ClientboundChatMessage;
+            use kojacoord_protocol::versions::v1_7_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
                 json_message: json,
                 position: 1,
@@ -25,7 +25,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_8 | ProtocolVersion::V1_12_2 => {
-            use kojacoord_protocol::versions::v1_12_2::play::ClientboundChatMessage;
+            use kojacoord_protocol::versions::v1_12_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
                 json_message: json,
                 position: 1,
@@ -34,7 +34,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_16_5 => {
-            use kojacoord_protocol::versions::v1_16_5::play::ClientboundChatMessage;
+            use kojacoord_protocol::versions::v1_16_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
                 json_message: json,
                 position: 1,
@@ -44,7 +44,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         _ => {
-            use kojacoord_protocol::versions::v1_20_4::play::ClientboundSystemChat;
+            use kojacoord_protocol::versions::v1_20_x::play::ClientboundSystemChat;
             ClientboundSystemChat {
                 content: json,
                 overlay: false,
@@ -91,6 +91,7 @@ pub fn build_brand_packet(kind: modloader::ModloaderKind, proto: u32) -> Bytes {
         modloader::ModloaderKind::Fml3 => "forge",
         modloader::ModloaderKind::NeoForge => "neoforge",
         modloader::ModloaderKind::Fabric => "fabric",
+        modloader::ModloaderKind::Quilt => "quilt",
         modloader::ModloaderKind::Unknown | modloader::ModloaderKind::Vanilla => "Kojacoord",
     };
 
@@ -115,7 +116,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
 
     match nearest(proto) {
         ProtocolVersion::V1_6_4 => {
-            use kojacoord_protocol::versions::v1_6_4::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_6_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -123,7 +124,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_7_10 => {
-            use kojacoord_protocol::versions::v1_7_10::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_7_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -131,7 +132,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_8 | ProtocolVersion::V1_12_2 => {
-            use kojacoord_protocol::versions::v1_12_2::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_12_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -139,7 +140,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_16_5 => {
-            use kojacoord_protocol::versions::v1_16_5::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_16_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -147,7 +148,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_19_4 => {
-            use kojacoord_protocol::versions::v1_19_4::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_19_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -155,7 +156,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_20_4 => {
-            use kojacoord_protocol::versions::v1_20_4::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_20_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -163,7 +164,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_21 => {
-            use kojacoord_protocol::versions::v1_21::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_21_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }

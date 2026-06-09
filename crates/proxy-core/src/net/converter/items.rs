@@ -1,3 +1,11 @@
+//! Slot/item conversion helpers shared by the cross-version converters.
+//!
+//! These are queued for the chunk-data / window-items / set-slot / entity-
+//! equipment converter work that the 1.12.2 ↔ 1.16.5 bridge currently drops.
+//! They live in their own module so the heavy flattening table can be plugged
+//! in later without touching the per-direction converters.
+#![allow(dead_code)]
+
 use kojacoord_protocol::types::slot::{LegacySlot, LegacySlotData, Slot};
 use kojacoord_protocol::ProtocolVersion;
 

@@ -5,6 +5,11 @@ use crate::error::ProtocolError;
 use crate::types::slot::LegacySlot;
 use crate::types::VarInt;
 
+// Trimming the `pub use` list to only the types actively constructed in the
+// proxy (limbo, connection disconnects) is a known follow-up — see the audit
+// in `versions/mod.rs`. Removing the unused types also requires deleting
+// their `raw_packet!`/`bin_packet!` definitions inside `mod packets`, which is
+// careful per-packet work. Kept as the full re-export until that sweep lands.
 pub use packets::{
     ClientboundAwardStats, ClientboundBlockAction, ClientboundBlockDestroyStage,
     ClientboundBlockEntityData, ClientboundBlockUpdate, ClientboundChangeDifficulty,
