@@ -162,3 +162,4 @@ kubeconfig
 
 # Docker
 .dockerignore.local
+AUDIT_FINDINGS.json

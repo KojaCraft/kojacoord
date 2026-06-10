@@ -56,6 +56,16 @@ impl PluginVerifier {
         self.trusted_hashes.insert(hash.trim().to_ascii_lowercase());
     }
 
+    /// Get the set of trusted hashes.
+    pub fn trusted_hashes(&self) -> &HashSet<String> {
+        &self.trusted_hashes
+    }
+
+    /// Check if verification is required.
+    pub fn require_verification(&self) -> bool {
+        self.require_verification
+    }
+
     /// Compute the hex-encoded SHA-256 digest of a file.
     pub fn file_sha256(path: &Path) -> Result<String> {
         // Prevent path traversal attacks by rejecting paths containing '..'.

@@ -1,3 +1,12 @@
+//! Optional SQL backing store (MySQL or SQLite).
+//!
+//! When `[database] url` is set, the proxy persists player profiles,
+//! purchases, role assignments, and ban records here. The SQLite
+//! fallback is the default when no URL is configured — `data/proxy.db`
+//! is created on the fly. The connection is optional throughout:
+//! every consumer treats `db: Option<Arc<Db>>` and degrades to
+//! in-memory-only behavior when it's `None`.
+
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;

@@ -1,3 +1,9 @@
+//! 64-bit variant of [`var_int`][crate::types::var_int].
+//!
+//! Same encoding (7 bits per byte, MSB continuation), 10 bytes max
+//! instead of 5. Used in world-seed fields and a handful of timing
+//! packets where the 32-bit range isn't enough.
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
@@ -5,6 +11,7 @@ use crate::{
     error::ProtocolError,
 };
 
+/// Maximum byte length of a serialized VarLong (10 bytes = `ceil(64/7)`).
 pub const VARLONG_MAX_BYTES: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

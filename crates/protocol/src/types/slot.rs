@@ -1,3 +1,13 @@
+//! Inventory slot wire types.
+//!
+//! Two shapes coexist because Minecraft refactored slots in 1.13:
+//!   - [`LegacySlot`] — pre-1.13: `i16 item_id + i8 count + i16 damage + optional NBT`
+//!   - [`Slot`] — 1.13+: `bool present + varint item_id + i8 count + optional NBT`
+//!
+//! The 1.19.4 / 1.20.5 changes (state-id prefix, structured component
+//! data) ride on top of these as wrappers in the converter code; the
+//! base structs here stay focused on the round-trip shape.
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{

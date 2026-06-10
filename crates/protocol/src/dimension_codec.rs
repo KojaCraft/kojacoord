@@ -12,13 +12,16 @@
 //! The 1.16.2 protocol bump changed the codec slightly (dimension type became
 //! its own embedded compound rather than an int id); the layout here targets
 //! 1.16.2+ since 1.16.0/1.16.1 are sub-1% of legacy clients.
+//!
+//! 1.20.4+ uses a more complex registry structure with additional fields
+//! like `monster_spawn_light_level`, `min_y`, `height`, etc.
 
 use std::collections::HashMap;
 
+use crate::codec::Encode;
+use crate::types::nbt::{Nbt, NbtTag};
+use crate::ProtocolError;
 use bytes::BytesMut;
-use kojacoord_protocol::codec::Encode;
-use kojacoord_protocol::types::nbt::{Nbt, NbtTag};
-use kojacoord_protocol::ProtocolError;
 
 fn d(v: f64) -> NbtTag {
     NbtTag::Float(v as f32)
@@ -40,6 +43,7 @@ fn dimension_type_element(
     natural: bool,
     infiniburn: &str,
     effects: &str,
+    is_1_20_4: bool,
 ) -> NbtTag {
     let mut m = HashMap::new();
     m.insert("piglin_safe".into(), b(0));
@@ -60,6 +64,14 @@ fn dimension_type_element(
     m.insert("coordinate_scale".into(), NbtTag::Double(1.0));
     m.insert("ultrawarm".into(), b(ultrawarm as i8));
     m.insert("has_ceiling".into(), b(has_ceiling as i8));
+
+    // 1.20.4+ additional fields
+    if is_1_20_4 {
+        m.insert("monster_spawn_light_level".into(), NbtTag::Int(0));
+        m.insert("monster_spawn_block_light_limit".into(), NbtTag::Int(0));
+        m.insert("fixed_time".into(), NbtTag::Int(0)); // 0 = no fixed time
+    }
+
     NbtTag::Compound(m)
 }
 
@@ -110,6 +122,16 @@ fn registry(registry_id: &str, values: Vec<NbtTag>) -> NbtTag {
 /// Build the dimension codec compound that 1.16+ JoinGame embeds.
 /// Returned as a network-encoded NBT (compound tag with empty name).
 pub fn dimension_codec_nbt() -> Result<Vec<u8>, ProtocolError> {
+    dimension_codec_nbt_with_version(false)
+}
+
+/// Build the dimension codec compound for 1.20.4+ JoinGame.
+/// Includes additional fields required by modern versions.
+pub fn dimension_codec_nbt_1_20_4() -> Result<Vec<u8>, ProtocolError> {
+    dimension_codec_nbt_with_version(true)
+}
+
+fn dimension_codec_nbt_with_version(is_1_20_4: bool) -> Result<Vec<u8>, ProtocolError> {
     let mut root: HashMap<String, NbtTag> = HashMap::new();
 
     let overworld = dimension_type_element(
@@ -119,6 +141,7 @@ pub fn dimension_codec_nbt() -> Result<Vec<u8>, ProtocolError> {
         true,
         "minecraft:infiniburn_overworld",
         "minecraft:overworld",
+        is_1_20_4,
     );
     let nether = dimension_type_element(
         false,
@@ -127,6 +150,7 @@ pub fn dimension_codec_nbt() -> Result<Vec<u8>, ProtocolError> {
         false,
         "minecraft:infiniburn_nether",
         "minecraft:the_nether",
+        is_1_20_4,
     );
     let end = dimension_type_element(
         false,
@@ -135,6 +159,7 @@ pub fn dimension_codec_nbt() -> Result<Vec<u8>, ProtocolError> {
         false,
         "minecraft:infiniburn_end",
         "minecraft:the_end",
+        is_1_20_4,
     );
 
     let dim_registry = registry(
@@ -166,9 +191,17 @@ pub fn dimension_codec_nbt() -> Result<Vec<u8>, ProtocolError> {
 /// Build the standalone "dimension type" compound the 1.16.2+ JoinGame embeds
 /// right after the codec. `key` is e.g. "minecraft:overworld".
 pub fn dimension_type_nbt(key: &str) -> Result<Vec<u8>, ProtocolError> {
-    let (element, infiniburn, effects, has_skylight, has_ceiling, ultrawarm, natural) = match key {
+    dimension_type_nbt_with_version(key, false)
+}
+
+/// Build the standalone "dimension type" compound for 1.20.4+ JoinGame.
+pub fn dimension_type_nbt_1_20_4(key: &str) -> Result<Vec<u8>, ProtocolError> {
+    dimension_type_nbt_with_version(key, true)
+}
+
+fn dimension_type_nbt_with_version(key: &str, is_1_20_4: bool) -> Result<Vec<u8>, ProtocolError> {
+    let (infiniburn, effects, has_skylight, has_ceiling, ultrawarm, natural) = match key {
         "minecraft:the_nether" => (
-            "nether",
             "minecraft:infiniburn_nether",
             "minecraft:the_nether",
             false,
@@ -177,7 +210,6 @@ pub fn dimension_type_nbt(key: &str) -> Result<Vec<u8>, ProtocolError> {
             false,
         ),
         "minecraft:the_end" => (
-            "end",
             "minecraft:infiniburn_end",
             "minecraft:the_end",
             false,
@@ -186,7 +218,6 @@ pub fn dimension_type_nbt(key: &str) -> Result<Vec<u8>, ProtocolError> {
             false,
         ),
         _ => (
-            "overworld",
             "minecraft:infiniburn_overworld",
             "minecraft:overworld",
             true,
@@ -195,7 +226,6 @@ pub fn dimension_type_nbt(key: &str) -> Result<Vec<u8>, ProtocolError> {
             true,
         ),
     };
-    let _ = element;
     let element = dimension_type_element(
         has_skylight,
         has_ceiling,
@@ -203,6 +233,7 @@ pub fn dimension_type_nbt(key: &str) -> Result<Vec<u8>, ProtocolError> {
         natural,
         infiniburn,
         effects,
+        is_1_20_4,
     );
     let mut root = HashMap::new();
     if let NbtTag::Compound(m) = element {

@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package kojacoord.control_plane;
+
+// Control plane service for external orchestration
+service ControlPlane {
+  // Server management
+  rpc GetServers(GetServersRequest) returns (GetServersResponse);
+  rpc AddServer(AddServerRequest) returns (AddServerResponse);
+  rpc RemoveServer(RemoveServerRequest) returns (RemoveServerResponse);
+  rpc UpdateServerStatus(UpdateServerStatusRequest) returns (UpdateServerStatusResponse);
+  
+  // Routing rule management
+  rpc GetRoutingRules(GetRoutingRulesRequest) returns (GetRoutingRulesResponse);
+  rpc AddRoutingRule(AddRoutingRuleRequest) returns (AddRoutingRuleResponse);
+  rpc RemoveRoutingRule(RemoveRoutingRuleRequest) returns (RemoveRoutingRuleResponse);
+  rpc ToggleRoutingRule(ToggleRoutingRuleRequest) returns (ToggleRoutingRuleResponse);
+  
+  // Metrics
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream MetricsUpdate);
+  
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Server status enum
+enum ServerStatus {
+  ONLINE = 0;
+  OFFLINE = 1;
+  DRAINING = 2;
+  MAINTENANCE = 3;
+}
+
+// Server information
+message ServerInfo {
+  string name = 1;
+  string address = 2;
+  ServerStatus status = 3;
+  uint32 player_count = 4;
+  uint32 max_players = 5;
+  string region = 6;
+  double latency_ms = 7;
+  int64 last_updated = 8;
+}
+
+// Routing rule
+message RoutingRule {
+  string id = 1;
+  string pattern = 2;
+  string target = 3;
+  uint32 priority = 4;
+  bool enabled = 5;
+  map<string, string> metadata = 6;
+}
+
+// Proxy metrics
+message ProxyMetrics {
+  uint64 total_connections = 1;
+  uint64 active_connections = 2;
+  uint64 total_bytes_sent = 3;
+  uint64 total_bytes_received = 4;
+  uint64 uptime_seconds = 5;
+  double cpu_usage_percent = 6;
+  double memory_usage_percent = 7;
+  double error_rate = 8;
+}
+
+// Server management requests/responses
+message GetServersRequest {
+  string filter_region = 1;
+  ServerStatus filter_status = 2;
+}
+
+message GetServersResponse {
+  repeated ServerInfo servers = 1;
+}
+
+message AddServerRequest {
+  ServerInfo server = 1;
+}
+
+message AddServerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RemoveServerRequest {
+  string name = 1;
+}
+
+message RemoveServerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message UpdateServerStatusRequest {
+  string name = 1;
+  ServerStatus status = 2;
+}
+
+message UpdateServerStatusResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Routing rule requests/responses
+message GetRoutingRulesRequest {
+  bool enabled_only = 1;
+}
+
+message GetRoutingRulesResponse {
+  repeated RoutingRule rules = 1;
+}
+
+message AddRoutingRuleRequest {
+  RoutingRule rule = 1;
+}
+
+message AddRoutingRuleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RemoveRoutingRuleRequest {
+  string id = 1;
+}
+
+message RemoveRoutingRuleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ToggleRoutingRuleRequest {
+  string id = 1;
+  bool enabled = 2;
+}
+
+message ToggleRoutingRuleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Metrics requests/responses
+message GetMetricsRequest {
+  // Empty for now
+}
+
+message GetMetricsResponse {
+  ProxyMetrics metrics = 1;
+}
+
+message StreamMetricsRequest {
+  uint32 interval_ms = 1;
+}
+
+message MetricsUpdate {
+  ProxyMetrics metrics = 1;
+  int64 timestamp = 2;
+}
+
+// Health check
+message HealthCheckRequest {
+  // Empty
+}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  string message = 3;
+}

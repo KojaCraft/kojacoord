@@ -59,12 +59,12 @@ impl Decode for ClientboundLoginDisconnect {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientboundEncryptionRequest {
     pub server_id: String,
-
     pub public_key: Vec<u8>,
-
     pub verify_token: Vec<u8>,
-
-    pub should_authenticate: bool,
+    /// Always present from 1.20.5 (proto 766) onward, but kept as
+    /// `Option<bool>` so the call sites match the v1_20_x signature.
+    /// Pass `Some(true)` for any real 1.21 client.
+    pub should_authenticate: Option<bool>,
 }
 
 impl PacketId for ClientboundEncryptionRequest {
@@ -78,7 +78,10 @@ impl Encode for ClientboundEncryptionRequest {
         self.server_id.encode(dst)?;
         encode_byte_array(&self.public_key, dst)?;
         encode_byte_array(&self.verify_token, dst)?;
-        self.should_authenticate.encode(dst)
+        if let Some(flag) = self.should_authenticate {
+            flag.encode(dst)?;
+        }
+        Ok(())
     }
 }
 
@@ -87,7 +90,8 @@ impl Decode for ClientboundEncryptionRequest {
         let server_id = String::decode(src)?;
         let public_key = decode_byte_array(src)?;
         let verify_token = decode_byte_array(src)?;
-        let should_authenticate = bool::decode(src)?;
+        let should_authenticate =
+            if src.is_empty() { None } else { Some(bool::decode(src)?) };
         Ok(Self {
             server_id,
             public_key,
@@ -130,10 +134,12 @@ impl Decode for ProfileProperty {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientboundLoginSuccess {
     pub uuid: uuid::Uuid,
-
     pub username: String,
-
     pub properties: Vec<ProfileProperty>,
+    /// `strict_error_handling` was added in 1.21 (proto 767) and
+    /// dropped again in 1.21.4 (proto 769). `None` ⇒ don't emit the
+    /// trailing byte.
+    pub strict_error_handling: Option<bool>,
 }
 
 impl PacketId for ClientboundLoginSuccess {
@@ -148,7 +154,11 @@ impl Encode for ClientboundLoginSuccess {
         (hi as i64).encode(dst)?;
         (lo as i64).encode(dst)?;
         self.username.encode(dst)?;
-        self.properties.encode(dst)
+        self.properties.encode(dst)?;
+        if let Some(flag) = self.strict_error_handling {
+            flag.encode(dst)?;
+        }
+        Ok(())
     }
 }
 
@@ -159,10 +169,13 @@ impl Decode for ClientboundLoginSuccess {
         let uuid = uuid::Uuid::from_u64_pair(hi, lo);
         let username = String::decode(src)?;
         let properties = Vec::<ProfileProperty>::decode(src)?;
+        let strict_error_handling =
+            if src.is_empty() { None } else { Some(bool::decode(src)?) };
         Ok(Self {
             uuid,
             username,
             properties,
+            strict_error_handling,
         })
     }
 }
@@ -343,6 +356,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             username: "Player1".to_string(),
             properties: Vec::new(),
+            strict_error_handling: Some(true),
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();
@@ -370,6 +384,7 @@ mod tests {
                     signature: None,
                 },
             ],
+            strict_error_handling: Some(true),
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();
@@ -387,7 +402,7 @@ mod tests {
             server_id: String::new(),
             public_key: vec![0xAB, 0xCD, 0xEF],
             verify_token: vec![1, 2, 3, 4],
-            should_authenticate: true,
+            should_authenticate: Some(true),
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();

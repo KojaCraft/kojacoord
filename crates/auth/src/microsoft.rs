@@ -1,3 +1,13 @@
+//! Microsoft / Xbox Live authentication flow.
+//!
+//! Three-step token exchange: Xbox Live → XSTS → Minecraft Services,
+//! ending in a bearer token that lets us pull the
+//! `/minecraft/profile` endpoint and resolve the player's UUID.
+//! Used when the operator wires the proxy to its own Microsoft
+//! account (for hosted-by-proxy auth flows) — the per-connection
+//! online-mode check still goes through `session::verify_session`
+//! against `sessionserver.mojang.com`.
+
 use serde::Deserialize;
 
 const XBL_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";

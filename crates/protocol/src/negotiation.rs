@@ -88,10 +88,14 @@ pub enum ProtocolVersion {
     V1_20_6, // 766  (also 1.20.6)
 
     // 1.21.x family — tricky trials; registry data packet rework.
-    V1_21,   // 767  (also 1.21.1)
-    V1_21_2, // 768  (also 1.21.3)
-    V1_21_4, // 769
-    V1_21_5, // 770
+    V1_21,    // 767  (also 1.21.1)
+    V1_21_2,  // 768  (also 1.21.3)
+    V1_21_4,  // 769
+    V1_21_5,  // 770
+    V1_21_6,  // 771
+    V1_21_8,  // 772
+    V1_21_9,  // 773
+    V1_21_11, // 774
 
     Unknown(u32),
 }
@@ -178,6 +182,10 @@ impl ProtocolVersion {
             768 => ProtocolVersion::V1_21_2,
             769 => ProtocolVersion::V1_21_4,
             770 => ProtocolVersion::V1_21_5,
+            771 => ProtocolVersion::V1_21_6,
+            772 => ProtocolVersion::V1_21_8,
+            773 => ProtocolVersion::V1_21_9,
+            774 => ProtocolVersion::V1_21_11,
             x => ProtocolVersion::Unknown(x),
         }
     }
@@ -235,6 +243,10 @@ impl ProtocolVersion {
             ProtocolVersion::V1_21_2 => 768,
             ProtocolVersion::V1_21_4 => 769,
             ProtocolVersion::V1_21_5 => 770,
+            ProtocolVersion::V1_21_6 => 771,
+            ProtocolVersion::V1_21_8 => 772,
+            ProtocolVersion::V1_21_9 => 773,
+            ProtocolVersion::V1_21_11 => 774,
             ProtocolVersion::Unknown(x) => *x,
         }
     }
@@ -295,9 +307,56 @@ impl ProtocolVersion {
             ProtocolVersion::V1_21
             | ProtocolVersion::V1_21_2
             | ProtocolVersion::V1_21_4
-            | ProtocolVersion::V1_21_5 => Epoch::V1_21Plus,
+            | ProtocolVersion::V1_21_5
+            | ProtocolVersion::V1_21_6
+            | ProtocolVersion::V1_21_8
+            | ProtocolVersion::V1_21_9
+            | ProtocolVersion::V1_21_11 => Epoch::V1_21Plus,
             ProtocolVersion::Unknown(_) => Epoch::Unknown,
         }
+    }
+
+    // ── Feature predicates ───────────────────────────────────────────────
+    // Prefer these over bare `match self` ladders at call sites: each one
+    // corresponds to a documented wire-protocol boundary on minecraft.wiki.
+
+    /// True for 1.6.x — completely different protocol shape (no varint
+    /// framing, hardcoded packet IDs, no Login phase).
+    pub fn is_pre_netty(&self) -> bool {
+        matches!(self.epoch(), Epoch::PreNetty)
+    }
+
+    /// True for 1.13+ — the "flattening" that gave every block/item its own
+    /// numeric ID and switched many packets to string-keyed registry refs.
+    pub fn is_flattened(&self) -> bool {
+        self.epoch() >= Epoch::V1_13_To_1_15
+    }
+
+    /// True for 1.20.2+ (proto 764) — the version that introduced the
+    /// Configuration state between Login and Play.  Note that `Epoch::V1_20`
+    /// alone is *not* sufficient because it also covers 1.20/1.20.1 (proto
+    /// 763) which still ship LoginSuccess → Play.
+    pub fn has_configuration_phase(&self) -> bool {
+        self.id() >= 764
+    }
+
+    /// True for 1.19+ — clientbound chat is split into SystemChat /
+    /// PlayerChat, and ServerboundChatMessage carries signing data.
+    pub fn has_chat_signing(&self) -> bool {
+        self.epoch() >= Epoch::V1_19
+    }
+
+    /// True for 1.19.3+ (proto 761) — ServerboundLoginStart carries an
+    /// `Option<UUID>` field (bool prefix). 1.20.2+ promoted it to a
+    /// mandatory `UUID` (no bool prefix) — see [`Self::has_mandatory_login_start_uuid`].
+    pub fn has_login_start_uuid(&self) -> bool {
+        self.id() >= 761
+    }
+
+    /// True for 1.20.2+ (proto 764) — ServerboundLoginStart carries an
+    /// always-present `UUID` field (no `Option<>` bool prefix).
+    pub fn has_mandatory_login_start_uuid(&self) -> bool {
+        self.id() >= 764
     }
 
     /// Bucket any version onto a [`CanonicalVersion`] — i.e. one of the

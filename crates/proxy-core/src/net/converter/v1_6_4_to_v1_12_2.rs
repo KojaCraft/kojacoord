@@ -21,21 +21,21 @@ const V164_S2C_HELD_ITEM_CHANGE: u8 = 0x09;
 const V164_S2C_PLAYER_ABILITIES: u8 = 0x43;
 const V164_S2C_DISCONNECT: u8 = 0xFF;
 
-const V112_S2C_KEEP_ALIVE: u8 = 0x00;
-const V112_S2C_CHAT: u8 = 0x02;
-const V112_S2C_PLAYER_POS_LOOK: u8 = 0x2E;
-const V112_S2C_SPAWN_PLAYER: u8 = 0x0C;
-const V112_S2C_ENTITY_TELEPORT: u8 = 0x18;
-const V112_S2C_ENTITY_REL_MOVE: u8 = 0x25;
-const V112_S2C_ENTITY: u8 = 0x00;
+const V112_S2C_KEEP_ALIVE: u8 = 0x1F;
+const V112_S2C_CHAT: u8 = 0x0F;
+const V112_S2C_PLAYER_POS_LOOK: u8 = 0x2F;
+const V112_S2C_SPAWN_PLAYER: u8 = 0x05;
+const V112_S2C_ENTITY_TELEPORT: u8 = 0x4C;
+const V112_S2C_ENTITY_REL_MOVE: u8 = 0x26;
+const V112_S2C_ENTITY: u8 = 0x25;
 const V112_S2C_BLOCK_CHANGE: u8 = 0x0B;
 const V112_S2C_SET_SLOT: u8 = 0x16;
 const V112_S2C_WINDOW_ITEMS: u8 = 0x14;
-const V112_S2C_ENTITY_EQUIPMENT: u8 = 0x04;
-const V112_S2C_EXPERIENCE: u8 = 0x1F;
-const V112_S2C_HELD_ITEM_CHANGE: u8 = 0x37;
-const V112_S2C_PLAYER_ABILITIES: u8 = 0x2B;
-const V112_S2C_DISCONNECT: u8 = 0x40;
+const V112_S2C_ENTITY_EQUIPMENT: u8 = 0x3F;
+const V112_S2C_EXPERIENCE: u8 = 0x40;
+const V112_S2C_HELD_ITEM_CHANGE: u8 = 0x3A;
+const V112_S2C_PLAYER_ABILITIES: u8 = 0x2C;
+const V112_S2C_DISCONNECT: u8 = 0x1A;
 
 pub fn convert_s2c(payload: Bytes) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
@@ -433,11 +433,11 @@ const V164_C2S_ENTITY_ACTION: u8 = 0x13;
 
 const V112_C2S_KEEP_ALIVE: u8 = 0x0B;
 const V112_C2S_CHAT: u8 = 0x02;
-const V112_C2S_PLAYER_POS_LOOK: u8 = 0x0D;
-const V112_C2S_PLAYER_DIGGING: u8 = 0x18;
-const V112_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x1C;
-const V112_C2S_HELD_ITEM_CHANGE: u8 = 0x21;
-const V112_C2S_ENTITY_ACTION: u8 = 0x14;
+const V112_C2S_PLAYER_POS_LOOK: u8 = 0x0E;
+const V112_C2S_PLAYER_DIGGING: u8 = 0x14;
+const V112_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x1F;
+const V112_C2S_HELD_ITEM_CHANGE: u8 = 0x1A;
+const V112_C2S_ENTITY_ACTION: u8 = 0x15;
 
 pub fn convert_c2s(payload: Bytes) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {

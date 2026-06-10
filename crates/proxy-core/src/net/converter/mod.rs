@@ -1,5 +1,4 @@
-pub mod dimension_codec;
-pub mod flattening;
+pub mod chunk_repack;
 mod items;
 pub mod modern_to_v1_8;
 mod safe;
@@ -12,6 +11,8 @@ pub mod v1_6_4_to_v1_16_5;
 pub mod v1_7_to_v1_8;
 pub mod v1_8_to_modern;
 pub mod v1_8_to_v1_7;
+
+mod helpers;
 
 use bytes::Bytes;
 use kojacoord_protocol::{CanonicalVersion, ProtocolVersion};
@@ -39,14 +40,78 @@ pub enum ConversionDirection {
     },
 }
 
-pub struct PacketConverter;
+pub struct PacketConverter {
+    // Optional reference to chunk repacker for cross-version chunk conversion
+    chunk_repacker: Option<std::sync::Arc<chunk_repack::ChunkRepacker>>,
+}
 
 impl PacketConverter {
-    pub fn convert(payload: Bytes, direction: ConversionDirection) -> ConversionResult {
-        safe::guard("convert", move || Self::convert_inner(payload, direction))
+    pub fn new() -> Self {
+        Self {
+            chunk_repacker: None,
+        }
     }
 
-    fn convert_inner(payload: Bytes, direction: ConversionDirection) -> ConversionResult {
+    pub fn with_chunk_repacker(
+        mut self,
+        repacker: std::sync::Arc<chunk_repack::ChunkRepacker>,
+    ) -> Self {
+        self.chunk_repacker = Some(repacker);
+        self
+    }
+
+    pub fn convert(payload: Bytes, direction: ConversionDirection) -> ConversionResult {
+        safe::guard("convert", move || {
+            Self::convert_inner(payload, direction, None)
+        })
+    }
+
+    pub fn convert_with_repacker(
+        payload: Bytes,
+        direction: ConversionDirection,
+        repacker: Option<std::sync::Arc<chunk_repack::ChunkRepacker>>,
+    ) -> ConversionResult {
+        safe::guard("convert", move || {
+            Self::convert_inner(payload, direction, repacker)
+        })
+    }
+
+    fn convert_inner(
+        payload: Bytes,
+        direction: ConversionDirection,
+        repacker: Option<std::sync::Arc<chunk_repack::ChunkRepacker>>,
+    ) -> ConversionResult {
+        // Log conversion for protocol-coverage tracking. Annotate the
+        // trace with each side's slot layout so packet dumps make it
+        // obvious which item-encoding path the converters are expected
+        // to take.
+        match &direction {
+            ConversionDirection::ServerToClient {
+                server_proto,
+                client_proto,
+            } => {
+                tracing::trace!(
+                    server_proto,
+                    client_proto,
+                    server_slot = ?items::slot_layout(nearest(*server_proto)),
+                    client_slot = ?items::slot_layout(nearest(*client_proto)),
+                    "Converting packet S2C"
+                );
+            },
+            ConversionDirection::ClientToServer {
+                client_proto,
+                server_proto,
+            } => {
+                tracing::trace!(
+                    client_proto,
+                    server_proto,
+                    client_slot = ?items::slot_layout(nearest(*client_proto)),
+                    server_slot = ?items::slot_layout(nearest(*server_proto)),
+                    "Converting packet C2S"
+                );
+            },
+        }
+
         match direction {
             ConversionDirection::ServerToClient {
                 server_proto,
@@ -90,7 +155,7 @@ impl PacketConverter {
                 (ProtocolVersion::V1_6_4, ProtocolVersion::V1_16_5) => {
                     v1_6_4_to_v1_16_5::convert_s2c(payload)
                 },
-                _ => dispatch_canonical_s2c(payload, server_proto, client_proto),
+                _ => dispatch_canonical_s2c(payload, server_proto, client_proto, repacker),
             },
 
             ConversionDirection::ClientToServer {
@@ -140,7 +205,7 @@ impl PacketConverter {
                 (ProtocolVersion::V1_6_4, ProtocolVersion::V1_16_5) => {
                     v1_6_4_to_v1_16_5::convert_c2s(payload)
                 },
-                _ => dispatch_canonical_c2s(payload, client_proto, server_proto),
+                _ => dispatch_canonical_c2s(payload, client_proto, server_proto, repacker),
             },
         }
     }
@@ -164,6 +229,7 @@ fn dispatch_canonical_s2c(
     payload: Bytes,
     server_proto: u32,
     client_proto: u32,
+    repacker: Option<std::sync::Arc<chunk_repack::ChunkRepacker>>,
 ) -> ConversionResult {
     match (
         canonical_for_dispatch(server_proto),
@@ -176,10 +242,10 @@ fn dispatch_canonical_s2c(
             v1_20_4_to_v1_16_5::convert_s2c(payload)
         },
         (CanonicalVersion::V1_12_2, CanonicalVersion::V1_16_5) => {
-            v1_12_2_to_v1_16_5::convert_s2c(payload)
+            v1_12_2_to_v1_16_5::convert_s2c(payload, repacker)
         },
         (CanonicalVersion::V1_16_5, CanonicalVersion::V1_12_2) => {
-            v1_16_5_to_v1_12_2::convert_s2c(payload)
+            v1_16_5_to_v1_12_2::convert_s2c(payload, repacker)
         },
         _ => ConversionResult::Passthrough,
     }
@@ -189,6 +255,7 @@ fn dispatch_canonical_c2s(
     payload: Bytes,
     client_proto: u32,
     server_proto: u32,
+    _repacker: Option<std::sync::Arc<chunk_repack::ChunkRepacker>>,
 ) -> ConversionResult {
     match (
         canonical_for_dispatch(client_proto),
@@ -212,6 +279,12 @@ fn dispatch_canonical_c2s(
 
 use bytes::BytesMut;
 use kojacoord_protocol::codec::Encode;
+
+impl Default for PacketConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub(crate) fn build_payload(id: u8, body: &[u8]) -> Bytes {
     let mut buf = BytesMut::new();

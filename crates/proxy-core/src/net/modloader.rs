@@ -1,3 +1,20 @@
+//! Modloader detection + handshake plumbing.
+//!
+//! Sniffs Forge/NeoForge/Fabric/Quilt clients by the plugin-message
+//! channels they advertise during the handshake or configuration
+//! phase. Once detected, the proxy advertises the matching brand on
+//! its own side so the modded client recognises the proxy as a
+//! compatible server. Brand strings, channel names, and FML
+//! discriminators are kept as `const` here so the per-version code
+//! paths can pattern-match cleanly.
+//!
+//! References:
+//! - FML1 (1.7–1.12): old `FML|HS` plugin-message handshake.
+//! - FML2/FML3 (1.13+): `fml:loginwrapper` and `fml:handshake` channels.
+//! - NeoForge: `neoforge:*` channels (1.20.2+).
+//! - Fabric: `fabric-networking-api-v1:*`.
+//! - Quilt: a Fabric fork; advertises both Fabric and Quilt channels.
+
 use bytes::{BufMut, Bytes, BytesMut};
 use kojacoord_protocol::codec::Encode;
 use kojacoord_protocol::types::VarInt;
@@ -141,12 +158,54 @@ pub fn parse_fml1_discriminator(body: &[u8]) -> Option<FmlDiscriminator> {
     body.first().copied().map(FmlDiscriminator::from)
 }
 
+/// Build the FML1 handshake-reset plugin message in modern (1.7+) wire
+/// format. The packet id is varint-encoded and the channel string is
+/// length-prefixed. For 1.6.x clients use
+/// [`build_fml1_handshake_reset_legacy`] — pre-netty has no varint length
+/// prefix.
 pub fn build_fml1_handshake_reset(plugin_msg_id: u8) -> Bytes {
     let mut payload = BytesMut::new();
     VarInt(plugin_msg_id as i32).encode(&mut payload).unwrap();
     FML1_HS.to_owned().encode(&mut payload).unwrap();
     payload.put_u8(0xFE);
     frame_bytes(payload.freeze())
+}
+
+/// Pick the right FML1 handshake-reset bytes for the negotiated
+/// protocol. Routes 1.6.x clients through the pre-netty variant and
+/// 1.7+ through the modern (varint-framed) one. Saves callers from
+/// having to know about the wire-format split.
+///
+/// The `plugin_msg_id` argument is ignored for pre-netty (its plugin
+/// message id is a hardcoded `0xFA`).
+pub fn build_fml1_handshake_reset_for_proto(proto: u32, plugin_msg_id: u8) -> Bytes {
+    if crate::packet_io::is_pre_netty_proto(proto) {
+        build_fml1_handshake_reset_legacy()
+    } else {
+        build_fml1_handshake_reset(plugin_msg_id)
+    }
+}
+
+/// Build the FML1 handshake-reset plugin message in pre-netty (1.6.x)
+/// wire format. The 1.6.4 plugin message packet (0xFA) uses two raw
+/// UCS-2 strings (length-prefixed in big-endian u16) instead of
+/// varint-prefixed UTF-8. The 1.6 Forge handshake uses the same
+/// `FML|HS` channel but the framing layer is entirely different.
+///
+/// See <https://wiki.vg/Protocol_History/1.6.4#Plugin_Message_.280xFA.29>.
+pub fn build_fml1_handshake_reset_legacy() -> Bytes {
+    // Pre-netty plugin message: 0xFA, then UCS-2 channel name with u16
+    // length prefix, then u16 payload length, then payload bytes.
+    let mut out = BytesMut::new();
+    out.put_u8(0xFA);
+    out.put_u16(FML1_HS.encode_utf16().count() as u16);
+    for unit in FML1_HS.encode_utf16() {
+        out.put_u16(unit);
+    }
+    // One byte payload — the handshake-reset discriminator.
+    out.put_u16(1);
+    out.put_u8(0xFE);
+    out.freeze()
 }
 
 #[inline]

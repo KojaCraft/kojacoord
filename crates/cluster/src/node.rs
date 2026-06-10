@@ -1,3 +1,10 @@
+//! Per-peer cluster state.
+//!
+//! [`ClusterNode`] is the public, serializable view of one proxy in
+//! the cluster — UUID, address, role, last heartbeat. Shared over
+//! the gossip channel between nodes and surfaced to the management
+//! API.
+
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;

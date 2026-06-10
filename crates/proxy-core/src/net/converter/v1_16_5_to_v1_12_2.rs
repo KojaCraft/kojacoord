@@ -6,14 +6,21 @@
 //! client just doesn't see those updates). Position bit layout is repacked
 //! from the 1.14+ scheme back to the pre-1.14 scheme.
 //!
+//! Chunk data packets are handled by the chunk repacker for proper
+//! cross-version conversion from Flattened (1.16.5) to Legacy (1.12.2).
+//!
 //! Reference: see the docstring on [`super::v1_12_2_to_v1_16_5`].
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kojacoord_protocol::codec::{Decode, Encode};
 use kojacoord_protocol::types::{Position, VarInt};
+use kojacoord_protocol::{decode_modern_position, encode_legacy_position, BlockFlatteningTable};
 
+use super::helpers::rebuild_with_id;
+use super::items;
 use super::{build_payload, split_id};
 use crate::converter::ConversionResult;
+use kojacoord_protocol::types::slot::Slot;
 
 // ── S2C IDs (mirrored from the forward converter) ────────────────────────────
 const V16_S2C_KEEP_ALIVE: u8 = 0x1F;
@@ -51,12 +58,18 @@ const V12_S2C_HELD_ITEM_CHANGE: u8 = 0x3A;
 const V12_S2C_PLAYER_ABILITIES: u8 = 0x2C;
 const V12_S2C_SET_EXPERIENCE: u8 = 0x40;
 const V12_S2C_ENTITY_TELEPORT: u8 = 0x4C;
-const V12_S2C_MOVE_ENTITY_POS: u8 = 0x25;
-const V12_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x26;
-const V12_S2C_MOVE_ENTITY_ROT: u8 = 0x27;
+const V12_S2C_MOVE_ENTITY_POS: u8 = 0x26;
+const V12_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x27;
+const V12_S2C_MOVE_ENTITY_ROT: u8 = 0x28;
 const V12_S2C_DESTROY_ENTITIES: u8 = 0x32;
 const V12_S2C_ENTITY_HEAD_LOOK: u8 = 0x36;
 const V12_S2C_ENTITY_VELOCITY: u8 = 0x3E;
+const V12_S2C_BLOCK_CHANGE: u8 = 0x0B;
+const V12_S2C_MULTI_BLOCK_CHANGE: u8 = 0x10;
+const V12_S2C_SET_SLOT: u8 = 0x16;
+const V12_S2C_WINDOW_ITEMS: u8 = 0x14;
+const V12_S2C_ENTITY_EQUIPMENT: u8 = 0x3F;
+const V12_S2C_CHUNK_DATA: u8 = 0x20;
 
 // ── C2S IDs ──────────────────────────────────────────────────────────────────
 const V16_C2S_TELEPORT_CONFIRM: u8 = 0x00;
@@ -97,16 +110,12 @@ const V12_C2S_USE_ITEM: u8 = 0x20;
 
 // ── Position repacking (modern → legacy) ─────────────────────────────────────
 
-fn encode_legacy_position(p: Position) -> u64 {
-    let x = (p.x as i64) & 0x3FF_FFFF;
-    let y = (p.y as i64) & 0xFFF;
-    let z = (p.z as i64) & 0x3FF_FFFF;
-    ((x << 38) | (y << 26) | z) as u64
-}
-
 // ── S2C dispatch ─────────────────────────────────────────────────────────────
 
-pub fn convert_s2c(payload: Bytes) -> ConversionResult {
+pub fn convert_s2c(
+    payload: Bytes,
+    repacker: Option<std::sync::Arc<crate::converter::chunk_repack::ChunkRepacker>>,
+) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
         return ConversionResult::Passthrough;
     };
@@ -131,53 +140,214 @@ pub fn convert_s2c(payload: Bytes) -> ConversionResult {
         V16_S2C_ENTITY_VELOCITY => rebuild_with_id(V12_S2C_ENTITY_VELOCITY, &body),
 
         V16_S2C_BLOCK_CHANGE => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping BlockChange (needs inverse flattening state \
-                 table); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert BlockChange from modern to legacy format
+            // 1.16.5: i64 position (1.14 layout) + VarInt state
+            // 1.12.2: i64 position (1.8 layout) + VarInt block_state where block_state = (block_id << 4) | meta
+            let mut body_mut = BytesMut::from(body.as_ref());
+            if body_mut.remaining() < 8 {
+                return ConversionResult::Passthrough;
+            }
+            let packed_modern = body_mut.get_u64();
+            let pos = decode_modern_position(packed_modern);
+            let modern_state = match VarInt::decode(&mut body_mut.clone().freeze()) {
+                Ok(v) => v.0 as u32,
+                Err(_) => return ConversionResult::Passthrough,
+            };
+
+            // Map modern state to legacy state using flattening table
+            let flattening = BlockFlatteningTable::new();
+            let legacy_state = match flattening.modern_to_legacy(modern_state) {
+                Some(state) => state,
+                None => {
+                    tracing::warn!(modern_state, "v1_16_5_to_v1_12_2: No mapping for modern block state, dropping BlockChange");
+                    return ConversionResult::Drop;
+                },
+            };
+
+            let packed_legacy = encode_legacy_position(pos);
+
+            let mut out = BytesMut::new();
+            out.put_u64(packed_legacy as u64);
+            VarInt(legacy_state as i32).encode(&mut out).unwrap();
+
+            rebuild_with_id(V12_S2C_BLOCK_CHANGE, &out.freeze())
         },
         V16_S2C_MULTI_BLOCK_CHANGE => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping MultiBlockChange (1.16 reshaped this packet *and* \
-                 needs inverse flattening); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert MultiBlockChange from modern to legacy format
+            // 1.16.5: i32 chunk_x | i32 chunk_z | VarInt count | (VarInt long_offset, VarInt state)[] records
+            // 1.12.2: i32 chunk_x | i32 chunk_z | VarInt count | (i16 x, i16 y, i16 z, VarInt block_id, VarInt block_data)[] records
+            let mut body_mut = BytesMut::from(body.as_ref());
+            if body_mut.remaining() < 8 {
+                return ConversionResult::Passthrough;
+            }
+            let chunk_x = body_mut.get_i32();
+            let chunk_z = body_mut.get_i32();
+            let count = VarInt::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode count: {}", e))
+                .unwrap()
+                .0 as usize;
+
+            let flattening = BlockFlatteningTable::new();
+            let mut out = BytesMut::new();
+            out.put_i32(chunk_x);
+            out.put_i32(chunk_z);
+            VarInt(count as i32).encode(&mut out).unwrap();
+
+            for _ in 0..count {
+                let long_offset = VarInt::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode offset: {}", e))
+                    .unwrap()
+                    .0 as u64;
+                let state = VarInt::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode state: {}", e))
+                    .unwrap()
+                    .0 as u32;
+
+                // Convert long offset to x, y, z coordinates
+                // 1.16.5 packs as: ((y & 0xF) << 8) | (z << 4) | x within a section
+                let x = (long_offset & 0xF) as i16;
+                let z = ((long_offset >> 4) & 0xF) as i16;
+                let y = ((long_offset >> 8) & 0xF) as i16;
+
+                // Map modern state to legacy state using flattening table
+                let legacy_state = match flattening.modern_to_legacy(state) {
+                    Some(s) => s,
+                    None => {
+                        tracing::warn!(state, "v1_16_5_to_v1_12_2: No mapping for modern block state in MultiBlockChange, skipping record");
+                        continue;
+                    },
+                };
+
+                let block_id = (legacy_state >> 4) as i32;
+                let block_data = (legacy_state & 0xF) as i32;
+
+                out.put_i16(x);
+                out.put_i16(y);
+                out.put_i16(z);
+                VarInt(block_id).encode(&mut out).unwrap();
+                VarInt(block_data).encode(&mut out).unwrap();
+            }
+
+            rebuild_with_id(V12_S2C_MULTI_BLOCK_CHANGE, &out.freeze())
         },
         V16_S2C_CHUNK_DATA => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping ChunkData (palette/bit-storage and per-section \
-                 biome layout need rewrite); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Use chunk repacker to convert from Flattened (1.16.5) to Legacy (1.12.2)
+            if let Some(repacker) = repacker {
+                match repacker.repack(&body, kojacoord_protocol::ProtocolVersion::V1_16_5, kojacoord_protocol::ProtocolVersion::V1_12_2) {
+                    Ok(converted_body) => {
+                        tracing::debug!("v1_16_5_to_v1_12_2: Successfully repacked chunk data");
+                        rebuild_with_id(V12_S2C_CHUNK_DATA, &bytes::Bytes::copy_from_slice(&converted_body))
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "v1_16_5_to_v1_12_2: Chunk repacking failed, dropping packet");
+                        ConversionResult::Drop
+                    },
+                }
+            } else {
+                tracing::warn!(
+                    "v1_16_5_to_v1_12_2: No chunk repacker available, dropping ChunkData"
+                );
+                ConversionResult::Drop
+            }
         },
         V16_S2C_SET_SLOT => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping SetSlot (needs inverse item-id flattening); \
-                 not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert SetSlot from modern to legacy format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            match items::convert_set_slot_modern_to_legacy(&mut body_mut) {
+                Ok(()) => rebuild_with_id(V12_S2C_SET_SLOT, &body_mut.freeze()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "v1_16_5_to_v1_12_2: SetSlot conversion failed, dropping packet");
+                    ConversionResult::Drop
+                },
+            }
         },
         V16_S2C_WINDOW_ITEMS => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping WindowItems (needs inverse item-id flattening); \
-                 not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert WindowItems from modern to legacy format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            let window_id = body_mut.get_u8();
+            let count = VarInt::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode count: {}", e))
+                .unwrap()
+                .0 as usize;
+
+            let mut legacy_slots = Vec::new();
+            for _ in 0..count {
+                let modern_slot = Slot::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode slot: {}", e))
+                    .unwrap();
+                legacy_slots.push(items::modern_slot_to_legacy(&modern_slot));
+            }
+
+            // Rebuild in legacy format
+            let mut out = BytesMut::new();
+            out.put_u8(window_id);
+            for slot in legacy_slots {
+                match slot.0 {
+                    None => out.put_u8(0),
+                    Some(data) => {
+                        out.put_u8(1);
+                        out.put_i16(data.item_id);
+                        out.put_u8(data.count as u8);
+                        out.put_i16(data.damage);
+                        match &data.nbt {
+                            None => VarInt(0).encode(&mut out).unwrap(),
+                            Some(nbt) => {
+                                nbt.encode(&mut out).unwrap();
+                            },
+                        }
+                    },
+                }
+            }
+
+            rebuild_with_id(V12_S2C_WINDOW_ITEMS, &out.freeze())
         },
         V16_S2C_ENTITY_EQUIPMENT => {
-            tracing::warn!(
-                "v1_16_5_to_v1_12_2: dropping EntityEquipment (multi-slot reshape + item \
-                 flattening); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert EntityEquipment from modern to legacy format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            let entity_id = body_mut.get_i32();
+            let slot = body_mut.get_u8();
+
+            // Read modern slot
+            let modern_slot = Slot::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode slot: {}", e))
+                .unwrap();
+
+            // Map modern slot to legacy slot
+            let legacy_slot_idx = match items::map_equipment_slot(slot) {
+                Some(idx) => idx,
+                None => {
+                    // Off-hand (slot 1) doesn't exist in legacy, drop this packet
+                    tracing::trace!(slot, "v1_16_5_to_v1_12_2: Off-hand equipment not supported in legacy, dropping packet");
+                    return ConversionResult::Drop;
+                },
+            };
+
+            let legacy_slot = items::modern_slot_to_legacy(&modern_slot);
+
+            // Rebuild in legacy format
+            let mut out = BytesMut::new();
+            out.put_i32(entity_id);
+            out.put_i16(legacy_slot_idx);
+            match legacy_slot.0 {
+                None => out.put_u8(0),
+                Some(data) => {
+                    out.put_u8(1);
+                    out.put_i16(data.item_id);
+                    out.put_u8(data.count as u8);
+                    out.put_i16(data.damage);
+                    match &data.nbt {
+                        None => VarInt(0).encode(&mut out).unwrap(),
+                        Some(nbt) => {
+                            nbt.encode(&mut out).unwrap();
+                        },
+                    }
+                },
+            }
+
+            rebuild_with_id(V12_S2C_ENTITY_EQUIPMENT, &out.freeze())
         },
         _ => ConversionResult::Passthrough,
     }
-}
-
-fn rebuild_with_id(new_id: u8, body: &Bytes) -> ConversionResult {
-    ConversionResult::Converted(vec![build_payload(new_id, body)])
 }
 
 fn s2c_chat(mut body: Bytes) -> ConversionResult {
@@ -211,7 +381,7 @@ fn s2c_spawn_position(mut body: Bytes) -> ConversionResult {
     };
     let packed = encode_legacy_position(pos);
     let mut out = BytesMut::with_capacity(8);
-    out.put_u64(packed);
+    out.put_u64(packed as u64);
     ConversionResult::Converted(vec![build_payload(V12_S2C_SPAWN_POSITION, &out)])
 }
 
@@ -368,7 +538,7 @@ fn c2s_player_digging(mut body: Bytes) -> ConversionResult {
 
     let mut out = BytesMut::new();
     VarInt(status).encode(&mut out).unwrap();
-    out.put_u64(encode_legacy_position(pos));
+    out.put_u64(encode_legacy_position(pos) as u64);
     out.put_i8(face);
     ConversionResult::Converted(vec![build_payload(V12_C2S_PLAYER_DIGGING, &out)])
 }
@@ -397,7 +567,7 @@ fn c2s_player_block_placement(mut body: Bytes) -> ConversionResult {
     let _inside = body.get_u8();
 
     let mut out = BytesMut::new();
-    out.put_u64(encode_legacy_position(pos));
+    out.put_u64(encode_legacy_position(pos) as u64);
     VarInt(face).encode(&mut out).unwrap();
     VarInt(hand).encode(&mut out).unwrap();
     out.put_f32(cx);
@@ -518,7 +688,10 @@ mod tests {
         let id = VarInt::decode(&mut out).unwrap().0 as u8;
         assert_eq!(id, V12_S2C_SPAWN_POSITION);
         let packed = out.get_u64();
-        assert_eq!(packed, encode_legacy_position(pos));
+        // `encode_legacy_position` returns an i64 (the on-wire signed
+        // representation); compare bit-patterns so we don't reject a
+        // perfectly-fine round-trip because of sign-mismatched types.
+        assert_eq!(packed, encode_legacy_position(pos) as u64);
     }
 
     #[test]

@@ -27,6 +27,8 @@ log = "0.4"
 bytes = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
+wasmtime = { version = "15", features = ["component-model"] }
+wasmtime-wasi = "15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

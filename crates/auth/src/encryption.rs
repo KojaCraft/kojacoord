@@ -1,3 +1,12 @@
+//! Session-key crypto for the Notchian login handshake.
+//!
+//! The proxy generates a 2048-bit RSA keypair at startup, advertises
+//! the public key in `EncryptionRequest`, and decrypts the
+//! `EncryptionResponse` (shared-secret + verify-token) the client
+//! returns. Everything after that point on the wire is AES-128 in
+//! CFB8 mode with the shared secret as both key and IV — that's the
+//! `Cfb8State` machinery in `net::connection`.
+
 use aes::Aes128;
 use cfb_mode::{BufDecryptor, BufEncryptor};
 use cipher::KeyIvInit;

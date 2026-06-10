@@ -27,16 +27,24 @@ flate2 = "1"
 lazy_static = "1"
 dashmap = { workspace = true }
 aes = { workspace = true }
+aes-gcm = "0.10"
 cfb-mode = { workspace = true }
 cfb8 = "0.8"
-cipher = "0.3"
+cipher = "0.4"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+aead = "0.5"
 sqlx = { version = "0.8", features = ["mysql", "sqlite", "runtime-tokio-rustls", "chrono", "uuid"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
+tonic = { version = "0.11", features = ["tls"] }
+prost = "0.12"
+tokio-stream = "0.1"
 crossbeam-queue = "0.3.12"
 notify = "6.1.1"
 arc-swap = "1.7.1"
 
 [build-dependencies]
 anyhow = "1"
+tonic-build = "0.11"

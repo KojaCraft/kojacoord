@@ -1,3 +1,11 @@
+//! HTTP management API.
+//!
+//! Operator-facing JSON API: list players, query backends, push
+//! bans, view metrics. Bound to `[http_api] bind` (default
+//! `127.0.0.1:8080`) and gated on a bearer token from
+//! `[http_api] auth_token`. Use a reverse proxy for TLS — this
+//! listener speaks plain HTTP by design.
+
 use std::sync::Arc;
 
 use axum::{

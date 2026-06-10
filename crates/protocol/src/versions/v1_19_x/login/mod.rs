@@ -60,12 +60,9 @@ impl Decode for ClientboundLoginDisconnect {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientboundEncryptionRequest {
     pub server_id: String,
-
     pub public_key: Vec<u8>,
-
     pub verify_token: Vec<u8>,
-
-    pub should_authenticate: bool,
+    // `should_authenticate` was introduced in 1.20.5 — absent here.
 }
 
 impl PacketId for ClientboundEncryptionRequest {
@@ -78,8 +75,7 @@ impl Encode for ClientboundEncryptionRequest {
     fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
         self.server_id.encode(dst)?;
         encode_byte_array(&self.public_key, dst)?;
-        encode_byte_array(&self.verify_token, dst)?;
-        self.should_authenticate.encode(dst)
+        encode_byte_array(&self.verify_token, dst)
     }
 }
 
@@ -88,12 +84,10 @@ impl Decode for ClientboundEncryptionRequest {
         let server_id = String::decode(src)?;
         let public_key = decode_byte_array(src)?;
         let verify_token = decode_byte_array(src)?;
-        let should_authenticate = bool::decode(src)?;
         Ok(Self {
             server_id,
             public_key,
             verify_token,
-            should_authenticate,
         })
     }
 }
@@ -331,12 +325,11 @@ mod tests {
     }
 
     #[test]
-    fn encryption_request_with_authenticate() {
+    fn encryption_request_roundtrip() {
         let p = ClientboundEncryptionRequest {
             server_id: String::new(),
             public_key: vec![1, 2, 3],
             verify_token: vec![4, 5, 6, 7],
-            should_authenticate: true,
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();

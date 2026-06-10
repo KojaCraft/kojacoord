@@ -1,3 +1,9 @@
+//! Length-prefixed framing handler for the netty pipeline.
+//!
+//! Same VarInt-prefixed framing the proxy uses on the wire, but
+//! exposed via the `ChannelHandler` trait so it can sit in a netty
+//! pipeline alongside cipher / compression handlers.
+
 use bytes::{Buf, Bytes, BytesMut};
 use kojacoord_protocol::{
     codec::{Decode as _, Encode as _},

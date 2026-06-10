@@ -1,3 +1,14 @@
+//! Config schema for the proxy.
+//!
+//! Mirrors the on-disk `config.toml` 1:1. Every struct here is
+//! `serde::Deserialize` so the loader can deserialize directly from
+//! TOML and most use `#[serde(default)]` so operators only have to
+//! write the fields they care about — defaults live in the per-section
+//! `Default` impls below.
+//!
+//! Hot-reloadable fields are flagged in the field comments; anything
+//! not marked needs a process restart to take effect.
+
 #![deny(clippy::all)]
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +26,9 @@ pub struct ProxyConfig {
     pub servers: Vec<ServerEntry>,
 
     #[serde(default)]
+    pub routing: RoutingConfig,
+
+    #[serde(default)]
     pub database: DatabaseConfig,
 
     #[serde(default)]
@@ -29,6 +43,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub plugins: PluginConfig,
 
+    /// Plugin permission grants: map of plugin name to list of allowed permissions
+    #[serde(default)]
+    pub plugin_permissions: std::collections::HashMap<String, Vec<String>>,
+
+    /// Failover groups for active-passive backend redundancy
+    #[serde(default)]
+    pub failover_groups: Vec<FailoverGroup>,
+
     #[serde(default)]
     pub metrics: MetricsConfig,
 
@@ -37,6 +59,37 @@ pub struct ProxyConfig {
 
     #[serde(default)]
     pub metrics_backend: MetricsBackendConfig,
+
+    #[serde(default)]
+    pub grpc_control_plane: GrpcControlPlaneConfig,
+}
+
+/// One `[[failover_groups]]` block. The runtime mirror lives in
+/// `proxy_core::failover::FailoverGroupState` — keep the two in sync
+/// when adding fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverGroup {
+    /// Group identifier; referenced by routing rules via
+    /// `target = "group:<name>"`.
+    pub name: String,
+    /// Server that receives traffic while healthy.
+    pub primary: String,
+    /// Ordered fallbacks. The monitor walks the list top-to-bottom
+    /// when the active server fails; the first healthy entry wins.
+    pub standbys: Vec<String>,
+    /// If true, traffic moves back to `primary` automatically once it
+    /// passes a probe. If false, the failover sticks until an operator
+    /// resets it manually.
+    #[serde(default = "default_failback")]
+    pub auto_failback: bool,
+}
+
+fn default_failback() -> bool {
+    true // Auto-failback enabled by default
+}
+
+fn default_resource_pack_required() -> bool {
+    false // Optional by default
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +117,40 @@ pub struct ProxySection {
     #[serde(default = "default_proxy_protocol")]
     pub proxy_protocol: bool,
 
+    /// When enabled, PROXY protocol headers are optional - if no header is detected,
+    /// the connection proceeds with the direct address. This allows the proxy to work
+    /// both behind a load balancer and with direct connections.
+    #[serde(default)]
+    pub proxy_protocol_optional: bool,
+
     #[serde(default = "default_session_timeout")]
     pub session_timeout_secs: u64,
+
+    /// Resource pack URL to force on all clients
+    #[serde(default)]
+    pub resource_pack_url: Option<String>,
+
+    /// Resource pack hash for verification (SHA-1)
+    #[serde(default)]
+    pub resource_pack_hash: Option<String>,
+
+    /// Whether to require the resource pack (force download)
+    #[serde(default = "default_resource_pack_required")]
+    pub resource_pack_required: bool,
+
+    /// Resource pack prompt message shown to clients
+    #[serde(default)]
+    pub resource_pack_prompt: Option<String>,
+
+    /// Enable cookies & transfers passthrough (1.20.5+)
+    /// Preserves server-driven reconnects by relaying cookie and transfer packets
+    #[serde(default)]
+    pub cookies_transfers_passthrough: bool,
+
+    /// Enable chat signing translation (1.19+)
+    /// Signs/strips chat messages when bridging between versions
+    #[serde(default)]
+    pub chat_signing_translation: bool,
 
     /// New connections allowed per source IP within a short window before a
     /// temporary ban. `0` disables connection throttling. Defaults to a value
@@ -89,6 +174,9 @@ pub struct ProxySection {
 
     #[serde(default = "default_auth_url")]
     pub auth_url: String,
+
+    #[serde(default = "default_public_key")]
+    pub mojang_public_key: String,
 }
 
 impl Default for ProxySection {
@@ -101,7 +189,14 @@ impl Default for ProxySection {
             max_players: default_max_players(),
             prevent_proxy_connections: false,
             proxy_protocol: default_proxy_protocol(),
+            proxy_protocol_optional: false,
             session_timeout_secs: default_session_timeout(),
+            resource_pack_url: None,
+            resource_pack_hash: None,
+            resource_pack_required: false,
+            resource_pack_prompt: None,
+            cookies_transfers_passthrough: false,
+            chat_signing_translation: false,
             max_connections_per_ip: default_max_conns_per_ip(),
             lobby_server_name: default_lobby_name(),
             lobby_server_protocol: 47,
@@ -110,6 +205,7 @@ impl Default for ProxySection {
             server_id: String::new(),
             eula_accepted: false,
             auth_url: default_auth_url(),
+            mojang_public_key: default_public_key()
         }
     }
 }
@@ -215,11 +311,64 @@ pub struct ServerEntry {
     #[serde(default)]
     pub game_type: Option<String>,
 
+    /// Per-server compression threshold. Overrides the global proxy setting.
+    /// -1 to disable compression for this server, 0 to use global default.
+    #[serde(default = "default_server_compression")]
+    pub compression_threshold: i32,
+
+    /// Cipher suite pinning for this server's TLS connection (if using TLS).
+    /// Empty string uses default cipher suites.
+    #[serde(default)]
+    pub cipher_suites: String,
+
+    /// Health probe interval in seconds. 0 disables health probes for this server.
+    #[serde(default)]
+    pub health_probe_interval_secs: u64,
+
+    /// Health probe timeout in seconds.
+    #[serde(default = "default_health_probe_timeout")]
+    pub health_probe_timeout_secs: u64,
+
+    /// Number of consecutive probe failures before marking server as unhealthy.
+    #[serde(default = "default_health_probe_threshold")]
+    pub health_probe_fail_threshold: u32,
+
+    /// Region for this server (e.g., "us-east", "eu-west", "asia")
+    #[serde(default)]
+    pub region: String,
+
     #[serde(default)]
     pub backend_protocol: u32,
 
     #[serde(default)]
     pub backend_type: BackendType,
+}
+
+/// Top-level routing config (see `[routing]` / `[[routing.rules]]` in the
+/// configuration file). Evaluated by `proxy_core::routing::RoutingRules`
+/// after the player's name and IP are known. See ROADMAP.md item
+/// "Per-player and per-region routing rules".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub rules: Vec<RouteRuleConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RouteRuleConfig {
+    /// Human-readable label, shows up in logs.
+    #[serde(default)]
+    pub label: String,
+    /// Case-insensitive glob (`*` wildcards) for the player username. Omit
+    /// for "any name".
+    #[serde(default)]
+    pub name_glob: Option<String>,
+    /// IPv4/IPv6 CIDR strings (`"10.0.0.0/8"`, `"2001:db8::/32"`). Empty list
+    /// = "any IP".
+    #[serde(default)]
+    pub client_cidrs: Vec<String>,
+    /// Target server name (must match a `[[servers]].name`).
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -259,6 +408,19 @@ pub struct PluginConfig {
 
     #[serde(default)]
     pub configs: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+
+    /// Watch `plugin_dir` for changes and hot-reload plugins whose DLL/SO/
+    /// DYLIB mtime advances. Implemented via polling (no `notify` dep).
+    #[serde(default)]
+    pub hot_reload: bool,
+
+    /// Poll interval in seconds for the hot-reload watcher. Defaults to 5.
+    #[serde(default = "default_hot_reload_interval")]
+    pub hot_reload_interval_secs: u64,
+}
+
+fn default_hot_reload_interval() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -340,6 +502,10 @@ fn default_http_token() -> String {
     String::new()
 }
 
+fn default_public_key() -> String {
+    "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAylB4B6m5lz7jwrcFz6Fd/fnfUhcvlxsTSn5kIK/2aGG1C3kMy4VjhwlxF6BFUSnfxhNswPjh3ZitkBxEAFY25uzkJFRwHwVA9mdwjashXILtR6OqdLXXFVyUPIURLOSWqGNBtb08EN5fMnG8iFLgEJIBMxs9BvF3s3/FhuHyPKiVTZmXY0WY4ZyYqvoKR+XjaTRPPvBsDa4WI2u1zxXMeHlodT3lnCzVvyOYBLXL6CJgByuOxccJ8hnXfF9yY4F0aeL080Jz/3+EBNG8RO4ByhtBf4Ny8NQ6stWsjfeUIvH7bU/4zCYcYOq4WrInXHqS8qruDmIl7P5XXGcabuzQstPf/h2CRAUpP/PlHXcMlvewjmGU6MfDK+lifScNYwjPxRo4nKTGFZf/0aqHCh/EAsQyLKrOIYRE0lDG3bzBh8ogIMLAugsAfBb6M3mqCqKaTMAf/VAjh5FFJnjS+7bE+bZEV0qwax1CEoPPJL1fIQjOS8zj086gjpGRCtSy9+bTPTfTR/SJ+VUB5G2IeCItnkNHpJX2ygojFZ9n5Fnj7R9ZnOM+L8nyIjPu3aePvtcrXlyLhH/hvOfIOjPxOlqW+O5QwSFP4OEcyLAUgDdUgyW36Z5mB285uKW/ighzZsOTevVUG2QwDItObIV6i8RCxFbN2oDHyPaO5j1tTaBNyVt8CAwEAAQ==".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerManagementConfig {
     #[serde(default = "default_management_enabled")]
@@ -359,6 +525,61 @@ pub struct MetricsBackendConfig {
 
     #[serde(default)]
     pub token: String,
+}
+
+/// gRPC control plane configuration for external orchestration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcControlPlaneConfig {
+    #[serde(default = "default_grpc_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_grpc_bind_address")]
+    pub bind_address: String,
+
+    #[serde(default = "default_grpc_port")]
+    pub port: u16,
+
+    #[serde(default)]
+    pub tls_enabled: bool,
+
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+
+    #[serde(default)]
+    pub auth_enabled: bool,
+
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for GrpcControlPlaneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: default_grpc_bind_address(),
+            port: default_grpc_port(),
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            auth_enabled: false,
+            auth_token: None,
+        }
+    }
+}
+
+fn default_grpc_enabled() -> bool {
+    false
+}
+
+fn default_grpc_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_grpc_port() -> u16 {
+    50051
 }
 
 // ── Default value functions ────────────────────────────────────────────────────
@@ -417,6 +638,18 @@ fn default_auth_url() -> String {
 }
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".into()
+}
+
+fn default_server_compression() -> i32 {
+    0 // 0 means use global default
+}
+
+fn default_health_probe_timeout() -> u64 {
+    5 // 5 seconds
+}
+
+fn default_health_probe_threshold() -> u32 {
+    3 // 3 consecutive failures
 }
 
 // ── Secret utilities ───────────────────────────────────────────────────────────

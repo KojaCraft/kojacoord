@@ -1,3 +1,10 @@
+//! Peer registry — the shared view of "who else is in the cluster".
+//!
+//! Backed by a `DashMap<Uuid, ClusterNode>` so updates from the
+//! heartbeat task and reads from the load balancer don't contend on
+//! a single lock. Entries that haven't checked in inside the
+//! configured liveness window get evicted by the coordinator.
+
 use crate::node::ClusterNode;
 use dashmap::DashMap;
 use std::sync::Arc;

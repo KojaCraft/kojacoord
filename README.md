@@ -11,107 +11,125 @@
 
 </div>
 
-A high-performance, modular Minecraft proxy server written in Rust, designed for multi-version protocol support, authentication management, and advanced network features. Built by [KojaCraft](https://www.kojacraft.net) to power our modded Minecraft network.
+Hey there! Kojacoord Proxy is a high-performance Minecraft proxy server we built in Rust. It handles multi-version protocol support, authentication, and all sorts of advanced networking stuff. We created it at [KojaCraft](https://www.kojacraft.net) to power our modded Minecraft network, and we're excited to share it with you.
 
-## Overview
+## What is this?
 
-Kojacoord Proxy sits between Minecraft clients and backend servers, providing protocol translation, authentication, anti-cheat mechanisms, and extensive configuration options. Built with Rust's async runtime (Tokio), it offers high concurrency and low latency for large-scale Minecraft networks.
+Think of Kojacoord Proxy as the middleman between Minecraft clients and your backend servers. It handles protocol translation, authentication, and gives you tons of configuration options. Since it's built with Rust's async runtime (Tokio), it can handle tons of connections with minimal lag—perfect for large servers.
 
-## Features
+## What can it do?
 
-- **Multi-Version Protocol Support**: Handles multiple Minecraft protocol versions with automatic negotiation and conversion
-- **Authentication Pipeline**: Supports both online (Mojang) and offline authentication modes
-- **Anti-Cheat Engine**: Built-in detection system for malicious client behavior
-- **Protocol Conversion**: Seamless translation between different Minecraft versions
-- **Forge Mod Support**: Comprehensive FML handshake handling for modded clients
-- **Dashboard API**: RESTful API for remote management and monitoring
-- **Server Management**: TCP-based server control interface
-- **Database Integration**: MySQL support for persistent data storage
-- **Connection Pooling**: Optimized backend connection management
-- **Metrics Collection**: Real-time performance monitoring and logging
+- **Multi-Version Support**: Handles Minecraft 1.6.x through 1.21.x with automatic protocol conversion—no more version mismatches
+- **Authentication**: Works with both online (Mojang) and offline mode, plus profile property signature verification to keep things secure
+- **Player Forwarding**: Supports Velocity (HMAC-signed), BungeeCord (legacy), and no forwarding modes—whatever your backend needs
+- **Plugin System**: Load custom plugins via `.kpl` packages or WASM modules, with hot-reload support so you don't have to restart
+- **Modloader Detection**: Automatically detects Forge and other modded clients
+- **Limbo System**: Hold players in a waiting state while transferring between servers—no more random kicks
+- **PROXY Protocol**: Optional PROXY protocol support for getting real client IPs behind load balancers
+- **Database**: SQLite by default, with MySQL support for persistent data
+- **Telemetry**: Anonymous, opt-in usage metrics to help us understand adoption (you can turn this off)
+- **Rate Limiting**: Built-in rate limiting for plugin channel messages to prevent spam
 
-## Architecture
+## How it's organized
 
-The project is organized as a Cargo workspace with the following crates:
+The project is split into several crates (Rust's word for packages):
 
 - `kojacoord-protocol`: Protocol definitions, packet codecs, and version registries
 - `kojacoord-netty`: Network layer with encryption and frame handling
 - `kojacoord-auth`: Authentication pipeline and encryption utilities
 - `kojacoord-proxy-core`: Core proxy logic and session management
-- `kojacoord-anticheat`: Anti-cheat detection and violation tracking
 - `kojacoord-config`: Configuration management and validation
 - `kojacoord-api`: Public API for plugin development
-- `kojacoord-dashboard-api`: Dashboard REST API endpoints
-- `kojacoord-plugin-system`: Dynamic plugin loading system for custom functionality
+- `kojacoord-plugin-system`: Dynamic plugin loading with WASM runtime support
 - `kojacoord-cluster`: Cluster coordination for horizontal scaling
-- `kojacoord-metrics`: Prometheus metrics export and analytics engine
+- `kojacoord-metrics`: Analytics and telemetry collection
 
-## Building
+## Key features
 
-### Prerequisites
+- **Region Selector**: Routes players to the closest server based on their IP region (US-East, EU-West, Asia) to reduce latency. Uses a simple IPv4 heuristic with smart fallback ordering—picks the least-loaded server in the preferred region, then tries other regions if needed
+- **Routing**: Flexible rule-based player routing—match by username patterns (case-insensitive glob with `*` wildcards) or IP ranges (IPv4/IPv6 CIDR). Rules are evaluated in order, first match wins. Falls back to default server, then any online server
+- **Encryption**: Pluggable cipher registry for inter-node communication (cluster gossip, control-plane payloads)—separate from Minecraft login encryption. Supports AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305, and experimental post-quantum KEM. You can even register custom algorithms at runtime
+- **Limbo**: Holds players in a synthetic world when backends are unavailable instead of kicking them. Synthesizes JoinGame, position, abilities, and keepalive packets per version. Polls every 3 seconds for a backend to come back online. Uses a distinct world name to avoid chunk cache collisions when transferring back to real servers
 
-- Rust 1.70 or later
-- Cargo (included with Rust)
-- MySQL (optional, for database features)
+## Building it
 
-### Compilation
+### What you need
+
+- Rust 1.75 or later
+- Cargo (comes with Rust)
+- MySQL (optional, only if you want database features)
+
+### Compiling
 
 ```bash
-# Clone the repository
-git clone https://github.com/aleroycz/kojacoord-proxy.git
-cd kojacoord-proxy
+# Clone the repo
+git clone https://github.com/aleroycz/kojacoord.git
+cd kojacoord-proxy-experimentals
 
-# Build in release mode for optimal performance
+# Build in release mode for best performance
 cargo build --release
 
-# The binary will be located at target/release/kojacoord-proxy
+# The binary will be at target/release/kojacoord-proxy
 ```
 
-### Development Build
+### For development
 
 ```bash
 cargo build
 cargo test
 ```
 
-## Configuration
+## Setting it up
 
-Create a `config.toml` file in the proxy's working directory. A sample configuration is provided below:
+Create a `config.toml` file in the proxy's working directory. Here's a sample to get you started:
 
 ```toml
 [proxy]
-bind = "0.0.0.0:25577"
+bind = "0.0.0.0:25565"
 online_mode = true
 compression_threshold = 256
-session_timeout_secs = 30
-prevent_proxy_connections = true
+max_players = 1000
+prevent_proxy_connections = false
+session_timeout_secs = 5
+
+[listeners]
+motd = "KojacoordNetwork"
+tab_list = "GLOBAL_PING"
+
+[forwarding]
+mode = "none"  # Options: none, velocity, bungeecord
+velocity_secret = ""
+
+[telemetry]
+enabled = true
+endpoint = "https://metric.kojacoord.net"
+interval_secs = 1800
+
+[database]
+url = ""  # Empty for SQLite, or mysql://user:pass@host/kojacoord
+max_connections = 10
 
 [[servers]]
 name = "lobby"
-address = "localhost:25565"
+address = "127.0.0.1:25566"
 restricted = false
-backend_type = "vanilla"
+display_name = "Lobby"
+motd = "The KojaCraft hub — pick a game to play!"
+game_type = "lobby"
 
-[database]
-url = "mysql://user:password@localhost/kojacoord"
-max_connections = 10
-
-[anticheat]
-enabled = true
-strict_mode = false
-
-[server_management]
-enabled = true
-bind = "127.0.0.1:8080"
-auth_token = "your-secret-token"
-
-[http_api]
-enabled = true
-bind = "127.0.0.1:8081"
-auth_token = "your-api-token"
+[[servers]]
+name = "survival"
+address = "127.0.0.1:25567"
+backend_type = "spigot"
+display_name = "Survival"
+motd = "Hardcore survival with custom mechanics"
+game_type = "survival"
+modpack = "kojacraft"
+modpack_version = "1.0.0"
+max_players = 100
 ```
 
-## Running
+## Running it
 
 ```bash
 # Run the compiled binary
@@ -121,26 +139,30 @@ auth_token = "your-api-token"
 cargo run --release
 ```
 
-## Protocol Support
+That's it—you should see the proxy start up and begin accepting connections!
 
-Currently supported Minecraft versions:
+## Supported versions
 
-- 1.7.10 - 1.8 (Protocol 5-47)
-- 1.12.2 (Protocol 340)
-- 1.16.5 (Protocol 754)
+We support a wide range of Minecraft versions:
+
+- 1.6.x - 1.8.x (Protocol 5-47)
+- 1.12.x (Protocol 335-340)
+- 1.16.x (Protocol 751-754)
+- 1.19.x (Protocol 759-760)
+- 1.20.x (Protocol 763-764)
 - 1.21.x (Latest)
 
-Protocol conversion is automatically performed when clients connect to backend servers running different versions.
+Protocol conversion happens automatically when clients connect to backend servers running different versions—no manual configuration needed.
 
-## API Documentation
+## API docs
 
 ### HTTP API
 
-The proxy exposes a RESTful API for management operations when `http_api.enabled` is set to `true`.
+The proxy exposes a RESTful API for management operations when configured.
 
 #### Authentication
 
-All API requests require an `Authorization` header with the configured auth token:
+All API requests require an `Authorization` header with your configured token:
 
 ```
 Authorization: Bearer your-api-token
@@ -153,30 +175,27 @@ Authorization: Bearer your-api-token
 - `POST /api/players/{uuid}/kick` - Kick a player
 - `GET /api/servers` - List backend servers
 - `GET /api/metrics` - Get performance metrics
-- `GET /api/health` - Health check endpoint
-
-### Server Management API
-
-A TCP-based management interface is available on the configured `server_management.bind` address for advanced operations.
+- `GET /api/health` - Health check
 
 ## Performance
 
-- **Concurrent Connections**: Supports thousands of simultaneous connections
-- **Low Latency**: Sub-millisecond proxy overhead
+- **Concurrent Connections**: Handles thousands of simultaneous connections without breaking a sweat
+- **Low Latency**: Sub-millisecond proxy overhead—your players won't even notice it's there
 - **Memory Efficient**: Optimized buffer pooling and zero-copy where possible
-- **Async I/O**: Non-blocking operations using Tokio
+- **Async I/O**: Non-blocking operations using Tokio for maximum throughput
 
 ## Security
 
 - RSA encryption for authentication handshakes
+- Profile property signature verification (Mojang public key)
 - Configurable proxy connection prevention
-- Anti-cheat system with violation tracking
+- PROXY protocol support for real client IPs
 - Secure API authentication
 - TLS support for database connections
 
 ## Contributing
 
-We welcome contributions to Kojacoord Proxy. Please follow these guidelines:
+We'd love your help! Here's how to contribute:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
@@ -184,11 +203,11 @@ We welcome contributions to Kojacoord Proxy. Please follow these guidelines:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-### Code Style
+### Code style
 
-- Follow Rust standard formatting (`cargo fmt`)
+- Run `cargo fmt` to format your code
 - Use `cargo clippy` for linting
-- Write unit tests for new functionality
+- Write tests for new functionality
 - Document public APIs with rustdoc comments
 
 ## Testing
@@ -200,20 +219,22 @@ cargo test
 # Run tests with output
 cargo test -- --nocapture
 
-# Run specific test
+# Run a specific test
 cargo test test_name
 ```
 
-## Bug Reporting
+## Found a bug?
 
-If you encounter a bug, please open an issue on GitHub with the following information:
+If you run into an issue, please open a GitHub issue with:
 
 - Proxy version
 - Minecraft client version
 - Backend server version
-- Configuration (redacted sensitive information)
+- Configuration (redact sensitive info!)
 - Error logs
 - Steps to reproduce
+
+The more details you give us, the faster we can fix it.
 
 ## License
 
@@ -221,31 +242,29 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 Copyright (c) 2026 Alex Guy Yann Le Roy
 
-## Acknowledgments
+## Thanks
 
 - Built with [Tokio](https://tokio.rs/) for async runtime
-- Protocol implementation inspired by existing Minecraft proxy projects
-- Community feedback and contributions
+- Protocol implementation inspired by other Minecraft proxy projects
+- Our amazing community for feedback and contributions
 
-## Citation
+## Protocol Sources
 
-If you use Kojacoord Proxy in academic research or publications, please cite:
+We couldn't have built accurate protocol support without these amazing resources:
 
-```
-Kojacoord Proxy: A High-Performance Minecraft Proxy Server
-Alex Guy Yann Le Roy
-2026
-```
+- [Minecraft Wiki - Java Edition Protocol](https://minecraft.wiki/w/Java_Edition_protocol/Packets) - Comprehensive packet documentation and version history
+- [PrismarineJS minecraft-data](https://github.com/PrismarineJS/minecraft-data) - Detailed protocol data and mappings
 
-## Contact
+Huge thanks to the maintainers of these projects for providing such invaluable information about Minecraft's protocols.
 
-For questions, support, or discussions, please open an issue on GitHub or contact the maintainers.
+## Get in touch
 
-## Roadmap
+Have questions? Need support? Want to chat? Open an issue on GitHub or join our Discord.
+
+## What's next?
 
 - [ ] Additional protocol version support
-- [x] Enhanced anti-cheat heuristics
-- [x] Plugin system for custom functionality
-- [x] Web dashboard UI
+- [x] Plugin system with WASM runtime
+- [x] Hot-reload for plugins
 - [x] Cluster support for horizontal scaling
 - [x] Enhanced metrics and analytics

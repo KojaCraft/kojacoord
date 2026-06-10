@@ -1,7 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kojacoord_protocol::codec::Encode;
+use kojacoord_protocol::codec::{Decode, Encode};
 use kojacoord_protocol::types::VarInt;
 
+use super::helpers::rebuild_with_id;
+use super::items;
 use super::{build_payload, split_id};
 use crate::converter::ConversionResult;
 
@@ -23,19 +25,19 @@ const V164_S2C_DISCONNECT: u8 = 0xFF;
 
 const V165_S2C_KEEP_ALIVE: u8 = 0x1F;
 const V165_S2C_CHAT: u8 = 0x0E;
-const V165_S2C_PLAYER_POS_LOOK: u8 = 0x32;
-const V165_S2C_SPAWN_PLAYER: u8 = 0x05;
+const V165_S2C_PLAYER_POS_LOOK: u8 = 0x34;
+const V165_S2C_SPAWN_PLAYER: u8 = 0x04;
 const V165_S2C_ENTITY_TELEPORT: u8 = 0x56;
-const V165_S2C_ENTITY_REL_MOVE: u8 = 0x28;
+const V165_S2C_ENTITY_REL_MOVE: u8 = 0x27;
 const V165_S2C_ENTITY: u8 = 0x00;
 const V165_S2C_BLOCK_CHANGE: u8 = 0x0B;
-const V165_S2C_SET_SLOT: u8 = 0x16;
-const V165_S2C_WINDOW_ITEMS: u8 = 0x14;
-const V165_S2C_ENTITY_EQUIPMENT: u8 = 0x46;
-const V165_S2C_EXPERIENCE: u8 = 0x3D;
-const V165_S2C_HELD_ITEM_CHANGE: u8 = 0x48;
-const V165_S2C_PLAYER_ABILITIES: u8 = 0x2B;
-const V165_S2C_DISCONNECT: u8 = 0x1A;
+const V165_S2C_SET_SLOT: u8 = 0x15;
+const V165_S2C_WINDOW_ITEMS: u8 = 0x13;
+const V165_S2C_ENTITY_EQUIPMENT: u8 = 0x47;
+const V165_S2C_EXPERIENCE: u8 = 0x48;
+const V165_S2C_HELD_ITEM_CHANGE: u8 = 0x3F;
+const V165_S2C_PLAYER_ABILITIES: u8 = 0x2F;
+const V165_S2C_DISCONNECT: u8 = 0x19;
 
 pub fn convert_s2c(payload: Bytes) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
@@ -277,86 +279,132 @@ fn s2c_block_change(mut body: Bytes) -> ConversionResult {
     ConversionResult::Converted(vec![build_payload(V165_S2C_BLOCK_CHANGE, &out)])
 }
 
-fn s2c_set_slot(mut body: Bytes) -> ConversionResult {
-    if body.remaining() < 1 + 2 {
-        return ConversionResult::Passthrough;
+fn s2c_set_slot(body: Bytes) -> ConversionResult {
+    // Convert SetSlot from 1.6.4 (legacy slot) to 1.16.5 (modern slot)
+    let mut body_mut = BytesMut::from(body.as_ref());
+    match items::convert_set_slot_legacy_to_modern(&mut body_mut) {
+        Ok(()) => rebuild_with_id(V165_S2C_SET_SLOT, &body_mut.freeze()),
+        Err(e) => {
+            tracing::warn!(error = %e, "v1_6_4_to_v1_16_5: SetSlot conversion failed, dropping packet");
+            ConversionResult::Drop
+        },
     }
-
-    let window_id = body.get_i8();
-    let slot = body.get_i16();
-
-    if body.remaining() < 2 + 2 + 1 {
-        return ConversionResult::Passthrough;
-    }
-
-    let item_id = body.get_i16();
-    let _damage = body.get_i16();
-    let count = body.get_i8();
-
-    let mut out = BytesMut::new();
-    out.put_i8(window_id);
-    out.put_i16(slot);
-
-    if item_id == -1 {
-        out.put_u8(0);
-    } else {
-        VarInt(item_id as i32).encode(&mut out).unwrap();
-        out.put_i8(count);
-
-        out.put_u8(0x00);
-    }
-
-    ConversionResult::Converted(vec![build_payload(V165_S2C_SET_SLOT, &out)])
 }
 
-fn s2c_window_items(mut body: Bytes) -> ConversionResult {
-    if body.remaining() < 1 + 2 {
+fn s2c_window_items(body: Bytes) -> ConversionResult {
+    // Convert WindowItems from 1.6.4 (legacy slots) to 1.16.5 (modern slots)
+    let mut body_mut = BytesMut::from(body.as_ref());
+    if body_mut.remaining() < 1 + 2 {
         return ConversionResult::Passthrough;
     }
 
-    let window_id = body.get_i8();
-    let count = body.get_i16();
+    let window_id = body_mut.get_u8();
+    let count = body_mut.get_i16();
 
-    let mut out = BytesMut::new();
-    out.put_i8(window_id);
-    VarInt(0).encode(&mut out).unwrap();
-
+    let mut modern_slots = Vec::new();
     for _ in 0..count {
-        if body.remaining() < 2 + 2 + 1 {
-            return ConversionResult::Passthrough;
-        }
-
-        let item_id = body.get_i16();
-        let _damage = body.get_i16();
-        let slot_count = body.get_i8();
-
-        if item_id == -1 {
-            out.put_u8(0);
+        // Read legacy slot
+        let has_item = body_mut.get_u8() != 0;
+        let legacy_slot = if has_item {
+            let item_id = body_mut.get_i16();
+            let slot_count = body_mut.get_u8();
+            let damage = body_mut.get_i16();
+            let nbt_len = VarInt::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode nbt len: {}", e))
+                .unwrap()
+                .0;
+            let nbt = if nbt_len > 0 {
+                let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
+                Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+            } else {
+                None
+            };
+            items::LegacySlot(Some(items::LegacySlotData {
+                item_id,
+                count: slot_count as i8,
+                damage,
+                nbt,
+            }))
         } else {
-            VarInt(item_id as i32).encode(&mut out).unwrap();
-            out.put_i8(slot_count);
+            items::LegacySlot(None)
+        };
 
-            out.put_u8(0x00);
-        }
+        // Convert to modern slot
+        modern_slots.push(items::legacy_slot_to_modern(&legacy_slot));
     }
 
-    ConversionResult::Converted(vec![build_payload(V165_S2C_WINDOW_ITEMS, &out)])
+    // Rebuild in modern format
+    let mut out = BytesMut::new();
+    out.put_u8(window_id);
+    for slot in modern_slots {
+        slot.encode(&mut out)
+            .map_err(|e| format!("encode slot: {}", e))
+            .unwrap();
+    }
+
+    rebuild_with_id(V165_S2C_WINDOW_ITEMS, &out.freeze())
 }
 
-fn s2c_entity_equipment(mut body: Bytes) -> ConversionResult {
-    if body.remaining() < 6 {
+fn s2c_entity_equipment(body: Bytes) -> ConversionResult {
+    // Convert EntityEquipment from 1.6.4 (legacy slot) to 1.16.5 (modern slot)
+    let mut body_mut = BytesMut::from(body.as_ref());
+    if body_mut.remaining() < 6 {
         return ConversionResult::Passthrough;
     }
-    let entity_id = body.get_i32();
-    let slot = body.get_i16();
-    let item = body.get_i16();
+    let entity_id = body_mut.get_i32();
+    let slot = body_mut.get_i16();
 
-    let mut out = BytesMut::with_capacity(8);
+    // Read legacy slot
+    let has_item = body_mut.get_u8() != 0;
+    let legacy_slot = if has_item {
+        let item_id = body_mut.get_i16();
+        let count = body_mut.get_u8();
+        let damage = body_mut.get_i16();
+        let nbt_len = VarInt::decode(&mut body_mut.clone().freeze())
+            .map_err(|e| format!("decode nbt len: {}", e))
+            .unwrap()
+            .0;
+        let nbt = if nbt_len > 0 {
+            let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
+            Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+        } else {
+            None
+        };
+        items::LegacySlot(Some(items::LegacySlotData {
+            item_id,
+            count: count as i8,
+            damage,
+            nbt,
+        }))
+    } else {
+        items::LegacySlot(None)
+    };
+
+    // Map legacy equipment slot to modern slot index
+    let modern_slot_idx = match items::map_legacy_equipment_slot(slot) {
+        Some(idx) => idx,
+        None => {
+            tracing::warn!(
+                legacy_slot = slot,
+                "v1_6_4_to_v1_16_5: No mapping for legacy equipment slot, dropping packet"
+            );
+            return ConversionResult::Drop;
+        },
+    };
+
+    // Convert to modern slot
+    let modern_slot = items::legacy_slot_to_modern(&legacy_slot);
+
+    // Rebuild in modern format
+    let mut out = BytesMut::new();
     VarInt(entity_id).encode(&mut out).unwrap();
-    VarInt(slot as i32).encode(&mut out).unwrap();
-    VarInt(item as i32).encode(&mut out).unwrap();
-    out.put_u8(0);
-    ConversionResult::Converted(vec![build_payload(V165_S2C_ENTITY_EQUIPMENT, &out)])
+    out.put_u8(modern_slot_idx);
+    modern_slot
+        .encode(&mut out)
+        .map_err(|e| format!("encode slot: {}", e))
+        .unwrap();
+
+    rebuild_with_id(V165_S2C_ENTITY_EQUIPMENT, &out.freeze())
 }
 
 fn s2c_experience(mut body: Bytes) -> ConversionResult {
@@ -437,11 +485,11 @@ const V164_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x0F;
 const V164_C2S_HELD_ITEM_CHANGE: u8 = 0x10;
 const V164_C2S_ENTITY_ACTION: u8 = 0x13;
 
-const V165_C2S_KEEP_ALIVE: u8 = 0x0E;
+const V165_C2S_KEEP_ALIVE: u8 = 0x10;
 const V165_C2S_CHAT: u8 = 0x03;
 const V165_C2S_PLAYER_POS_LOOK: u8 = 0x11;
-const V165_C2S_PLAYER_DIGGING: u8 = 0x18;
-const V165_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x1E;
+const V165_C2S_PLAYER_DIGGING: u8 = 0x1B;
+const V165_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x2E;
 const V165_C2S_HELD_ITEM_CHANGE: u8 = 0x25;
 const V165_C2S_ENTITY_ACTION: u8 = 0x1C;
 

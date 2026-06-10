@@ -1,3 +1,12 @@
+//! Public event-listener API.
+//!
+//! External code (plugins, embedders, integration tests) implements
+//! [`EventListener`] to be notified of lifecycle events on
+//! [`player::ApiPlayer`] / [`server::ApiServer`]. The trait is
+//! intentionally read-only — there's no callback that can mutate
+//! proxy state, since the host has its own internal hook system for
+//! that.
+
 #![deny(clippy::all)]
 
 pub mod events;

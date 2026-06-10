@@ -1,5 +1,18 @@
+//! Offline-mode UUID derivation.
+//!
+//! When `online_mode = false` the proxy can't ask Mojang for a real
+//! UUID, so it deterministically derives one from the username via
+//! `MD5("OfflinePlayer:<name>")` with the version/variant bits
+//! flipped to make a valid UUIDv3. Matches the convention vanilla
+//! and most servers use, so an offline player's UUID is stable
+//! across restarts and identical to the one they'd get on any other
+//! offline server.
+
 use uuid::Uuid;
 
+/// Derive the canonical offline-mode UUIDv3 for a username. Stable
+/// across runs and matches what vanilla offline servers produce for
+/// the same name.
 pub fn offline_uuid(username: &str) -> Uuid {
     use md5::{Digest, Md5};
     let input = format!("OfflinePlayer:{}", username);

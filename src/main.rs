@@ -99,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
     // Start listening to plugin command channels.
     state.start_plugin_command_processors();
 
+    // Polling hot-reload watcher (no-op when plugins.hot_reload = false).
+    state.start_plugin_hot_reload_watcher();
+
     // Anonymous, opt-out usage telemetry (metric.kojacoord.net). Honours
     // [telemetry] enabled in the config; never blocks or fails the proxy.
     kojacoord_proxy_core::telemetry::spawn(Arc::clone(&state));
@@ -145,10 +148,10 @@ async fn main() -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 match kojacoord_config::ProxyConfig::from_file(&watcher_path) {
                     Ok(new_cfg) => {
-                        tracing::info!("Config file modified, hot-reloading servers...");
+                        tracing::info!("Config file modified, hot-reloading full configuration...");
                         let st = Arc::clone(&watcher_state);
                         tokio::spawn(async move {
-                            st.reload_servers(&new_cfg).await;
+                            st.reload_config(&new_cfg).await;
                         });
                     },
                     Err(e) => {
@@ -158,6 +161,29 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // SIGHUP signal handler for Unix systems to trigger config reload
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix;
+        let sighup_state = Arc::clone(&state);
+        let sighup_path = config_path.clone();
+        tokio::spawn(async move {
+            let mut sigterm = unix::signal(unix::SignalKind::hangup()).unwrap();
+            loop {
+                sigterm.recv().await;
+                tracing::info!("Received SIGHUP signal, reloading configuration...");
+                match kojacoord_config::ProxyConfig::from_file(&sighup_path) {
+                    Ok(new_cfg) => {
+                        sighup_state.reload_config(&new_cfg).await;
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e, path = %sighup_path, "Failed to reload config on SIGHUP");
+                    },
+                }
+            }
+        });
+    }
 
     kojacoord_proxy_core::proxy::accept_loop(state).await
 }

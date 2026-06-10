@@ -1,3 +1,11 @@
+//! Lock-free `BytesMut` recycler.
+//!
+//! Per-packet allocations show up high in flame graphs; this pool
+//! smooths them out. Fixed capacity, drops overflow on return,
+//! tolerates leaks (callers that forget to return just allocate the
+//! next time). Backed by `crossbeam_queue::ArrayQueue` so the
+//! relay's three tokio tasks per connection don't fight a mutex.
+
 use bytes::BytesMut;
 use crossbeam_queue::ArrayQueue;
 use lazy_static::lazy_static;

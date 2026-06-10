@@ -1,3 +1,9 @@
+//! Top-level error types for the proxy.
+//!
+//! [`ConnectionError`] is what every connection IO path returns.
+//! Variants are coarse on purpose — callers care about "retry,
+//! close, or kick?" more than the specific bytes that went wrong.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

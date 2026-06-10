@@ -103,7 +103,7 @@ pub struct ClientboundEncryptionRequest {
     pub server_id: String,
     pub public_key: Vec<u8>,
     pub verify_token: Vec<u8>,
-    pub should_authenticate: bool,
+    // `should_authenticate` was introduced in 1.20.5 — absent in this era.
 }
 
 impl PacketId for ClientboundEncryptionRequest {
@@ -117,7 +117,6 @@ impl Encode for ClientboundEncryptionRequest {
         encode_string(&self.server_id, dst)?;
         encode_byte_array(&self.public_key, dst)?;
         encode_byte_array(&self.verify_token, dst)?;
-        dst.put_u8(self.should_authenticate as u8);
         Ok(())
     }
 }
@@ -127,12 +126,10 @@ impl Decode for ClientboundEncryptionRequest {
         let server_id = decode_string(src)?;
         let public_key = decode_byte_array(src)?;
         let verify_token = decode_byte_array(src)?;
-        let should_authenticate = src.get_u8() != 0;
         Ok(Self {
             server_id,
             public_key,
             verify_token,
-            should_authenticate,
         })
     }
 }
@@ -321,7 +318,6 @@ mod tests {
             server_id: String::new(),
             public_key: vec![0xDE, 0xAD, 0xBE, 0xEF],
             verify_token: vec![0x01, 0x02, 0x03, 0x04],
-            should_authenticate: true,
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();

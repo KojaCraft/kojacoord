@@ -1,3 +1,8 @@
+//! Prometheus counters/gauges/histograms the proxy writes to from the
+//! hot path. The exporter reads the same `Registry` when Prometheus
+//! scrapes; each metric is typed so callers get a compile error if
+//! they update the wrong one rather than silently dropping samples.
+
 use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, Registry};
 
 pub struct MetricsCollector {

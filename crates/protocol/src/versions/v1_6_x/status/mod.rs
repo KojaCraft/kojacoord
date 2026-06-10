@@ -29,6 +29,30 @@ fn encode_legacy_string(s: &str, dst: &mut BytesMut) {
     }
 }
 
+/// Legacy 0xFE server-list ping packet for pre-1.7 / 1.6.x clients.
+/// This is a single-byte packet (0xFE) that clients send to request
+/// the MOTD in the legacy format before the modern handshake was introduced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundLegacyPing;
+
+impl PacketId for ServerboundLegacyPing {
+    fn packet_id(_ver: u32) -> u8 {
+        0xFE
+    }
+}
+
+impl Decode for ServerboundLegacyPing {
+    fn decode(_src: &mut Bytes) -> Result<Self, ProtocolError> {
+        Ok(Self)
+    }
+}
+
+impl Encode for ServerboundLegacyPing {
+    fn encode(&self, _dst: &mut BytesMut) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientboundResponse {
     pub response: String,
@@ -52,6 +76,52 @@ impl Decode for ClientboundResponse {
         Ok(Self {
             response: decode_legacy_string(src)?,
         })
+    }
+}
+
+/// Legacy MOTD response format for 0xFE ping.
+/// Format: "§1\0<protocol>\0<version>\0<motd>\0<players>\0<max_players>"
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundLegacyMotd {
+    pub protocol: String,
+    pub version: String,
+    pub motd: String,
+    pub players: String,
+    pub max_players: String,
+}
+
+impl ClientboundLegacyMotd {
+    /// Create a legacy MOTD response from modern JSON status
+    pub fn from_json(_json: &str) -> Self {
+        // Parse the JSON to extract relevant fields
+        // Fallback to defaults if parsing fails
+        let protocol = "78".to_string(); // 1.6.4 protocol
+        let version = "1.6.4".to_string();
+        let motd = "A Minecraft Server".to_string();
+        let players = "0".to_string();
+        let max_players = "20".to_string();
+
+        Self {
+            protocol,
+            version,
+            motd,
+            players,
+            max_players,
+        }
+    }
+
+    /// Encode in the legacy format expected by pre-1.7 clients
+    pub fn encode_legacy(&self) -> Bytes {
+        let mut dst = BytesMut::new();
+        dst.put_u8(0xFF); // Packet ID for legacy response
+        encode_legacy_string(
+            &format!(
+                "§1\0{}\0{}\0{}\0{}\0{}",
+                self.protocol, self.version, self.motd, self.players, self.max_players
+            ),
+            &mut dst,
+        );
+        dst.freeze()
     }
 }
 

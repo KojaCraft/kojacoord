@@ -1,3 +1,10 @@
+//! Periodic per-modpack online-count reporter.
+//!
+//! Background loop that posts modpack identifier + current online
+//! count to the configured webhook every N seconds. Used by the
+//! upstream marketplace for the "live players right now" badge —
+//! the data is anonymous (modpack ID + count, nothing player-shaped).
+
 use crate::proxy::ProxyState;
 use std::sync::Arc;
 use std::time::Duration;

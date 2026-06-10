@@ -1,3 +1,15 @@
+//! Named Binary Tag — Minecraft's native data format.
+//!
+//! Two surfaces:
+//!   - [`Nbt`] / [`NbtTag`] for full parse/build trees, used by the
+//!     dimension-codec builder and friends
+//!   - [`skip`] for streaming over a top-level NBT value without
+//!     materialising it, used by version converters that need to
+//!     skip past an embedded codec without caring about the contents
+//!
+//! Wire format reference:
+//! <https://minecraft.wiki/w/NBT_format>.
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 
@@ -501,4 +513,142 @@ mod tests {
         assert_eq!(tag.as_int(), Some(100));
         assert_eq!(tag.as_string(), None);
     }
+
+    #[test]
+    fn skip_walks_past_empty_compound() {
+        // tag=Compound(10), name_len=0, then immediate End(0)
+        let raw: &[u8] = &[10, 0, 0, 0];
+        let mut buf = Bytes::copy_from_slice(raw);
+        skip(&mut buf).expect("skip");
+        assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn skip_returns_err_on_truncated_input() {
+        let raw: &[u8] = &[10, 0]; // missing name_len trailing byte
+        let mut buf = Bytes::copy_from_slice(raw);
+        assert!(skip(&mut buf).is_err());
+    }
+
+    #[test]
+    fn skip_handles_explicit_end_at_top_level() {
+        let raw: &[u8] = &[0]; // bare TAG_End
+        let mut buf = Bytes::copy_from_slice(raw);
+        skip(&mut buf).expect("skip end");
+        assert_eq!(buf.remaining(), 0);
+    }
+}
+
+// ── Skipper ──────────────────────────────────────────────────────────────
+//
+// The on-wire NBT used by JoinGame's dimension codec and a handful of other
+// 1.13+ packets is self-delimiting — but only if you decode it. When we
+// want to *step over* a codec without materialising the tree (e.g. when
+// translating between protocol versions that no longer carry it), we need
+// a streaming skipper that honours every tag's payload shape.
+//
+// `skip` consumes a single top-level NBT value from `cur` and advances
+// past it. Returns the count of bytes consumed.
+
+/// Advance `cur` past one top-level NBT value. Returns the number of
+/// bytes consumed. Surfaces `ProtocolError::UnexpectedEof` /
+/// `UnknownNbtTag` on malformed input so callers can react (most
+/// converters turn that into `ConversionResult::Drop`).
+pub fn skip(cur: &mut Bytes) -> Result<usize, ProtocolError> {
+    let start = cur.remaining();
+    if start < 1 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    let tag_byte = cur.get_u8();
+    if tag_byte == TagType::End as u8 {
+        return Ok(start - cur.remaining());
+    }
+    let tag = TagType::from_u8(tag_byte)?;
+    // Top-level value carries a name prefix: u16 length + UTF-8 bytes.
+    skip_name(cur)?;
+    skip_payload(cur, tag)?;
+    Ok(start - cur.remaining())
+}
+
+fn skip_name(cur: &mut Bytes) -> Result<(), ProtocolError> {
+    if cur.remaining() < 2 {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    let len = cur.get_u16() as usize;
+    if cur.remaining() < len {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    cur.advance(len);
+    Ok(())
+}
+
+fn skip_payload(cur: &mut Bytes, tag: TagType) -> Result<(), ProtocolError> {
+    match tag {
+        TagType::End => Ok(()),
+        TagType::Byte => need(cur, 1),
+        TagType::Short => need(cur, 2),
+        TagType::Int | TagType::Float => need(cur, 4),
+        TagType::Long | TagType::Double => need(cur, 8),
+        TagType::ByteArray => {
+            need(cur, 4)?;
+            let n = cur.get_i32();
+            if n < 0 {
+                return Err(ProtocolError::UnknownNbtTag(0));
+            }
+            need(cur, n as usize)
+        },
+        TagType::String => {
+            need(cur, 2)?;
+            let n = cur.get_u16() as usize;
+            need(cur, n)
+        },
+        TagType::List => {
+            need(cur, 5)?;
+            let inner = TagType::from_u8(cur.get_u8())?;
+            let n = cur.get_i32();
+            if n < 0 {
+                return Err(ProtocolError::UnknownNbtTag(0));
+            }
+            for _ in 0..n {
+                skip_payload(cur, inner)?;
+            }
+            Ok(())
+        },
+        TagType::Compound => loop {
+            if cur.remaining() < 1 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let child_byte = cur.get_u8();
+            if child_byte == TagType::End as u8 {
+                return Ok(());
+            }
+            let child = TagType::from_u8(child_byte)?;
+            skip_name(cur)?;
+            skip_payload(cur, child)?;
+        },
+        TagType::IntArray => {
+            need(cur, 4)?;
+            let n = cur.get_i32();
+            if n < 0 {
+                return Err(ProtocolError::UnknownNbtTag(0));
+            }
+            need(cur, (n as usize).saturating_mul(4))
+        },
+        TagType::LongArray => {
+            need(cur, 4)?;
+            let n = cur.get_i32();
+            if n < 0 {
+                return Err(ProtocolError::UnknownNbtTag(0));
+            }
+            need(cur, (n as usize).saturating_mul(8))
+        },
+    }
+}
+
+fn need(cur: &mut Bytes, n: usize) -> Result<(), ProtocolError> {
+    if cur.remaining() < n {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    cur.advance(n);
+    Ok(())
 }

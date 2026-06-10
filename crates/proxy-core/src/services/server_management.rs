@@ -1,10 +1,18 @@
+//! TCP-based backend orchestration channel.
+//!
+//! A small protocol for orchestrators (custom CI scripts, the
+//! Kojacoord launcher) to register/deregister backends and transfer
+//! players without going through the gRPC control plane. Bound to
+//! `[server_management] bind`; constant-time-compared auth token
+//! per message so accept-rate brute-force doesn't leak token bytes.
+
 use crate::proxy::ProxyState;
 use crate::server::BackendServer;
 use crate::transfer::TransferCommand;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -171,6 +179,14 @@ impl ServerManagementServer {
             online: Arc::new(AtomicBool::new(true)),
             connection_pool: None,
             backend_type: kojacoord_config::BackendType::default(),
+            compression_threshold: 0,
+            cipher_suites: String::new(),
+            health_probe_interval_secs: 0,
+            health_probe_timeout_secs: 5,
+            health_probe_fail_threshold: 3,
+            health_fail_count: Arc::new(AtomicU32::new(0)),
+            health_unhealthy: Arc::new(AtomicBool::new(false)),
+            region: String::new(),
         };
 
         self.state.server_registry.register(server).await;
@@ -310,25 +326,31 @@ impl ServerManagementServer {
 
     /// Move all players currently on `from_server` to `to_server`.
     /// Returns the number of players evacuated.
+    ///
+    /// Snapshots the session map up front: the DashMap iterator holds
+    /// per-shard guards, and `kick_player()` reaches back into the same
+    /// map. Reentering a held shard would deadlock.
     async fn evacuate_players(&self, from_server: &str, to_server: &str) -> usize {
-        let mut evacuated = 0usize;
+        let snapshot: Vec<(Uuid, crate::session::SharedSession)> = self
+            .state
+            .sessions
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
 
-        for entry in self.state.sessions.iter() {
-            let uuid = *entry.key();
-            let session = entry.value();
+        let mut evacuated = 0usize;
+        for (uuid, session) in snapshot {
             let current = {
                 let s = session.read().await;
                 s.current_server.clone()
             };
 
             if current.as_deref() == Some(from_server) {
-                // Update routing state.
                 {
                     let mut s = session.write().await;
                     s.current_server = Some(to_server.to_owned());
                 }
 
-                // Update player counts.
                 if let Some(old) = self.state.server_registry.get(from_server) {
                     old.player_count.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -336,7 +358,6 @@ impl ServerManagementServer {
                     new_srv.player_count.fetch_add(1, Ordering::Relaxed);
                 }
 
-                // Kick the player with a friendly message so they reconnect to the lobby.
                 let reason = r#"{"text":"§cThe server you were on has shut down. Reconnecting you to the lobby..."}"#;
                 self.state.kick_player(&uuid, reason).await;
 

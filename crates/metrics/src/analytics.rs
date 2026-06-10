@@ -1,3 +1,10 @@
+//! Rolling event log for the management dashboard.
+//!
+//! Buckets events by hour and trims to the operator-configured
+//! retention window. Storage is in-memory only — this isn't a
+//! persistence layer, just a way to surface "what happened in the
+//! last N hours" without going through the metrics scrape.
+
 use chrono::{DateTime, Timelike, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

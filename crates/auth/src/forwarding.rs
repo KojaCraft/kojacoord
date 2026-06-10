@@ -1,3 +1,17 @@
+//! IP-forward handshake formats for downstream backends.
+//!
+//! Backends behind the proxy need the real client IP / UUID for ban
+//! lists, anticheat, and logging. Two ecosystems standardised
+//! formats:
+//!
+//! - **BungeeCord** legacy: appends `\0<ip>\0<uuid>\0<properties_json>`
+//!   to the `server_address` field of the handshake. Unauthenticated;
+//!   the backend must firewall on the proxy's IP to prevent spoofing.
+//! - **Velocity modern**: a signed plugin-message containing the
+//!   profile, sent over the `velocity:player_info` channel. Uses an
+//!   HMAC shared secret — operator must set `velocity_secret` in the
+//!   config and the same secret in `velocity.toml` on every backend.
+
 use crate::session::AuthenticatedProfile;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

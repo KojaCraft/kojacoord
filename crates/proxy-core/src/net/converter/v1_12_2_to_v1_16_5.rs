@@ -10,21 +10,22 @@
 //! - <https://minecraft.wiki/w/Java_Edition_1.13/Flattening> (block/item flattening)
 //! - PrismarineJS minecraft-data proto.yml for 1.12.2 and 1.16.5
 //!
-//! Packets whose body shape carries flattened block/item state IDs or
-//! palette-encoded chunk data are too large to remap in one pass (it
-//! requires a full ~12000-entry state mapping table). Those are dropped
-//! with a warn-level trace and a note pointing at the wiki section to
-//! consult. The result is a stable proxy that loses block/inventory
-//! fidelity but does not desync the client connection.
+//! Chunk data packets are now handled by the chunk repacker for proper
+//! cross-version conversion across the 1.13 flattening and 1.14 biome/storage rewrites.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kojacoord_protocol::codec::Encode;
-use kojacoord_protocol::types::{Position, VarInt};
+use kojacoord_protocol::codec::{Decode, Encode};
+use kojacoord_protocol::types::VarInt;
+#[cfg(test)]
+use kojacoord_protocol::types::Position;
+use kojacoord_protocol::{decode_legacy_position, encode_modern_position, BlockFlatteningTable};
 
+use super::helpers::rebuild_with_id;
+use super::items;
 use super::{build_payload, split_id};
 use crate::converter::ConversionResult;
+use crate::protocol::dimension_codec;
 
-// ── Packet ID mapping table ──────────────────────────────────────────────────
 // (kept as `const` slices so they're easy to audit in one place)
 
 /// `(1.12.2 id, 1.16.5 id)` for clientbound packets we forward as-is
@@ -34,7 +35,6 @@ const S2C_ID_PASSTHROUGH: &[(u8, u8)] = &[
     (0x1F, 0x1F),
 ];
 
-// ── S2C IDs ──────────────────────────────────────────────────────────────────
 const V12_S2C_KEEP_ALIVE: u8 = 0x1F;
 const V12_S2C_JOIN_GAME: u8 = 0x23;
 const V12_S2C_CHAT: u8 = 0x0F;
@@ -52,33 +52,37 @@ const V12_S2C_WINDOW_ITEMS: u8 = 0x14;
 const V12_S2C_ENTITY_EQUIPMENT: u8 = 0x3F;
 const V12_S2C_CHUNK_DATA: u8 = 0x20;
 const V12_S2C_ENTITY_TELEPORT: u8 = 0x4C;
-const V12_S2C_MOVE_ENTITY_POS: u8 = 0x25;
-const V12_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x26;
-const V12_S2C_MOVE_ENTITY_ROT: u8 = 0x27;
+const V12_S2C_MOVE_ENTITY_POS: u8 = 0x26;
+const V12_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x27;
+const V12_S2C_MOVE_ENTITY_ROT: u8 = 0x28;
 const V12_S2C_DESTROY_ENTITIES: u8 = 0x32;
 const V12_S2C_ENTITY_HEAD_LOOK: u8 = 0x36;
 const V12_S2C_ENTITY_VELOCITY: u8 = 0x3E;
 
-const V16_S2C_KEEP_ALIVE: u8 = 0x1F;
-const V16_S2C_JOIN_GAME: u8 = 0x24;
+const V16_S2C_KEEP_ALIVE: u8 = 0x20;
+const V16_S2C_JOIN_GAME: u8 = 0x25;
 const V16_S2C_CHAT: u8 = 0x0E;
-const V16_S2C_PLAYER_POS_LOOK: u8 = 0x34;
+const V16_S2C_PLAYER_POS_LOOK: u8 = 0x35;
 const V16_S2C_SPAWN_POSITION: u8 = 0x42;
-const V16_S2C_RESPAWN: u8 = 0x39;
+const V16_S2C_RESPAWN: u8 = 0x3A;
 const V16_S2C_DISCONNECT: u8 = 0x19;
 const V16_S2C_HELD_ITEM_CHANGE: u8 = 0x3F;
-const V16_S2C_PLAYER_ABILITIES: u8 = 0x2F;
+const V16_S2C_PLAYER_ABILITIES: u8 = 0x31;
 const V16_S2C_SET_EXPERIENCE: u8 = 0x48;
 const V16_S2C_ENTITY_TELEPORT: u8 = 0x56;
-const V16_S2C_MOVE_ENTITY_POS: u8 = 0x27;
-const V16_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x28;
-const V16_S2C_MOVE_ENTITY_ROT: u8 = 0x29;
-const V16_S2C_DESTROY_ENTITIES: u8 = 0x36;
-const V16_S2C_ENTITY_HEAD_LOOK: u8 = 0x3A;
+const V16_S2C_MOVE_ENTITY_POS: u8 = 0x28;
+const V16_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x29;
+const V16_S2C_MOVE_ENTITY_ROT: u8 = 0x2A;
+const V16_S2C_DESTROY_ENTITIES: u8 = 0x37;
+const V16_S2C_ENTITY_HEAD_LOOK: u8 = 0x3B;
 const V16_S2C_ENTITY_VELOCITY: u8 = 0x46;
 const V16_S2C_BLOCK_CHANGE: u8 = 0x0B;
+const V16_S2C_MULTI_BLOCK_CHANGE: u8 = 0x0F;
+const V16_S2C_SET_SLOT: u8 = 0x15;
+const V16_S2C_WINDOW_ITEMS: u8 = 0x13;
+const V16_S2C_CHUNK_DATA: u8 = 0x21;
+const V16_S2C_ENTITY_EQUIPMENT: u8 = 0x47;
 
-// ── C2S IDs ──────────────────────────────────────────────────────────────────
 const V12_C2S_TELEPORT_CONFIRM: u8 = 0x00;
 const V12_C2S_CHAT: u8 = 0x02;
 const V12_C2S_CLIENT_STATUS: u8 = 0x03;
@@ -110,12 +114,11 @@ const V16_C2S_MOVE_PLAYER_POS_ROT: u8 = 0x14;
 const V16_C2S_PLAYER_ABILITIES: u8 = 0x19;
 const V16_C2S_PLAYER_DIGGING: u8 = 0x1B;
 const V16_C2S_ENTITY_ACTION: u8 = 0x1C;
-const V16_C2S_HELD_ITEM_CHANGE: u8 = 0x25;
-const V16_C2S_ANIMATION: u8 = 0x2C;
-const V16_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x2E;
-const V16_C2S_USE_ITEM: u8 = 0x2F;
+const V16_C2S_HELD_ITEM_CHANGE: u8 = 0x24;
+const V16_C2S_ANIMATION: u8 = 0x2B;
+const V16_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x2D;
+const V16_C2S_USE_ITEM: u8 = 0x2E;
 
-// ── Position repacking ───────────────────────────────────────────────────────
 //
 // 1.12.2 packing:  XXXXXXXXXXXXXXXXXXXXXXXXXX YYYYYYYYYY ZZZZZZZZZZZZZZZZZZZZZZZZZZ
 //   (Y is the *middle* 12 bits — actually 12-bit field at offset 26).
@@ -126,33 +129,10 @@ const V16_C2S_USE_ITEM: u8 = 0x2F;
 // See: <https://minecraft.wiki/w/Java_Edition_protocol/Data_types#Position>
 //      (note describing the Y-bit move in 1.14).
 
-fn decode_legacy_position(val: u64) -> Position {
-    let v = val as i64;
-    let mut x = (v >> 38) & 0x3FF_FFFF;
-    let mut y = (v >> 26) & 0xFFF;
-    let mut z = v & 0x3FF_FFFF;
-    if x >= 0x200_0000 {
-        x -= 0x400_0000;
-    }
-    if z >= 0x200_0000 {
-        z -= 0x400_0000;
-    }
-    if z & 0x200_0000 != 0 {
-        // already handled
-    }
-    if y >= 0x800 {
-        y -= 0x1000;
-    }
-    Position {
-        x: x as i32,
-        y: y as i32,
-        z: z as i32,
-    }
-}
-
-// ── S2C dispatch ─────────────────────────────────────────────────────────────
-
-pub fn convert_s2c(payload: Bytes) -> ConversionResult {
+pub fn convert_s2c(
+    payload: Bytes,
+    repacker: Option<std::sync::Arc<crate::converter::chunk_repack::ChunkRepacker>>,
+) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
         return ConversionResult::Passthrough;
     };
@@ -188,46 +168,195 @@ pub fn convert_s2c(payload: Bytes) -> ConversionResult {
         // See <https://minecraft.wiki/w/Java_Edition_1.13/Flattening>.
         V12_S2C_BLOCK_CHANGE => s2c_block_change(body),
         V12_S2C_MULTI_BLOCK_CHANGE => {
-            tracing::warn!(
-                "v1_12_2_to_v1_16_5: dropping MultiBlockChange (needs flattening state table); \
-                 not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert MultiBlockChange from legacy to modern format
+            // 1.12.2: i32 chunk_x | i32 chunk_z | VarInt count | (i16 x, i16 y, i16 z, VarInt block_id, VarInt block_data)[] records
+            // 1.16.5: i32 chunk_x | i32 chunk_z | VarInt count | (VarInt long_offset, VarInt state)[] records
+            let mut body_mut = BytesMut::from(body.as_ref());
+            if body_mut.remaining() < 8 {
+                return ConversionResult::Passthrough;
+            }
+            let chunk_x = body_mut.get_i32();
+            let chunk_z = body_mut.get_i32();
+            let count = VarInt::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode count: {}", e))
+                .unwrap()
+                .0 as usize;
+
+            let flattening = BlockFlatteningTable::new();
+            let mut out = BytesMut::new();
+            out.put_i32(chunk_x);
+            out.put_i32(chunk_z);
+            VarInt(count as i32).encode(&mut out).unwrap();
+
+            for _ in 0..count {
+                let x = body_mut.get_i16();
+                let y = body_mut.get_i16();
+                let z = body_mut.get_i16();
+                let block_id = VarInt::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode block_id: {}", e))
+                    .unwrap()
+                    .0 as u32;
+                let block_data = VarInt::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode block_data: {}", e))
+                    .unwrap()
+                    .0 as u32;
+
+                // Convert to long offset format
+                // 1.16.5 packs as: ((y & 0xF) << 8) | (z << 4) | x within a section
+                let long_offset =
+                    ((y as u64 & 0xF) << 8) | ((z as u64 & 0xF) << 4) | (x as u64 & 0xF);
+
+                // Map legacy state to modern state using flattening table
+                let legacy_state = (block_id << 4) | block_data;
+                let modern_state = match flattening.legacy_to_modern(legacy_state) {
+                    Some(state) => state,
+                    None => {
+                        tracing::warn!(legacy_state, "v1_12_2_to_v1_16_5: No mapping for legacy block state in MultiBlockChange, skipping record");
+                        continue;
+                    },
+                };
+
+                VarInt(long_offset as i32).encode(&mut out).unwrap();
+                VarInt(modern_state as i32).encode(&mut out).unwrap();
+            }
+
+            rebuild_with_id(V16_S2C_MULTI_BLOCK_CHANGE, &out.freeze())
         },
         V12_S2C_CHUNK_DATA => {
-            tracing::warn!(
-                "v1_12_2_to_v1_16_5: dropping ChunkData (needs palette/bit-storage rewrite and \
-                 biome-per-section rework, 1.15+); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Use chunk repacker to convert from Legacy (1.12.2) to Flattened (1.16.5)
+            if let Some(repacker) = repacker {
+                match repacker.repack(&body, kojacoord_protocol::ProtocolVersion::V1_12_2, kojacoord_protocol::ProtocolVersion::V1_16_5) {
+                    Ok(converted_body) => {
+                        tracing::debug!("v1_12_2_to_v1_16_5: Successfully repacked chunk data");
+                        rebuild_with_id(V16_S2C_CHUNK_DATA, &bytes::Bytes::copy_from_slice(&converted_body))
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "v1_12_2_to_v1_16_5: Chunk repacking failed, dropping packet");
+                        ConversionResult::Drop
+                    },
+                }
+            } else {
+                tracing::warn!(
+                    "v1_12_2_to_v1_16_5: No chunk repacker available, dropping ChunkData"
+                );
+                ConversionResult::Drop
+            }
         },
         V12_S2C_SET_SLOT => {
-            tracing::warn!(
-                "v1_12_2_to_v1_16_5: dropping SetSlot (needs item-id flattening map); \
-                 not yet implemented — see minecraft-data 1.13 item mappings"
-            );
-            ConversionResult::Drop
+            // Convert SetSlot from legacy to modern format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            match items::convert_set_slot_legacy_to_modern(&mut body_mut) {
+                Ok(()) => rebuild_with_id(V16_S2C_SET_SLOT, &body_mut.freeze()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "v1_12_2_to_v1_16_5: SetSlot conversion failed, dropping packet");
+                    ConversionResult::Drop
+                },
+            }
         },
         V12_S2C_WINDOW_ITEMS => {
-            tracing::warn!(
-                "v1_12_2_to_v1_16_5: dropping WindowItems (needs item-id flattening map); \
-                 not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert WindowItems from legacy to modern format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            let window_id = body_mut.get_u8();
+            let count = VarInt::decode(&mut body_mut.clone().freeze())
+                .map_err(|e| format!("decode count: {}", e))
+                .unwrap()
+                .0 as usize;
+
+            let mut modern_slots = Vec::new();
+            for _ in 0..count {
+                let has_item = body_mut.get_u8() != 0;
+                let legacy_slot = if has_item {
+                    let item_id = body_mut.get_i16();
+                    let slot_count = body_mut.get_u8();
+                    let damage = body_mut.get_i16();
+                    let nbt_len = VarInt::decode(&mut body_mut.clone().freeze())
+                        .map_err(|e| format!("decode nbt len: {}", e))
+                        .unwrap()
+                        .0;
+                    let nbt = if nbt_len > 0 {
+                        let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
+                        Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+                    } else {
+                        None
+                    };
+                    items::LegacySlot(Some(items::LegacySlotData {
+                        item_id,
+                        count: slot_count as i8,
+                        damage,
+                        nbt,
+                    }))
+                } else {
+                    items::LegacySlot(None)
+                };
+                modern_slots.push(items::legacy_slot_to_modern(&legacy_slot));
+            }
+
+            // Rebuild in modern format
+            let mut out = BytesMut::new();
+            out.put_u8(window_id);
+            VarInt(modern_slots.len() as i32).encode(&mut out).unwrap();
+            for slot in modern_slots {
+                slot.encode(&mut out).unwrap();
+            }
+
+            rebuild_with_id(V16_S2C_WINDOW_ITEMS, &out.freeze())
         },
         V12_S2C_ENTITY_EQUIPMENT => {
-            tracing::warn!(
-                "v1_12_2_to_v1_16_5: dropping EntityEquipment (needs item-id flattening + 1.16 \
-                 multi-slot reshape); not yet implemented"
-            );
-            ConversionResult::Drop
+            // Convert EntityEquipment from legacy to modern format
+            let mut body_mut = BytesMut::from(body.as_ref());
+            let entity_id = body_mut.get_i32();
+            let slot = body_mut.get_i16();
+
+            // Read legacy slot
+            let has_item = body_mut.get_u8() != 0;
+            let legacy_slot = if has_item {
+                let item_id = body_mut.get_i16();
+                let count = body_mut.get_u8();
+                let damage = body_mut.get_i16();
+                let nbt_len = VarInt::decode(&mut body_mut.clone().freeze())
+                    .map_err(|e| format!("decode nbt len: {}", e))
+                    .unwrap()
+                    .0;
+                let nbt = if nbt_len > 0 {
+                    let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
+                    Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+                } else {
+                    None
+                };
+                items::LegacySlot(Some(items::LegacySlotData {
+                    item_id,
+                    count: count as i8,
+                    damage,
+                    nbt,
+                }))
+            } else {
+                items::LegacySlot(None)
+            };
+
+            // Map legacy slot to modern slot
+            let modern_slot_idx = match items::map_legacy_equipment_slot(slot) {
+                Some(idx) => idx,
+                None => {
+                    tracing::warn!(
+                        slot,
+                        "v1_12_2_to_v1_16_5: Unknown legacy equipment slot, dropping packet"
+                    );
+                    return ConversionResult::Drop;
+                },
+            };
+
+            let modern_slot = items::legacy_slot_to_modern(&legacy_slot);
+
+            // Rebuild in modern format
+            let mut out = BytesMut::new();
+            out.put_i32(entity_id);
+            out.put_u8(modern_slot_idx);
+            modern_slot.encode(&mut out).unwrap();
+
+            rebuild_with_id(V16_S2C_ENTITY_EQUIPMENT, &out.freeze())
         },
         _ => ConversionResult::Passthrough,
     }
-}
-
-fn rebuild_with_id(new_id: u8, body: &Bytes) -> ConversionResult {
-    ConversionResult::Converted(vec![build_payload(new_id, body)])
 }
 
 fn s2c_block_change(mut body: Bytes) -> ConversionResult {
@@ -244,26 +373,26 @@ fn s2c_block_change(mut body: Bytes) -> ConversionResult {
         Some(v) => v as u32,
         None => return ConversionResult::Passthrough,
     };
-    let block_id = legacy_state >> 4;
-    let meta = legacy_state & 0xF;
-    let modern_state = super::flattening::legacy_to_state(block_id, meta);
-    if modern_state == 0 && block_id != 0 {
-        tracing::trace!(
-            block_id,
-            meta,
-            "BlockChange: block not in flattening stub; emitting air"
-        );
-    }
-    let packed_modern = encode_modern_position(pos.x, pos.y, pos.z);
-    let mut out = BytesMut::new();
-    out.put_i64(packed_modern);
-    VarInt(modern_state as i32).encode(&mut out).unwrap();
-    ConversionResult::Converted(vec![build_payload(V16_S2C_BLOCK_CHANGE, &out)])
-}
 
-fn encode_modern_position(x: i32, y: i32, z: i32) -> i64 {
-    // 1.14+ layout: x high 26, z middle 26, y low 12.
-    (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
+    // Map legacy state to modern state using flattening table
+    let flattening = BlockFlatteningTable::new();
+    let modern_state = match flattening.legacy_to_modern(legacy_state) {
+        Some(state) => state,
+        None => {
+            tracing::warn!(
+                legacy_state,
+                "v1_12_2_to_v1_16_5: No mapping for legacy block state, dropping BlockChange"
+            );
+            return ConversionResult::Drop;
+        },
+    };
+
+    let packed_modern = encode_modern_position(pos);
+    let mut out = BytesMut::new();
+    out.put_u64(packed_modern as u64);
+    VarInt(modern_state as i32).encode(&mut out).unwrap();
+
+    rebuild_with_id(V16_S2C_BLOCK_CHANGE, &out.freeze())
 }
 
 fn s2c_chat(mut body: Bytes) -> ConversionResult {
@@ -342,14 +471,14 @@ fn s2c_join_game(mut body: Bytes) -> ConversionResult {
         _ => ("minecraft:overworld", "minecraft:overworld"),
     };
 
-    let codec = match super::dimension_codec::dimension_codec_nbt() {
+    let codec = match dimension_codec::dimension_codec_nbt() {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "failed to synthesize dimension codec NBT");
             return ConversionResult::Drop;
         },
     };
-    let dim_type = match super::dimension_codec::dimension_type_nbt(dim_key) {
+    let dim_type = match dimension_codec::dimension_type_nbt(dim_key) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "failed to synthesize dimension type NBT");
@@ -403,7 +532,7 @@ fn s2c_respawn(mut body: Bytes) -> ConversionResult {
         _ => ("minecraft:overworld", "minecraft:overworld"),
     };
 
-    let dim_type = match super::dimension_codec::dimension_type_nbt(dim_key) {
+    let dim_type = match dimension_codec::dimension_type_nbt(dim_key) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "failed to synthesize dimension type NBT (respawn)");

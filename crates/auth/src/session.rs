@@ -1,3 +1,13 @@
+//! Online-mode session verification.
+//!
+//! Implements the `sessionserver.mojang.com/session/minecraft/hasJoined`
+//! call. The client computes a SHA-1 hash over the shared secret +
+//! server id + public key, posts it to Mojang as proof it controls
+//! the account, and Mojang replies with the player's authoritative
+//! profile (UUID + signed skin/cape properties). The `Semaphore`
+//! here is the global bound on concurrent Mojang lookups; under a
+//! login storm we'd rather queue than 429 their API.
+
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;

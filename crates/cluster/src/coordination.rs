@@ -1,3 +1,10 @@
+//! Leader election and heartbeat for clustered proxies.
+//!
+//! Each proxy refreshes its own row in [`ServiceDiscovery`] and runs
+//! `elect_leader` periodically; the lowest-UUID alive node becomes
+//! leader. Coarse but deterministic — no external coordinator (etcd,
+//! ZooKeeper) needed.
+
 use crate::discovery::ServiceDiscovery;
 use crate::node::{ClusterNode, NodeRole};
 use std::net::SocketAddr;

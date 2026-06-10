@@ -1,3 +1,11 @@
+//! Channel handler trait + context type.
+//!
+//! [`ChannelHandler`] is what pipeline stages implement; each handler
+//! receives a [`ChannelContext`] giving it the ability to forward
+//! data to the next handler, fire events, or close the channel.
+//! [`Direction::Inbound`] / `Outbound` lets the same handler sit on
+//! either side of the pipeline.
+
 use bytes::{BufMut, Bytes, BytesMut};
 use kojacoord_protocol::codec::{Decode as _, Encode as _};
 

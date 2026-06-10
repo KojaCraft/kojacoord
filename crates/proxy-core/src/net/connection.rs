@@ -1,3 +1,24 @@
+//! Per-client connection state machine.
+//!
+//! [`ClientConnection`] is the lifecycle of one TCP socket from accept
+//! to disconnect — sniffs the PROXY-protocol header (if enabled),
+//! reads the Minecraft handshake, dispatches to status/login/limbo as
+//! appropriate, runs the Mojang auth dance, opens the backend, and
+//! finally hands the socket off to `PacketRelay` for the play phase.
+//!
+//! [`McStream`] is the half-duplex abstraction that lets the rest of
+//! the module write to a TCP stream that may or may not be wrapped in
+//! AES-CFB8 encryption — the cipher kicks in mid-handshake, so we
+//! need a single type that can switch from `Plain` to `Encrypted`
+//! without changing the calling code.
+//!
+//! The rest of the file is a big pile of per-version helpers
+//! (`send_login_success`, `send_encryption_request`, …) that
+//! construct typed packets and route them through
+//! [`Self::write_typed`], which resolves the packet id at compile
+//! time via the `PacketId` trait — no registry lookup on the hot
+//! path.
+
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -7,18 +28,21 @@ use uuid::Uuid;
 
 use aes::cipher::BlockEncrypt;
 use aes::Aes128;
-use bytes::{Bytes, BytesMut};
-use kojacoord_protocol::{CanonicalVersion, ProtocolVersion};
+use bytes::{BufMut, Bytes, BytesMut};
+use kojacoord_protocol::{CanonicalVersion, Epoch, ProtocolVersion};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use rsa::{pkcs1v15::Pkcs1v15Encrypt, pkcs8::DecodePublicKey, RsaPublicKey};
+use sha2::Sha256;
+use base64::prelude::*;
 
 use kojacoord_protocol::{
     codec::{Decode, Encode, PacketId},
     types::VarInt,
+    versions::v1_6_x::status::ClientboundLegacyMotd,
     versions::v1_8_x::{
         handshake::ServerboundHandshake,
-        login::ServerboundLoginStart,
         status::{ClientboundPongResponse, ClientboundStatusResponse, ServerboundPingRequest},
     },
 };
@@ -34,7 +58,10 @@ use crate::{
     session::{ConnectionState, PlayerSession, SharedSession},
 };
 
-use kojacoord_auth::{forwarding::bungeecord_suffix, AuthEvent, AuthOutbound};
+use kojacoord_auth::{
+    forwarding::{bungeecord_suffix, velocity_header},
+    AuthEvent, AuthOutbound,
+};
 use kojacoord_protocol::registry::{Direction, ProtocolState};
 
 struct Cfb8State {
@@ -171,20 +198,60 @@ impl AsyncWrite for EncryptedStream {
     }
 }
 
+/// Underlying socket; either plain TCP or AES-CFB8 encrypted after the
+/// Login exchange. `Empty` is a tombstone used during the
+/// hand-over to `PacketRelay` when the original stream is moved out.
 #[allow(clippy::large_enum_variant)]
-pub enum McStream {
+pub enum McStreamKind {
     Empty,
     Plain(TcpStream),
     Encrypted(EncryptedStream),
 }
 
+/// Wrapper around [`McStreamKind`] with a one-shot byte-prefix
+/// buffer. The buffer exists for a single reason: the legacy-ping
+/// sniffer in [`ClientConnection::run`] needs to peek the first byte
+/// to detect 0xFE without consuming bytes the modern handshake parser
+/// will need. After reading the peek byte, if it's not 0xFE we push
+/// it back into `prefix`; the next `poll_read` drains it before
+/// delegating to the inner stream.
+pub struct McStream {
+    kind: McStreamKind,
+    prefix: std::collections::VecDeque<u8>,
+}
+
 impl McStream {
+    pub fn plain(stream: TcpStream) -> Self {
+        Self {
+            kind: McStreamKind::Plain(stream),
+            prefix: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            kind: McStreamKind::Empty,
+            prefix: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Push bytes to the head of the read queue. The next read will
+    /// drain these before touching the underlying socket. Used by the
+    /// legacy-ping detector to put the peeked byte back when the
+    /// connection turns out to be a modern handshake.
+    pub fn push_prefix(&mut self, bytes: &[u8]) {
+        self.prefix.extend(bytes.iter().copied());
+    }
+
+    /// Upgrade a Plain connection to Encrypted using the negotiated
+    /// AES-CFB8 session key. Any pending `prefix` bytes carry across
+    /// — they were already plaintext when we read them.
     pub fn enable_encryption(&mut self, key: &[u8]) {
-        let old = std::mem::replace(self, McStream::Empty);
-        *self = match old {
-            McStream::Plain(stream) => McStream::Encrypted(EncryptedStream::new(stream, key)),
-            McStream::Encrypted(stream) => McStream::Encrypted(stream),
-            McStream::Empty => unreachable!(),
+        let old = std::mem::replace(&mut self.kind, McStreamKind::Empty);
+        self.kind = match old {
+            McStreamKind::Plain(stream) => McStreamKind::Encrypted(EncryptedStream::new(stream, key)),
+            McStreamKind::Encrypted(stream) => McStreamKind::Encrypted(stream),
+            McStreamKind::Empty => unreachable!("enable_encryption on Empty stream"),
         };
     }
 }
@@ -195,10 +262,24 @@ impl AsyncRead for McStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            McStream::Empty => Poll::Ready(Ok(())),
-            McStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            McStream::Encrypted(s) => Pin::new(s).poll_read(cx, buf),
+        let this = self.get_mut();
+        // Drain prefix first. Once it's empty, fall through to the
+        // underlying stream so the same `poll_read` call returns
+        // some prefix + some socket bytes when the caller asks for
+        // more than the prefix has.
+        if !this.prefix.is_empty() {
+            let n = std::cmp::min(this.prefix.len(), buf.remaining());
+            for _ in 0..n {
+                if let Some(b) = this.prefix.pop_front() {
+                    buf.put_slice(&[b]);
+                }
+            }
+            return Poll::Ready(Ok(()));
+        }
+        match &mut this.kind {
+            McStreamKind::Empty => Poll::Ready(Ok(())),
+            McStreamKind::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            McStreamKind::Encrypted(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -209,26 +290,26 @@ impl AsyncWrite for McStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            McStream::Empty => Poll::Ready(Ok(buf.len())),
-            McStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            McStream::Encrypted(s) => Pin::new(s).poll_write(cx, buf),
+        match &mut self.get_mut().kind {
+            McStreamKind::Empty => Poll::Ready(Ok(buf.len())),
+            McStreamKind::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            McStreamKind::Encrypted(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            McStream::Empty => Poll::Ready(Ok(())),
-            McStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            McStream::Encrypted(s) => Pin::new(s).poll_flush(cx),
+        match &mut self.get_mut().kind {
+            McStreamKind::Empty => Poll::Ready(Ok(())),
+            McStreamKind::Plain(s) => Pin::new(s).poll_flush(cx),
+            McStreamKind::Encrypted(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            McStream::Empty => Poll::Ready(Ok(())),
-            McStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            McStream::Encrypted(s) => Pin::new(s).poll_shutdown(cx),
+        match &mut self.get_mut().kind {
+            McStreamKind::Empty => Poll::Ready(Ok(())),
+            McStreamKind::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            McStreamKind::Encrypted(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -261,7 +342,7 @@ pub struct ClientConnection {
 impl ClientConnection {
     pub fn new(stream: TcpStream, addr: SocketAddr, state: Arc<ProxyState>) -> Self {
         Self {
-            stream: McStream::Plain(stream),
+            stream: McStream::plain(stream),
             addr,
             state,
             conn_state: ConnectionState::Handshaking,
@@ -271,21 +352,141 @@ impl ClientConnection {
         }
     }
 
+    /// Top-level entry: drive the connection through handshake →
+    /// status/login → play, and **always** kick the client gracefully
+    /// before returning when something fails mid-way. Without this
+    /// wrapper, an early `?` would drop the TCP socket with no
+    /// disconnect packet — modern clients show "Connection reset"
+    /// instead of the actual reason.
     pub async fn run(mut self) -> Result<(), ConnectionError> {
+        let result = self.run_inner().await;
+        if let Err(ref e) = result {
+            self.send_graceful_kick(e).await;
+        }
+        result
+    }
+
+    /// Send a state-appropriate Disconnect packet describing `err` to
+    /// the client, then return. Errors during the kick itself are
+    /// swallowed — we're already on the way out.
+    ///
+    /// Behaviour depends on the current `conn_state`:
+    ///   * `Login` / `Configuration` → LoginDisconnect (login state).
+    ///   * `Play`                    → play-state Disconnect.
+    ///   * `Status` / `Handshaking`  → silent; the wire spec has no
+    ///                                 disconnect packet for these.
+    ///
+    /// Errors that mean "the client already left" (`ConnectionError::Closed`,
+    /// any `Io` error) are also silent — there's nobody to talk to.
+    async fn send_graceful_kick(&mut self, err: &ConnectionError) {
+        if matches!(err, ConnectionError::Closed | ConnectionError::Io(_)) {
+            return;
+        }
+        let reason = match err {
+            ConnectionError::Auth(msg) => msg.clone(),
+            other => other.to_string(),
+        };
+        // Modern clients want a chat-component JSON; pre-netty wants a
+        // raw string. `send_disconnect_login` / `send_play_disconnect`
+        // both branch on `is_pre_netty_proto` and emit the right shape.
+        let json = serde_json::json!({
+            "text": format!("Disconnected: {}", reason),
+            "color": "red",
+        })
+        .to_string();
+        match self.conn_state {
+            ConnectionState::Login | ConnectionState::Configuration => {
+                let _ = self.send_disconnect_login(&json).await;
+            },
+            ConnectionState::Play => {
+                let _ = self.send_play_disconnect(&json).await;
+            },
+            ConnectionState::Status | ConnectionState::Handshaking => {
+                // No disconnect packet exists in these states.
+            },
+        }
+    }
+
+    async fn run_inner(&mut self) -> Result<(), ConnectionError> {
         if self.state.config.proxy.proxy_protocol {
-            match crate::net::proxy_protocol::read_proxy_header(&mut self.stream, self.addr).await {
-                Ok(real_addr) => {
-                    tracing::debug!(original = %self.addr, real = %real_addr, "parsed proxy protocol header");
-                    self.addr = real_addr;
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to parse proxy protocol header");
-                    return Err(e);
-                },
+            if self.state.config.proxy.proxy_protocol_optional {
+                // Optional mode: try to parse PROXY header, fall back to direct connection
+                match crate::net::proxy_protocol::read_proxy_header_optional(&mut self.stream).await
+                {
+                    Ok(crate::net::proxy_protocol::ProxyHeaderResult::Found(real_addr)) => {
+                        tracing::debug!(original = %self.addr, real = %real_addr, "parsed PROXY protocol header");
+                        self.addr = real_addr;
+                    },
+                    Ok(crate::net::proxy_protocol::ProxyHeaderResult::NotFound(_bytes)) => {
+                        tracing::debug!("No PROXY header detected, using direct connection");
+                        // Bytes are consumed but would need to be handled for the handshake
+                        // For now, we'll proceed with the direct address
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse PROXY protocol header");
+                        return Err(e);
+                    },
+                }
+            } else {
+                // Strict mode: PROXY header is required
+                match crate::net::proxy_protocol::read_proxy_header(&mut self.stream, self.addr)
+                    .await
+                {
+                    Ok(real_addr) => {
+                        tracing::debug!(original = %self.addr, real = %real_addr, "parsed proxy protocol header");
+                        self.addr = real_addr;
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse proxy protocol header");
+                        return Err(e);
+                    },
+                }
             }
         }
 
-        self.state.metrics.record_connection();
+        // Metrics bookkeeping (connection / disconnection / failed)
+        // is owned by `proxy::accept_loop` — single accounting
+        // layer, no double counting on either the happy path or
+        // any of the early-return error paths below.
+
+        // Legacy 0xFE-ping detection.
+        //
+        // Pre-1.7 clients send a single raw 0xFE byte (the
+        // pre-netty server-list-ping packet) before any handshake.
+        // Modern clients start with a varint-length-prefixed
+        // handshake whose first byte is the *length*, never 0xFE
+        // for any reasonable handshake (lengths fit in one byte, so
+        // the byte equals the length — typically 15–30).
+        //
+        // We peek a single raw byte. If it's 0xFE, dispatch to the
+        // legacy handler (which expects to read more 0xFE-style
+        // payload itself). Otherwise push the byte back into the
+        // stream's prefix buffer so the modern handshake parser
+        // sees the full length-prefixed frame.
+        let mut peek = [0u8; 1];
+        let peek_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut peek),
+        )
+        .await;
+        match peek_result {
+            Ok(Ok(_)) => {},
+            Ok(Err(_)) | Err(_) => {
+                return Err(ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection timed out",
+                )));
+            },
+        }
+
+        if peek[0] == 0xFE {
+            tracing::debug!("detected legacy 0xFE ping from pre-1.7 client");
+            return self.handle_legacy_ping().await;
+        }
+
+        // Push the peeked byte back so the modern handshake parser
+        // reads it as part of the length varint.
+        self.stream.push_prefix(&peek);
 
         let handshake = match tokio::time::timeout(
             tokio::time::Duration::from_secs(10),
@@ -294,12 +495,8 @@ impl ClientConnection {
         .await
         {
             Ok(Ok(h)) => h,
-            Ok(Err(e)) => {
-                self.state.metrics.record_failed_connection();
-                return Err(e);
-            },
+            Ok(Err(e)) => return Err(e),
             Err(_) => {
-                self.state.metrics.record_failed_connection();
                 return Err(ConnectionError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "handshake timed out",
@@ -330,17 +527,18 @@ impl ClientConnection {
             _ => Err(ConnectionError::Closed),
         };
 
-        self.state.metrics.record_disconnection();
-        if result.is_err() {
-            self.state.metrics.record_failed_connection();
-        }
+        // accept_loop calls record_disconnection / record_failed_connection
+        // based on this return value — don't double-count here.
         result
     }
 
     async fn read_packet<T: Decode + PacketId>(&mut self) -> Result<T, ConnectionError> {
         let mut bytes =
             crate::packet_io::read_packet(&mut self.stream, self.compression_threshold).await?;
-        let _id = VarInt::decode(&mut bytes)?;
+        let _ = VarInt::decode(&mut bytes)?;
+        // Per-player metrics are recorded in the relay loop where a UUID is
+        // already known — during the handshake/login phase the connection
+        // isn't yet associated with a player.
         Ok(T::decode(&mut bytes)?)
     }
 
@@ -371,12 +569,51 @@ impl ClientConnection {
         let _id = read_varint(&mut self.stream).await?;
 
         let cached = self.state.cached_status.load();
-        let json = [
-            r#"{"version":{"name":"Koja","protocol":"#,
-            &self.protocol_version.to_string(),
-            &cached.suffix,
-        ]
-        .join("");
+
+        // Fire ServerListPing event to allow plugins to customize the player sample
+        let online_players = self.state.sessions.len();
+        let max_players = self.state.config.proxy.max_players;
+
+        use kojacoord_plugin_system::api::PluginEvent;
+        let plugin_responses = self
+            .state
+            .plugin_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .broadcast_event(&PluginEvent::ServerListPing {
+                max_players,
+                online_players,
+                sample: Vec::new(),
+            });
+
+        // Check if any plugin customized the player sample
+        let custom_sample = plugin_responses.iter().find_map(|r| {
+            if let kojacoord_plugin_system::api::PluginResponse::UpdatePlayerSample { sample } = r {
+                Some(sample.clone())
+            } else {
+                None
+            }
+        });
+
+        // Build the JSON response with custom sample if provided
+        let json = if let Some(sample) = custom_sample {
+            let sample_json = sample
+                .iter()
+                .map(|p| format!(r#"{{"name":"{}","uuid":"{}"}}"#, p.name, p.uuid))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                r#"{{"version":{{"name":"Koja","protocol":"{}"}},"players":{{"max":{},"online":{},"sample":[{}]}}{}}}"#,
+                self.protocol_version, max_players, online_players, sample_json, cached.suffix
+            )
+        } else {
+            [
+                r#"{"version":{"name":"Koja","protocol":"#,
+                &self.protocol_version.to_string(),
+                &cached.suffix,
+            ]
+            .join("")
+        };
 
         self.write_packet(&ClientboundStatusResponse {
             json_response: json,
@@ -390,17 +627,47 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// Handle legacy 0xFE ping from pre-1.7/1.6.x clients.
+    /// These clients use a completely different protocol without varint framing.
+    async fn handle_legacy_ping(&mut self) -> Result<(), ConnectionError> {
+        let cached = self.state.cached_status.load();
+        let json = format!(
+            r#"{{"version":{{"name":"Koja","protocol":"{}"}}{}}}"#,
+            78, // 1.6.4 protocol
+            cached.suffix
+        );
+
+        let legacy_motd = ClientboundLegacyMotd::from_json(&json);
+        let response = legacy_motd.encode_legacy();
+
+        // Write the legacy response directly to the stream
+        use tokio::io::AsyncWriteExt;
+        self.stream
+            .write_all(&response)
+            .await
+            .map_err(ConnectionError::Io)?;
+        self.stream.flush().await.map_err(ConnectionError::Io)?;
+
+        tracing::debug!("sent legacy 0xFE ping response to pre-1.7 client");
+        Ok(())
+    }
+
     async fn handle_login(
         &mut self,
         original_host: String,
     ) -> Result<SharedSession, ConnectionError> {
-        let login_start = match tokio::time::timeout(
+        // Read LoginStart as raw bytes so we can parse the trailing UUID for
+        // modern (1.19.3+) clients out of the *same* packet.  Reading a second
+        // packet (as the old code did) deadlocks because the client doesn't
+        // send anything until it receives EncryptionRequest / LoginSuccess.
+        // See https://minecraft.wiki/w/Java_Edition_protocol/Packets#Login_Start
+        let raw_login_start = match tokio::time::timeout(
             tokio::time::Duration::from_secs(10),
-            self.read_packet::<ServerboundLoginStart>(),
+            self.read_raw_packet_bytes(),
         )
         .await
         {
-            Ok(Ok(pkt)) => pkt,
+            Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(ConnectionError::Io(std::io::Error::new(
@@ -409,26 +676,18 @@ impl ClientConnection {
                 )))
             },
         };
-        let username = login_start.username.clone();
 
-        // The UUID field in LoginStart appeared in 1.19.3 (proto 761) as an
-        // optional `(bool, Option<UUID>)`, and became mandatory in 1.20.2
-        // (proto 764). These feature boundaries don't align with epoch
-        // boundaries (1.20 / 1.20.1 are inside the V1_20_4 canonical bucket
-        // but still use the optional form), so we compare wire IDs via the
-        // named `ProtocolVersion` constants rather than canonical buckets.
-        let proto_id = self.protocol_version;
-        let client_uuid = if proto_id >= ProtocolVersion::V1_19_3.id() {
-            let mut cursor = self.read_raw_packet_bytes().await?;
+        let mut cursor = raw_login_start;
+        let _pkt_id = VarInt::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
+        let username = String::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
 
-            let _ = VarInt::decode(&mut cursor).ok();
-            let _ = String::decode(&mut cursor).ok();
-
+        let pv = nearest(self.protocol_version);
+        let client_uuid = if pv.has_login_start_uuid() {
             let uuid_decode_err = || ConnectionError::Auth("failed to decode client UUID".into());
 
-            // 1.20 (763) is the last version with the optional encoding;
-            // 1.20.2 (764) and later send the UUID unconditionally.
-            if proto_id < ProtocolVersion::V1_20_2.id() {
+            // 1.19.3 (761) … 1.20.1 (763): optional UUID with a bool prefix.
+            // 1.20.2+ (764+): UUID is mandatory and inlined.
+            if !pv.has_mandatory_login_start_uuid() {
                 let has_uuid = bool::decode(&mut cursor).unwrap_or(false);
                 if has_uuid {
                     let hi = i64::decode(&mut cursor).ok().ok_or_else(uuid_decode_err)? as u64;
@@ -615,6 +874,8 @@ impl ClientConnection {
             }
         }
 
+        self.check_properties_sig(&properties)?;
+
         self.send_login_success(uuid, &username, &properties)
             .await?;
 
@@ -650,9 +911,53 @@ impl ClientConnection {
             locale: None,
             view_distance: None,
             rank,
+            cookies: crate::cookies_transfers::CookieStore::default(),
         }));
 
         self.state.sessions.insert(uuid, session.clone());
+
+        // Register player for metrics tracking. Returns an Arc handle so
+        // the relay can record per-packet stats with a single atomic
+        // increment (no lock taken on the hot path).
+        let _player_metrics_handle = self.state.player_metrics.register_player(uuid);
+
+        // Send resource pack if configured
+        if let (Some(url), Some(hash)) = (
+            &self.state.config.proxy.resource_pack_url,
+            &self.state.config.proxy.resource_pack_hash,
+        ) {
+            use crate::resource_pack::{build_resource_pack_packet, should_send_resource_pack};
+
+            if should_send_resource_pack(
+                &self.state.config.proxy.resource_pack_url,
+                &self.state.config.proxy.resource_pack_hash,
+            ) {
+                match build_resource_pack_packet(
+                    url,
+                    hash,
+                    self.state.config.proxy.resource_pack_required,
+                    self.state.config.proxy.resource_pack_prompt.as_deref(),
+                    self.protocol_version,
+                ) {
+                    Ok(packet) => {
+                        if let Err(e) = crate::packet_io::write_packet(
+                            &mut self.stream,
+                            &packet,
+                            self.compression_threshold,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "Failed to send resource pack");
+                        } else {
+                            tracing::debug!(url = %url, "Sent resource pack to player");
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to build resource pack packet");
+                    },
+                }
+            }
+        }
 
         // Notify plugins that a player joined. A plugin may veto the join by
         // returning a KickPlayer response for this player.
@@ -708,6 +1013,10 @@ impl ClientConnection {
             },
         };
 
+        // Now in play state — any error from here on triggers a
+        // play-state Disconnect via `send_graceful_kick`.
+        self.conn_state = ConnectionState::Play;
+
         // Relay loop. A normal relay session ends in `Disconnected`; a
         // selector/command Connect ends in `Switch`, where we move the player to
         // the requested backend via limbo and relay against the new connection
@@ -748,11 +1057,70 @@ impl ClientConnection {
                         },
                     }
                 },
+                Ok(crate::relay::RelayExit::BackendKicked {
+                    client_stream,
+                    reason,
+                }) => {
+                    tracing::info!(
+                        reason = %reason,
+                        "backend kicked player — falling back to limbo"
+                    );
+                    self.stream = client_stream;
+                    // Send the kick reason as a system chat message
+                    // so the player understands why they ended up
+                    // in limbo. Best-effort: ignore failures.
+                    let chat_text = format!(
+                        "You were kicked from the server: {}",
+                        crate::packet_builder::plaintext_from_chat_json(&reason)
+                    );
+                    let raw = crate::packet_builder::build_system_message_packet(
+                        &chat_text,
+                        self.protocol_version,
+                    );
+                    let _ = crate::packet_io::write_packet(
+                        &mut self.stream,
+                        &raw,
+                        self.compression_threshold,
+                    )
+                    .await;
+
+                    // Pick a fallback target. Prefer the routing rules'
+                    // current choice; if that's unavailable the limbo
+                    // inside switch_to_server will keep us connected
+                    // until something comes back.
+                    let fallback_target = self
+                        .state
+                        .routing
+                        .select(&self.state.server_registry)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+
+                    match self
+                        .switch_to_server(
+                            &fallback_target,
+                            session.clone(),
+                            &username,
+                            &original_host,
+                            uuid,
+                        )
+                        .await
+                    {
+                        Ok((new_backend, new_threshold)) => {
+                            backend = new_backend;
+                            backend_threshold = new_threshold;
+                            continue;
+                        },
+                        Err(e) => break Err(e),
+                    }
+                },
                 Err(e) => break Err(e),
             }
         };
 
         self.state.sessions.remove(&uuid);
+
+        // Unregister player from metrics tracking
+        self.state.player_metrics.unregister_player(uuid).await;
 
         // Notify plugins that the player left (fire-and-forget).
         let _ = self
@@ -782,6 +1150,61 @@ impl ClientConnection {
         Ok(session)
     }
 
+    /// Verifies that player profile properties (textures, capes, etc.) are signed by Mojang.
+    ///
+    /// This security check ensures that the properties sent during login are authentic
+    /// by verifying their RSA signatures against Mojang's public key. If any property
+    /// signature is invalid or missing, the player is kicked to prevent spoofed profiles.
+    ///
+    /// # Arguments
+    /// * `properties` - The profile properties received from the auth server
+    ///
+    /// # Returns
+    /// * `Ok(())` if all signatures are valid
+    /// * `Err(ConnectionError::Auth)` if verification fails, kicking the player
+    fn check_properties_sig(
+        &self,
+        properties: &[kojacoord_auth::ProfileProperty],
+    ) -> Result<(), ConnectionError> {
+        let mojang_public_key_der = BASE64_STANDARD
+            .decode(self.state.config.proxy.mojang_public_key.trim())
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to decode mojang_public_key from base64 config");
+                ConnectionError::Auth("Failed to decode Mojang public key".into())
+            })?;
+
+        let mojang_public_key = RsaPublicKey::from_public_key_der(&mojang_public_key_der)
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to parse Mojang public key DER");
+                ConnectionError::Auth("Failed to parse Mojang public key".into())
+            })?;
+
+        for property in properties {
+            if let Some(signature) = &property.signature {
+                let signature_bytes = BASE64_STANDARD
+                    .decode(signature.trim())
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, property = %property.name, "Failed to decode signature from base64");
+                        return Err(ConnectionError::Auth("Invalid property signature encoding".into()));
+                    })?;
+
+                mojang_public_key
+                    .verify(
+                        Pkcs1v15Encrypt,
+                        Sha256::new(),
+                        property.value.as_bytes(),
+                        &signature_bytes,
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, property = %property.name, "Property signature verification failed");
+                        ConnectionError::Auth("Properties not signed properly. Please restart your game.".into())
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Move an in-play player to `target` without dropping the connection:
     /// reset the client into limbo (which transitions its world), then connect,
     /// handshake and complete login against the chosen backend. Returns the new
@@ -796,9 +1219,8 @@ impl ClientConnection {
     ) -> Result<(TcpStream, i32), ConnectionError> {
         let props = session.read().await.properties.clone();
 
-        // Hold the player in limbo while we (re)connect. The limbo handler sends
-        // a fresh JoinGame + Respawn, which resets the client's world so the new
-        // backend feels like a clean server switch.
+        // Hold the player in limbo while we (re)connect. The limbo handler sends a
+        // fresh JoinGame + Respawn, which resets the client's world so the new
 
         let mut limbo = crate::limbo::LimboHandler::new(
             &mut self.stream,
@@ -818,8 +1240,11 @@ impl ClientConnection {
             .as_ref()
             .map(|b| b.backend_type.clone())
             .unwrap_or_default();
+        let server_compression = server
+            .as_ref()
+            .map(|s| s.compression_threshold)
+            .unwrap_or(0);
 
-        let backend_protocol = self.backend_handshake_protocol(Some(target));
         self.send_backend_handshake(
             &mut backend,
             original_host,
@@ -828,10 +1253,13 @@ impl ClientConnection {
             &props,
             &mode,
             &backend_type,
-            backend_protocol,
+            server_compression,
         )
         .await?;
-        let backend_threshold = self.complete_backend_login(&mut backend).await?;
+        let backend_protocol = self.backend_protocol_for(Some(target));
+        let backend_threshold = self
+            .complete_backend_login(&mut backend, backend_protocol, username, uuid, &props, &mode)
+            .await?;
 
         if let Some(b) = self.state.server_registry.get(target) {
             b.player_count.fetch_add(1, Ordering::Relaxed);
@@ -851,68 +1279,48 @@ impl ClientConnection {
         &mut self,
         threshold: i32,
     ) -> Result<(), ConnectionError> {
-        let proto = self.protocol_version;
-        let ver = nearest(proto);
-        let pid = cb_login(proto, "ClientboundSetCompression");
+        let ver = nearest(self.protocol_version);
         match ver.canonical_typed_packet_version() {
             CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8 => {
                 use kojacoord_protocol::versions::v1_8_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
             CanonicalVersion::V1_12_2 => {
                 use kojacoord_protocol::versions::v1_12_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
             CanonicalVersion::V1_16_5 => {
                 use kojacoord_protocol::versions::v1_16_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
             CanonicalVersion::V1_19_4 => {
                 use kojacoord_protocol::versions::v1_19_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
             CanonicalVersion::V1_20_4 => {
                 use kojacoord_protocol::versions::v1_20_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
             CanonicalVersion::V1_21 => {
                 use kojacoord_protocol::versions::v1_21_x::login::ClientboundSetCompression;
-                self.write_login_packet(
-                    ClientboundSetCompression {
-                        threshold: VarInt(threshold),
-                    },
-                    pid,
-                )
+                self.write_typed(ClientboundSetCompression {
+                    threshold: VarInt(threshold),
+                })
                 .await
             },
         }
@@ -925,160 +1333,39 @@ impl ClientConnection {
         properties: &[kojacoord_auth::ProfileProperty],
     ) -> Result<(), ConnectionError> {
         let proto = self.protocol_version;
-        let ver = nearest(proto);
-        let pid = cb_login(proto, "ClientboundLoginSuccess");
+        let canonical = nearest(proto).canonical_typed_packet_version();
         tracing::debug!(
             username,
             uuid = %uuid,
             protocol = proto,
-            packet_id = pid,
             "sending LoginSuccess"
         );
-        match ver.canonical_typed_packet_version() {
-            CanonicalVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_x::login::LoginRequestS2C;
-                self.write_login_packet(
-                    LoginRequestS2C {
-                        entity_id: 0,
-                        level_type: "default".to_string(),
-                        game_mode: 0,
-                        dimension: 0,
-                        difficulty: 0,
-                        world_height: 250,
-                        max_players: 20,
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginSuccess;
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginSuccess;
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_x::login::{
-                    ClientboundLoginSuccess, ProfileProperty,
-                };
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_string(),
-                        properties: properties
-                            .iter()
-                            .map(|p| ProfileProperty {
-                                name: p.name.clone(),
-                                value: p.value.clone(),
-                                signature: p.signature.clone(),
-                            })
-                            .collect(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_x::login::{
-                    ClientboundLoginSuccess, ProfileProperty,
-                };
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                        properties: properties
-                            .iter()
-                            .map(|p| ProfileProperty {
-                                name: p.name.clone(),
-                                value: p.value.clone(),
-                                signature: p.signature.clone(),
-                            })
-                            .collect(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_x::login::{
-                    ClientboundLoginSuccess, ProfileProperty,
-                };
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                        properties: properties
-                            .iter()
-                            .map(|p| ProfileProperty {
-                                name: p.name.clone(),
-                                value: p.value.clone(),
-                                signature: p.signature.clone(),
-                            })
-                            .collect(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_x::login::{
-                    ClientboundLoginSuccess, ProfileProperty,
-                };
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                        properties: properties
-                            .iter()
-                            .map(|p| ProfileProperty {
-                                name: p.name.clone(),
-                                value: p.value.clone(),
-                                signature: p.signature.clone(),
-                            })
-                            .collect(),
-                        strict_error_handling: true,
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21_x::login::{
-                    ClientboundLoginSuccess, ProfileProperty,
-                };
-                self.write_login_packet(
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username: username.to_owned(),
-                        properties: properties
-                            .iter()
-                            .map(|p| ProfileProperty {
-                                name: p.name.clone(),
-                                value: p.value.clone(),
-                                signature: p.signature.clone(),
-                            })
-                            .collect(),
-                    },
-                    pid,
-                )
-                .await
-            },
+        // 1.6.4 pre-netty has a completely different `LoginRequestS2C`
+        // shape — handle it separately. Every other canonical version
+        // routes through the modern login_packets builder.
+        if matches!(canonical, CanonicalVersion::V1_6_4) {
+            use kojacoord_protocol::versions::v1_6_x::login::LoginRequestS2C;
+            return self
+                .write_typed(LoginRequestS2C {
+                    entity_id: 0,
+                    level_type: "default".to_string(),
+                    game_mode: 0,
+                    dimension: 0,
+                    difficulty: 0,
+                    world_height: 250,
+                    max_players: 20,
+                })
+                .await;
+        }
+        let profile = crate::login_packets::LoginProfile {
+            uuid,
+            username,
+            properties,
+        };
+        if let Some(pkt) = crate::login_packets::build_login_success(canonical, proto, &profile) {
+            self.write_raw_login_packet(pkt).await
+        } else {
+            Ok(())
         }
     }
 
@@ -1088,98 +1375,18 @@ impl ClientConnection {
         verify_token: &[u8],
     ) -> Result<(), ConnectionError> {
         let proto = self.protocol_version;
-        let ver = nearest(proto);
-        let pid = cb_login(proto, "ClientboundEncryptionRequest");
-        match ver.canonical_typed_packet_version() {
-            CanonicalVersion::V1_6_4 => Ok(()),
-            CanonicalVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                        should_authenticate: true,
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                        should_authenticate: true,
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                        should_authenticate: true,
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21_x::login::ClientboundEncryptionRequest;
-                self.write_login_packet(
-                    ClientboundEncryptionRequest {
-                        server_id: "".to_string(),
-                        public_key: der_public_key.to_vec(),
-                        verify_token: verify_token.to_vec(),
-                        should_authenticate: true,
-                    },
-                    pid,
-                )
-                .await
-            },
+        let canonical = nearest(proto).canonical_typed_packet_version();
+        let built = crate::login_packets::build_encryption_request(
+            canonical,
+            proto,
+            "",
+            der_public_key,
+            verify_token,
+        );
+        if let Some(pkt) = built {
+            self.write_raw_login_packet(pkt).await
+        } else {
+            Ok(())
         }
     }
 
@@ -1196,89 +1403,26 @@ impl ClientConnection {
 
     async fn send_disconnect_login(&mut self, reason_json: &str) -> Result<(), ConnectionError> {
         let proto = self.protocol_version;
-        let ver = nearest(proto);
-        let pid = cb_login(proto, "ClientboundLoginDisconnect");
-        match ver.canonical_typed_packet_version() {
-            CanonicalVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
-            CanonicalVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginDisconnect;
-                self.write_login_packet(
-                    ClientboundLoginDisconnect {
-                        reason: reason_json.to_owned(),
-                    },
-                    pid,
-                )
-                .await
-            },
+        let canonical = nearest(proto).canonical_typed_packet_version();
+        // 1.6.x has no login state and no JSON chat. Kick goes out as
+        // packet 0xFF with a single UCS-2 length-prefixed string, sent
+        // raw without the modern varint frame.
+        if crate::packet_io::is_pre_netty_proto(proto) {
+            use kojacoord_protocol::versions::v1_6_x::login::ClientboundLoginDisconnect;
+            let plaintext = crate::packet_builder::plaintext_from_chat_json(reason_json);
+            let pkt = ClientboundLoginDisconnect { reason: plaintext };
+            let mut body = BytesMut::new();
+            body.put_u8(0xFF);
+            pkt.encode(&mut body)?;
+            crate::packet_io::write_legacy_bytes(&mut self.stream, &body).await?;
+            return Ok(());
+        }
+        if let Some(pkt) =
+            crate::login_packets::build_login_disconnect(canonical, proto, reason_json)
+        {
+            self.write_raw_login_packet(pkt).await
+        } else {
+            Ok(())
         }
     }
 
@@ -1374,7 +1518,10 @@ impl ClientConnection {
 
         let fwd_host = original_host.to_owned();
 
-        let backend_opt = self.state.routing.select(&self.state.server_registry);
+        let backend_opt = self
+            .state
+            .routing
+            .select_with_region(&self.state.server_registry, Some(self.addr.ip()));
 
         match backend_opt {
             Some(b) => {
@@ -1392,7 +1539,7 @@ impl ClientConnection {
 
                         let mode = self.effective_forwarding_mode(b.forwarding_override.clone());
                         let backend_type = b.backend_type.clone();
-                        let backend_protocol = self.backend_handshake_protocol(Some(&server_name));
+                        let server_compression = b.compression_threshold;
                         if let Err(e) = self
                             .send_backend_handshake(
                                 &mut conn,
@@ -1402,7 +1549,7 @@ impl ClientConnection {
                                 &props,
                                 &mode,
                                 &backend_type,
-                                backend_protocol,
+                                server_compression,
                             )
                             .await
                         {
@@ -1416,7 +1563,11 @@ impl ClientConnection {
                                 .run_limbo_then_connect(username, session, &fwd_host, uuid)
                                 .await;
                         }
-                        match self.complete_backend_login(&mut conn).await {
+                        let backend_protocol = self.backend_protocol_for(Some(&server_name));
+                        match self
+                            .complete_backend_login(&mut conn, backend_protocol, username, uuid, &props, &mode)
+                            .await
+                        {
                             Ok(backend_threshold) => {
                                 b.player_count.fetch_add(1, Ordering::Relaxed);
                                 session.write().await.current_server = Some(server_name.clone());
@@ -1475,7 +1626,10 @@ impl ClientConnection {
             self.ml_session.kind,
         );
         let mut backend = limbo.run().await?;
-        let selected_server = self.state.routing.select(&self.state.server_registry);
+        let selected_server = self
+            .state
+            .routing
+            .select_with_region(&self.state.server_registry, Some(self.addr.ip()));
         let mode = self.effective_forwarding_mode(
             selected_server
                 .as_ref()
@@ -1485,8 +1639,10 @@ impl ClientConnection {
             .as_ref()
             .map(|b| b.backend_type.clone())
             .unwrap_or_default();
-        let backend_protocol =
-            self.backend_handshake_protocol(selected_server.as_ref().map(|b| b.name.as_str()));
+        let server_compression = selected_server
+            .as_ref()
+            .map(|s| s.compression_threshold)
+            .unwrap_or(0);
         self.send_backend_handshake(
             &mut backend,
             fwd_host,
@@ -1495,11 +1651,15 @@ impl ClientConnection {
             &props,
             &mode,
             &backend_type,
-            backend_protocol,
+            server_compression,
         )
         .await?;
-        let backend_threshold = self.complete_backend_login(&mut backend).await?;
-        if let Some(b) = self.state.routing.select(&self.state.server_registry) {
+        let backend_protocol =
+            self.backend_protocol_for(selected_server.as_ref().map(|b| b.name.as_str()));
+        let backend_threshold = self
+            .complete_backend_login(&mut backend, backend_protocol, username, uuid, &props, &mode)
+            .await?;
+        if let Some(b) = selected_server.as_ref() {
             b.player_count.fetch_add(1, Ordering::Relaxed);
             session.write().await.current_server = Some(b.name.clone());
             tracing::info!(
@@ -1529,14 +1689,19 @@ impl ClientConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Computes the protocol version we should advertise to the backend in the
-    /// handshake. When the converter is active (client speaks a version the
-    /// backend does not), we spoof this to the backend's expected version so
-    /// the backend does not respond with "Outdated client / server" disconnect.
-    fn backend_handshake_protocol(&self, target_server: Option<&str>) -> u32 {
-        let client_proto = self.protocol_version;
-        let lobby_name = self.state.config.proxy.lobby_server_name.clone();
-        let is_lobby = target_server.map(|n| n == lobby_name).unwrap_or(false);
+    /// Resolve the backend protocol the proxy expects to be speaking on the
+    /// wire to the named target server. Used so login/encryption-request
+    /// rewrites pick the right wire shape rather than blindly using the
+    /// client's protocol. Falls back to:
+    ///   * the lobby's configured `lobby_server_protocol` for the lobby
+    ///   * the per-server `backend_protocol` if configured
+    ///   * 1.12.2 (340) for V1_7 / V1_8 epoch clients with no explicit override
+    ///   * the client's own protocol otherwise
+    fn backend_protocol_for(&self, target_server: Option<&str>) -> u32 {
+        let lobby_name = &self.state.config.proxy.lobby_server_name;
+        let is_lobby = target_server
+            .map(|name| name == lobby_name.as_str())
+            .unwrap_or(false);
 
         if is_lobby {
             return self.state.config.proxy.lobby_server_protocol;
@@ -1548,17 +1713,10 @@ impl ClientConnection {
                 }
             }
         }
-        // Legacy clients (1.7.x, 1.8.x canonical buckets) default to 1.12.2
-        // (340) backend when no explicit override is configured — mirrors the
-        // start_relay logic.
-        let client_canonical = nearest(client_proto).canonical_typed_packet_version();
-        if matches!(
-            client_canonical,
-            CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
-        ) {
-            return ProtocolVersion::V1_12_2.id();
+        match nearest(self.protocol_version).epoch() {
+            Epoch::V1_7 | Epoch::V1_8 => ProtocolVersion::V1_12_2.id(),
+            _ => self.protocol_version,
         }
-        client_proto
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1571,16 +1729,9 @@ impl ClientConnection {
         properties: &[kojacoord_auth::ProfileProperty],
         mode: &kojacoord_config::ForwardingMode,
         backend_type: &kojacoord_config::BackendType,
-        backend_protocol: u32,
+        _server_compression: i32,
     ) -> Result<(), ConnectionError> {
-        let proto = backend_protocol;
-        if proto != self.protocol_version {
-            tracing::debug!(
-                client_proto = self.protocol_version,
-                backend_proto = proto,
-                "spoofing handshake protocol_version for backend"
-            );
-        }
+        let proto = self.protocol_version;
 
         let clean_host = server_address
             .split('\0')
@@ -1600,27 +1751,39 @@ impl ClientConnection {
             _ => "",
         };
 
-        let handshake_address = if matches!(mode, kojacoord_config::ForwardingMode::Bungeecord) {
-            let profile = kojacoord_auth::AuthenticatedProfile {
-                id: uuid,
-                name: username.to_string(),
-                properties: properties.to_vec(),
-            };
-            let suffix = bungeecord_suffix(&self.addr.ip(), &profile).map_err(|e| {
-                ConnectionError::Auth(format!("Failed to create Bungeecord suffix: {}", e))
-            })?;
-            let base = format!("{}{}", clean_host, suffix);
-            if is_forge_like {
-                format!("{}{}", base, fml_marker)
-            } else {
-                base
-            }
-        } else {
-            if is_forge_like {
-                modloader::apply_fml_marker(&clean_host, self.ml_session.kind)
-            } else {
-                clean_host
-            }
+        let handshake_address = match mode {
+            kojacoord_config::ForwardingMode::Bungeecord => {
+                let profile = kojacoord_auth::AuthenticatedProfile {
+                    id: uuid,
+                    name: username.to_string(),
+                    properties: properties.to_vec(),
+                };
+                let suffix = bungeecord_suffix(&self.addr.ip(), &profile).map_err(|e| {
+                    ConnectionError::Auth(format!("Failed to create Bungeecord suffix: {}", e))
+                })?;
+                let base = format!("{}{}", clean_host, suffix);
+                if is_forge_like {
+                    format!("{}{}", base, fml_marker)
+                } else {
+                    base
+                }
+            },
+            kojacoord_config::ForwardingMode::Velocity => {
+                // Velocity modern forwarding uses a plugin message instead of
+                // modifying the handshake address. The handshake uses the clean host.
+                if is_forge_like {
+                    modloader::apply_fml_marker(&clean_host, self.ml_session.kind)
+                } else {
+                    clean_host
+                }
+            },
+            kojacoord_config::ForwardingMode::None => {
+                if is_forge_like {
+                    modloader::apply_fml_marker(&clean_host, self.ml_session.kind)
+                } else {
+                    clean_host
+                }
+            },
         };
 
         tracing::debug!(
@@ -1656,10 +1819,24 @@ impl ClientConnection {
             let ls_id = sb_login(proto, "ServerboundLoginStart");
             let mut ls_payload = BytesMut::new();
             VarInt(ls_id as i32).encode(&mut ls_payload)?;
-            let ver = nearest(proto);
-            if matches!(
-                ver,
-                ProtocolVersion::V1_19_4 | ProtocolVersion::V1_20_4 | ProtocolVersion::V1_21
+            // LoginStart shape:
+            //   1.19.x (proto 759-762)  → username, Option<UUID>
+            //   1.20.2+ (proto 764+)    → username, mandatory UUID
+            //   1.20.0/1.20.1 (proto 763) → username, Option<UUID>
+            // The v1_19_x struct holds Option<UUID>; v1_20_x holds mandatory UUID.
+            let canonical = nearest(proto).canonical_typed_packet_version();
+            if matches!(canonical, CanonicalVersion::V1_19_4)
+                || (canonical == CanonicalVersion::V1_20_4 && proto < 764)
+            {
+                use kojacoord_protocol::versions::v1_19_x::login::ServerboundLoginStart;
+                ServerboundLoginStart {
+                    username: username.to_string(),
+                    uuid: Some(uuid),
+                }
+                .encode(&mut ls_payload)?;
+            } else if matches!(
+                canonical,
+                CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21
             ) {
                 use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginStart;
                 ServerboundLoginStart {
@@ -1667,7 +1844,7 @@ impl ClientConnection {
                     uuid,
                 }
                 .encode(&mut ls_payload)?;
-            } else if matches!(ver, ProtocolVersion::V1_16_5) {
+            } else if matches!(canonical, CanonicalVersion::V1_16_5) {
                 use kojacoord_protocol::versions::v1_16_x::login::ServerboundLoginStart;
                 ServerboundLoginStart {
                     username: username.to_string(),
@@ -1689,18 +1866,40 @@ impl ClientConnection {
     async fn complete_backend_login(
         &mut self,
         conn: &mut TcpStream,
+        backend_protocol: u32,
+        username: &str,
+        uuid: Uuid,
+        properties: &[kojacoord_auth::ProfileProperty],
+        mode: &kojacoord_config::ForwardingMode,
     ) -> Result<i32, ConnectionError> {
-        let proto = self.protocol_version;
+        let client_proto = self.protocol_version;
         let mut backend_threshold: i32 = NO_COMPRESSION;
 
-        let id_set_compression = cb_login(proto, "ClientboundSetCompression");
-        let id_login_success = cb_login(proto, "ClientboundLoginSuccess");
-        let id_login_plugin = cb_login(proto, "ClientboundLoginPluginRequest");
-        let id_login_plugin_sb = sb_login(proto, "ServerboundLoginPluginResponse");
-        let id_login_ack = sb_login(proto, "ServerboundLoginAcknowledged");
-        let id_cfg_ack = sb_config(proto, "AcknowledgeFinishConfiguration");
-        let id_login_disconnect = cb_login(proto, "ClientboundLoginDisconnect");
-        let id_encryption_request = cb_login(proto, "ClientboundEncryptionRequest");
+        // All IDs used to *read* packets coming from the backend must be
+        // looked up under the BACKEND's protocol (which is what the backend
+        // is speaking on the wire), not the client's. Same for the wire-shape
+        // we choose when decoding those packets. We only use the client's
+        // protocol when we need to forward something to the client.
+        // `backend_canonical` selects the right typed-packet module for
+        // decoding things the BACKEND sends (e.g. LoginSuccess wire shape).
+        // EncryptionRequest is shape-keyed off `Epoch::V1_7` vs everything
+        // else, so it works with the epoch helper directly.
+        let backend_canonical = nearest(backend_protocol).canonical_typed_packet_version();
+
+        // Determine if backend has configuration phase (needed for Velocity plugin message)
+        let backend_has_cfg = nearest(backend_protocol).has_configuration_phase();
+
+        let id_set_compression = cb_login(backend_protocol, "ClientboundSetCompression");
+        let id_login_success = cb_login(backend_protocol, "ClientboundLoginSuccess");
+        let id_login_plugin = cb_login(backend_protocol, "ClientboundLoginPluginRequest");
+        let id_login_plugin_sb = sb_login(backend_protocol, "ServerboundLoginPluginResponse");
+        let id_login_ack = sb_login(backend_protocol, "ServerboundLoginAcknowledged");
+        let id_cfg_ack = sb_config(backend_protocol, "AcknowledgeFinishConfiguration");
+        let id_login_disconnect = cb_login(backend_protocol, "ClientboundLoginDisconnect");
+        let id_encryption_request = cb_login(backend_protocol, "ClientboundEncryptionRequest");
+
+        // What we forward to the client uses the client's IDs.
+        let client_id_encryption_request = cb_login(client_proto, "ClientboundEncryptionRequest");
 
         loop {
             let pkt_bytes = crate::packet_io::read_packet(conn, backend_threshold)
@@ -1718,33 +1917,28 @@ impl ClientConnection {
             tracing::trace!(packet_id, backend_threshold, "backend login packet");
 
             if packet_id == id_encryption_request {
-                let ver = nearest(proto);
-                if matches!(ver, ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8) {
-                    use kojacoord_protocol::versions::v1_16_x::login::ClientboundEncryptionRequest;
-                    let pkt = ClientboundEncryptionRequest::decode(&mut cursor)
-                        .map_err(ConnectionError::Protocol)?;
+                let backend_epoch = nearest(backend_protocol).epoch();
+                let client_epoch = nearest(client_proto).epoch();
+                // The wire shape boundary for EncryptionRequest is Epoch::V1_7
+                // vs everything else — we only need to rewrite when those
+                // differ OR when the packet id differs between sides.
+                let shape_differs = backend_epoch != client_epoch;
+                let id_differs = backend_protocol != client_proto
+                    && id_encryption_request != client_id_encryption_request;
+                if shape_differs || id_differs {
+                    let (server_id, public_key, verify_token) =
+                        decode_encryption_request(backend_epoch, &mut cursor)
+                            .map_err(ConnectionError::Protocol)?;
 
                     let mut new_payload = BytesMut::new();
-                    VarInt(id_encryption_request as i32).encode(&mut new_payload)?;
-
-                    if matches!(ver, ProtocolVersion::V1_7_10) {
-                        use kojacoord_protocol::versions::v1_7_x::login::ClientboundEncryptionRequest as V1_7_Enc;
-                        let client_pkt = V1_7_Enc {
-                            server_id: pkt.server_id,
-                            public_key: pkt.public_key,
-                            verify_token: pkt.verify_token,
-                        };
-                        client_pkt.encode(&mut new_payload)?;
-                    } else {
-                        use kojacoord_protocol::versions::v1_8_x::login::ClientboundEncryptionRequest as V1_8_Enc;
-                        let client_pkt = V1_8_Enc {
-                            server_id: pkt.server_id,
-                            public_key: pkt.public_key,
-                            verify_token: pkt.verify_token,
-                        };
-                        client_pkt.encode(&mut new_payload)?;
-                    }
-
+                    VarInt(client_id_encryption_request as i32).encode(&mut new_payload)?;
+                    encode_encryption_request(
+                        client_epoch,
+                        &server_id,
+                        &public_key,
+                        &verify_token,
+                        &mut new_payload,
+                    )?;
                     crate::packet_io::write_packet(
                         &mut self.stream,
                         &new_payload,
@@ -1763,17 +1957,15 @@ impl ClientConnection {
                 tracing::debug!(threshold, "backend enabled compression");
             } else if packet_id == id_login_success {
                 tracing::debug!("backend sent LoginSuccess — login sequence complete");
-                // LoginSuccess wire shape changed across releases:
-                //   1.7.10 / 1.8: UUID-as-string + username
-                //   1.12.2:       UUID-bytes (16) + username
-                //   1.16.5:       same as 1.12.2 (codebase fork)
-                //   1.19+:        UUID-bytes + username + properties array
-                //   1.20.5/1.21+: + strict-error-handling bool
-                // Every CanonicalVersion gets its own decode so the cursor
-                // advances by the right amount; the previous code fell back to
-                // the v1_12_x shape for V1_16_5/V1_19_4/V1_20_4/V1_21 which
-                // under-read the body on 1.19+ and left bytes in the cursor.
-                match nearest(proto).canonical_typed_packet_version() {
+                // LoginSuccess wire shape changes per release:
+                //   1.7.x / 1.8: UUID-as-string + username
+                //   1.12.2:      UUID-bytes (16) + username
+                //   1.16.5:      same as 1.12.2 in this codebase
+                //   1.19+:       + properties array
+                //   1.20.5/1.21: + strict-error-handling bool
+                // Decode using the BACKEND's shape so the cursor advances the
+                // correct number of bytes.
+                match backend_canonical {
                     CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 => {
                         use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginSuccess;
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
@@ -1803,6 +1995,13 @@ impl ClientConnection {
                         let _ = ClientboundLoginSuccess::decode(&mut cursor);
                     },
                 }
+
+                // Velocity modern forwarding is a request/response flow
+                // driven by the backend's `LoginPluginRequest` — we
+                // respond inside the LoginPluginRequest handler below
+                // when the channel is `velocity:player_info`. By the
+                // time we see LoginSuccess that exchange has already
+                // happened (or the backend isn't asking for it).
                 break;
             } else if packet_id == id_login_plugin {
                 use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginPluginResponse;
@@ -1817,8 +2016,46 @@ impl ClientConnection {
                     "backend LoginPluginRequest"
                 );
 
-                if modloader::is_fml3_login_channel(&channel) {
-                    modloader::log_fml3_login_packet(&channel, &remaining, "S→C", proto);
+                if channel == "velocity:player_info"
+                    && matches!(mode, kojacoord_config::ForwardingMode::Velocity)
+                {
+                    // Backend (configured for Velocity modern forwarding)
+                    // is asking us to prove the player. Sign the player
+                    // info with the shared secret and reply via
+                    // LoginPluginResponse — this is the canonical Velocity
+                    // handshake. See <https://docs.papermc.io/velocity/security>.
+                    let secret = &self.state.config.forwarding.velocity_secret;
+                    if secret.is_empty() {
+                        tracing::warn!(
+                            "Velocity forwarding requested by backend but no secret configured"
+                        );
+                        let pkt = ServerboundLoginPluginResponse {
+                            message_id,
+                            data: vec![].into(),
+                        };
+                        let mut resp = BytesMut::new();
+                        VarInt(id_login_plugin_sb as i32).encode(&mut resp)?;
+                        pkt.encode(&mut resp)?;
+                        crate::packet_io::write_packet(conn, &resp, backend_threshold).await?;
+                    } else {
+                        let profile = kojacoord_auth::AuthenticatedProfile {
+                            id: uuid,
+                            name: username.to_string(),
+                            properties: properties.to_vec(),
+                        };
+                        let velocity_data = velocity_header(secret, &self.addr.ip(), &profile);
+                        let pkt = ServerboundLoginPluginResponse {
+                            message_id,
+                            data: velocity_data.into(),
+                        };
+                        let mut resp = BytesMut::new();
+                        VarInt(id_login_plugin_sb as i32).encode(&mut resp)?;
+                        pkt.encode(&mut resp)?;
+                        crate::packet_io::write_packet(conn, &resp, backend_threshold).await?;
+                        tracing::debug!("Velocity LoginPluginResponse sent to backend");
+                    }
+                } else if modloader::is_fml3_login_channel(&channel) {
+                    modloader::log_fml3_login_packet(&channel, &remaining, "S→C", backend_protocol);
 
                     let mut req_payload = BytesMut::new();
                     VarInt(id_login_plugin as i32).encode(&mut req_payload)?;
@@ -1894,18 +2131,13 @@ impl ClientConnection {
             }
         }
 
-        // Configuration phase was introduced in 1.20.2 (proto 764) — i.e.
-        // every CanonicalVersion >= V1_20_4. 1.19.x and 1.20/1.20.1 do not
-        // have it. The legacy gate of `V1_19_4 | V1_20_4 | V1_21` was both
-        // too broad (it included 1.19.4) and too narrow (would miss future
-        // canonical-version additions). We now route everything through the
-        // canonical bucket so subversion fallback is automatic.
-        let canonical = nearest(proto).canonical_typed_packet_version();
-        let has_config_phase = matches!(
-            canonical,
-            CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21
-        );
-        if has_config_phase {
+        // Configuration phase exists from 1.20.2 (proto 764) onward. We enter
+        // it only when BOTH sides speak it — otherwise the side that doesn't
+        // would never send/expect LoginAcknowledged. The sibling converter
+        // synthesises a fake FinishConfiguration when only one side has it.
+        // See https://minecraft.wiki/w/Java_Edition_protocol/Packets#Login_Acknowledged
+        let client_has_cfg = nearest(client_proto).has_configuration_phase();
+        if client_has_cfg && backend_has_cfg {
             {
                 let actual =
                     crate::packet_io::read_packet(&mut self.stream, self.compression_threshold)
@@ -1914,7 +2146,9 @@ impl ClientConnection {
                 let pkt_id = VarInt::decode(&mut cursor)
                     .map_err(ConnectionError::Protocol)?
                     .0 as u8;
-                let expected = sb_login(proto, "ServerboundLoginAcknowledged");
+                // The LoginAck *we read* came from the client, so look up its
+                // ID under the client's protocol.
+                let expected = sb_login(client_proto, "ServerboundLoginAcknowledged");
                 if pkt_id != expected {
                     tracing::warn!(
                         pkt_id,
@@ -1974,6 +2208,12 @@ impl ClientConnection {
 
         let mut buffered_for_client: Vec<Bytes> = Vec::new();
 
+        // Per-player rate limiting needs a UUID, but at this point in the
+        // config phase the connection isn't yet bound to a session. Leave
+        // the field as None — the rate limiter treats anonymous packets as
+        // an aggregated bucket.
+        let player_uuid: Option<uuid::Uuid> = None;
+
         loop {
             let raw_payload = crate::packet_io::read_packet(backend, backend_threshold).await?;
 
@@ -1994,15 +2234,7 @@ impl ClientConnection {
                 if modloader::is_neo_config_channel(&channel) {
                     modloader::log_neo_config_packet(&channel, &chan_data, "S→C", proto);
 
-                    // Strongest signal first: Quilt-specific channels always win,
-                    // even if we previously tagged the session as Fabric/Unknown,
-                    // because Quilt clients also advertise Fabric channels.
-                    if modloader::is_quilt_channel(&channel)
-                        && self.ml_session.kind != modloader::ModloaderKind::Quilt
-                    {
-                        tracing::debug!(channel = %channel, "promoted modloader to Quilt from config-phase channel");
-                        self.ml_session.kind = modloader::ModloaderKind::Quilt;
-                    } else if self.ml_session.kind == modloader::ModloaderKind::Unknown {
+                    if self.ml_session.kind == modloader::ModloaderKind::Unknown {
                         self.ml_session.kind = if channel.starts_with("neoforge:") {
                             tracing::debug!("detected NeoForge from config-phase channel");
                             modloader::ModloaderKind::NeoForge
@@ -2012,30 +2244,6 @@ impl ClientConnection {
                         } else {
                             self.ml_session.kind
                         };
-                    }
-
-                    // REGISTER bodies carry a NUL-separated list of every
-                    // channel the peer supports; scan that to catch Quilt even
-                    // when the channel name itself is the generic REGISTER
-                    // sentinel (Fabric/NeoForge/Quilt all use REGISTER for
-                    // their batched advertisements).
-                    if matches!(
-                        channel.as_str(),
-                        modloader::FABRIC_REGISTER
-                            | modloader::NEO_REGISTER
-                            | modloader::MC_REGISTER
-                            | modloader::QUILTED_FABRIC_API_REGISTER
-                    ) {
-                        if let Some(kind) = modloader::detect_kind_from_channel_list(&chan_data) {
-                            if kind == modloader::ModloaderKind::Quilt
-                                && self.ml_session.kind != modloader::ModloaderKind::Quilt
-                            {
-                                tracing::debug!(
-                                    "promoted modloader to Quilt via REGISTER channel list"
-                                );
-                                self.ml_session.kind = modloader::ModloaderKind::Quilt;
-                            }
-                        }
                     }
 
                     crate::packet_io::write_packet(&mut self.stream, &raw_payload, client_thresh)
@@ -2056,6 +2264,14 @@ impl ClientConnection {
                             "C→S",
                             proto,
                         );
+
+                        // Rate-limit plugin channel messages from client
+                        if let Some(uuid) = player_uuid {
+                            if !self.state.plugin_channel_rate_limiter.check(uuid).await {
+                                // Drop the packet silently (rate-limited)
+                                continue;
+                            }
+                        }
                     }
                     crate::packet_io::write_packet(backend, &resp_raw, backend_threshold).await?;
                 } else {
@@ -2121,41 +2337,14 @@ impl ClientConnection {
             .map(|name| name == lobby_name.as_str())
             .unwrap_or(false);
 
-        let backend_protocol = if is_lobby {
-            self.state.config.proxy.lobby_server_protocol
-        } else {
-            let server_protocol = self
-                .state
-                .config
-                .servers
-                .iter()
-                .find(|s| s.name == current_server.as_deref().unwrap_or(""))
-                .and_then(|s| {
-                    if s.backend_protocol > 0 {
-                        Some(s.backend_protocol)
-                    } else {
-                        None
-                    }
-                });
+        let backend_protocol = self.backend_protocol_for(current_server.as_deref());
 
-            let client_canonical = nearest(self.protocol_version).canonical_typed_packet_version();
-            if matches!(
-                client_canonical,
-                CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
-            ) {
-                // Legacy clients (1.7.x, 1.8.x) default to a 1.12.2 backend.
-                server_protocol.unwrap_or(ProtocolVersion::V1_12_2.id())
-            } else {
-                server_protocol.unwrap_or(self.protocol_version)
-            }
-        };
-
-        let client_canonical = nearest(self.protocol_version).canonical_typed_packet_version();
+        // Legacy clients always need conversion (their wire shape differs from
+        // every modern backend); other clients need it whenever the lobby's
+        // protocol doesn't match theirs. Epoch grouping makes "legacy" clean.
+        let client_epoch = nearest(self.protocol_version).epoch();
         let conversion_enabled = (is_lobby && backend_protocol != self.protocol_version)
-            || matches!(
-                client_canonical,
-                CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8
-            );
+            || matches!(client_epoch, Epoch::PreNetty | Epoch::V1_7 | Epoch::V1_8);
 
         if conversion_enabled {
             tracing::debug!(
@@ -2167,7 +2356,7 @@ impl ClientConnection {
         }
 
         PacketRelay {
-            client_stream: std::mem::replace(&mut self.stream, McStream::Empty),
+            client_stream: std::mem::replace(&mut self.stream, McStream::empty()),
             backend_stream: backend,
             session: session.clone(),
             state: Arc::clone(&self.state),
@@ -2194,4 +2383,101 @@ impl ClientConnection {
             .await?;
         Ok(())
     }
+
+    /// Send a typed clientbound packet whose id comes from the
+    /// `PacketId` trait impl on the packet type itself. This replaces
+    /// the older two-step `let pid = cb_login(proto, "Name"); write_login_packet(pkt, pid)`
+    /// pattern — no string-keyed registry lookup, no risk of typo'd
+    /// names, id resolves at compile time. Returns silently on the
+    /// `0xFF` sentinel (packet doesn't exist for this protocol).
+    async fn write_typed<P: Encode + PacketId>(&mut self, packet: P) -> Result<(), ConnectionError> {
+        let pid = P::packet_id(self.protocol_version);
+        if pid == 0xFF {
+            return Ok(());
+        }
+        self.write_login_packet(packet, pid).await
+    }
+
+    /// Write an already-encoded login-state packet (`id` + `body`)
+    /// from [`crate::login_packets`].
+    async fn write_raw_login_packet(
+        &mut self,
+        pkt: crate::login_packets::EncodedPacket,
+    ) -> Result<(), ConnectionError> {
+        let mut payload = BytesMut::new();
+        VarInt(pkt.id as i32).encode(&mut payload)?;
+        payload.extend_from_slice(&pkt.body);
+        crate::packet_io::write_packet(&mut self.stream, &payload, self.compression_threshold)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Decode a ClientboundEncryptionRequest using the wire shape of `epoch`.
+/// Returns (server_id, public_key bytes, verify_token bytes).
+///
+/// Per <https://minecraft.wiki/w/Java_Edition_protocol/Packets#Encryption_Request>:
+/// 1.7.x (`Epoch::V1_7`) — String + i16-prefixed bytes + i16-prefixed bytes
+/// 1.8+                  — String + VarInt-prefixed bytes + VarInt-prefixed bytes
+/// 1.20.5+               — same but with a trailing should_authenticate bool we discard.
+fn decode_encryption_request(
+    epoch: Epoch,
+    src: &mut Bytes,
+) -> Result<(String, Vec<u8>, Vec<u8>), kojacoord_protocol::ProtocolError> {
+    use bytes::Buf;
+    let server_id = String::decode(src)?;
+    if matches!(epoch, Epoch::V1_7) {
+        // i16-prefixed byte arrays (netty-era 1.7.x).
+        if src.remaining() < 2 {
+            return Err(kojacoord_protocol::ProtocolError::UnexpectedEof);
+        }
+        let pk_len = src.get_i16() as usize;
+        if src.remaining() < pk_len + 2 {
+            return Err(kojacoord_protocol::ProtocolError::UnexpectedEof);
+        }
+        let public_key = src.split_to(pk_len).to_vec();
+        let vt_len = src.get_i16() as usize;
+        if src.remaining() < vt_len {
+            return Err(kojacoord_protocol::ProtocolError::UnexpectedEof);
+        }
+        let verify_token = src.split_to(vt_len).to_vec();
+        Ok((server_id, public_key, verify_token))
+    } else {
+        // VarInt-prefixed byte arrays (1.8 onward — every epoch from V1_8 up).
+        let pk_len = VarInt::decode(src)?.0 as usize;
+        if src.remaining() < pk_len {
+            return Err(kojacoord_protocol::ProtocolError::UnexpectedEof);
+        }
+        let public_key = src.split_to(pk_len).to_vec();
+        let vt_len = VarInt::decode(src)?.0 as usize;
+        if src.remaining() < vt_len {
+            return Err(kojacoord_protocol::ProtocolError::UnexpectedEof);
+        }
+        let verify_token = src.split_to(vt_len).to_vec();
+        Ok((server_id, public_key, verify_token))
+    }
+}
+
+/// Encode a ClientboundEncryptionRequest in the wire shape of `epoch`.
+fn encode_encryption_request(
+    epoch: Epoch,
+    server_id: &str,
+    public_key: &[u8],
+    verify_token: &[u8],
+    dst: &mut BytesMut,
+) -> Result<(), kojacoord_protocol::ProtocolError> {
+    use bytes::BufMut;
+    server_id.to_string().encode(dst)?;
+    if matches!(epoch, Epoch::V1_7) {
+        dst.put_i16(public_key.len() as i16);
+        dst.extend_from_slice(public_key);
+        dst.put_i16(verify_token.len() as i16);
+        dst.extend_from_slice(verify_token);
+    } else {
+        VarInt(public_key.len() as i32).encode(dst)?;
+        dst.extend_from_slice(public_key);
+        VarInt(verify_token.len() as i32).encode(dst)?;
+        dst.extend_from_slice(verify_token);
+    }
+    Ok(())
 }

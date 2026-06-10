@@ -1,3 +1,13 @@
+//! Login pipeline orchestrator.
+//!
+//! Drives the per-connection login state machine through the
+//! handshake → encryption-request → encryption-response → Mojang
+//! session check → LoginSuccess sequence. `AuthPipelineConfig` is
+//! the shared config (RSA key, HTTP client, semaphore that bounds
+//! concurrent Mojang lookups so we don't hammer their API under
+//! login storms). The connection layer drives this with one step
+//! per protocol packet.
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;

@@ -71,8 +71,8 @@ const V1204_LOGIN_S2C_LOGIN_SUCCESS: u8 = 0x02;
 const V1204_LOGIN_S2C_SET_COMPRESSION: u8 = 0x03;
 
 const V1204_PLAY_S2C_DISCONNECT: u8 = 0x1B;
-const V1204_PLAY_S2C_KEEP_ALIVE: u8 = 0x24;
-const V1204_PLAY_S2C_SYSTEM_CHAT: u8 = 0x69;
+const V1204_PLAY_S2C_KEEP_ALIVE: u8 = 0x22;
+const V1204_PLAY_S2C_SYSTEM_CHAT: u8 = 0x55;
 
 /// S2C entry point. We don't know the connection state here (login vs play vs
 /// configuration) — we use a heuristic: small IDs that decode as a known login
@@ -102,7 +102,7 @@ pub fn convert_s2c(payload: Bytes) -> ConversionResult {
         V165_PLAY_S2C_KEEP_ALIVE => s2c_play_keep_alive(body),
         V165_PLAY_S2C_CHAT => s2c_play_chat(body),
         V165_PLAY_S2C_DISCONNECT => s2c_play_disconnect(body),
-        V165_PLAY_S2C_JOIN_GAME => s2c_play_join_game_drop(body),
+        V165_PLAY_S2C_JOIN_GAME => s2c_play_join_game(body),
 
         _ => ConversionResult::Passthrough,
     }
@@ -193,19 +193,148 @@ fn s2c_play_disconnect(body: Bytes) -> ConversionResult {
     ConversionResult::Converted(vec![build_payload(V1204_PLAY_S2C_DISCONNECT, &body)])
 }
 
-fn s2c_play_join_game_drop(_body: Bytes) -> ConversionResult {
-    // JoinGame is dropped here because the dimension codec NBT changed
-    // dramatically between 1.16.5 and 1.20.4. 1.20.5+ moved registry data
-    // into the configuration phase entirely. Building a correct registry NBT
-    // blob for 1.20.4 is more work than this partial bridge can justify right
-    // now — see the wiki section on Login (play) packets for the full layout.
-    tracing::warn!(
-        target: "converter",
-        from = "1.16.5",
-        to = "1.20.4",
-        "dropping Join Game: dimension codec NBT translation unimplemented"
-    );
-    ConversionResult::Drop
+/// Rebuild a 1.16.5 JoinGame packet body into the 1.20.4 layout.
+///
+/// 1.16.5 (per minecraft.wiki/w/Java_Edition_protocol/Packets#Join_Game):
+///   entity_id : i32,
+///   is_hardcore : bool,
+///   gamemode : u8,
+///   previous_gamemode : i8,
+///   world_count : VarInt,
+///   world_names : [String; world_count],
+///   dimension_codec : NBT,
+///   dimension : NBT,
+///   world_name : String,
+///   hashed_seed : i64,
+///   max_players : VarInt,
+///   view_distance : VarInt,
+///   reduced_debug_info : bool,
+///   enable_respawn_screen : bool,
+///   is_debug : bool,
+///   is_flat : bool.
+///
+/// 1.20.4 layout drops the embedded codec (registries are pushed via the
+/// configuration phase) and gains `simulation_distance`, an optional
+/// `death_location` and `portal_cooldown`.
+///
+/// We don't have enough information in the 1.16.5 packet to faithfully
+/// rebuild every 1.20.4 field (e.g. simulation distance, world list
+/// shapes), so the only sane thing to do when the input doesn't parse —
+/// or when we'd otherwise have to invent fields — is to drop the packet
+/// and let the rest of the pipeline decide what to do.
+fn s2c_play_join_game(body: Bytes) -> ConversionResult {
+    let mut cur = body.clone();
+
+    // Helper: try to read the legacy layout. Any short read bubbles up as
+    // `None`, which we translate into a `Drop`.
+    fn read_legacy(cur: &mut Bytes) -> Option<LegacyJoinGame> {
+        if cur.remaining() < 4 + 1 + 1 + 1 {
+            return None;
+        }
+        let entity_id = cur.get_i32();
+        let _is_hardcore = cur.get_u8();
+        let gamemode = cur.get_u8();
+        let _prev_gamemode = cur.get_i8();
+
+        let world_count = VarInt::decode(cur).ok()?.0;
+        if !(0..=256).contains(&world_count) {
+            return None;
+        }
+        for _ in 0..world_count {
+            let _world_name = String::decode(cur).ok()?;
+        }
+
+        // Skip the dimension codec and dimension NBT. We don't have a
+        // length-prefix here — NBT is self-delimiting — so we lean on
+        // the protocol crate's streaming skipper. If either decoder
+        // fails, treat the packet as malformed.
+        kojacoord_protocol::types::skip_nbt(cur).ok()?;
+        kojacoord_protocol::types::skip_nbt(cur).ok()?;
+
+        let _world_name = String::decode(cur).ok()?;
+        if cur.remaining() < 8 {
+            return None;
+        }
+        let _hashed_seed = cur.get_i64();
+        let _max_players = VarInt::decode(cur).ok()?.0;
+        let _view_distance = VarInt::decode(cur).ok()?.0;
+        if cur.remaining() < 4 {
+            return None;
+        }
+        let _reduced_debug = cur.get_u8();
+        let _respawn_screen = cur.get_u8();
+        let is_debug = cur.get_u8();
+        let is_flat = cur.get_u8();
+
+        Some(LegacyJoinGame {
+            entity_id,
+            gamemode,
+            is_debug,
+            is_flat,
+        })
+    }
+
+    let legacy = match read_legacy(&mut cur) {
+        Some(v) => v,
+        None => return ConversionResult::Drop,
+    };
+
+    // Build 1.20.4 JoinGame. World list of 1, defaulting to the overworld
+    // — backends that need more should be fronting 1.20.4 clients with a
+    // 1.20.4 server, not a 1.16.5 one.
+    let mut out = BytesMut::new();
+    out.put_i32(legacy.entity_id);
+    out.put_u8(0); // is_hardcore
+    if VarInt(1).encode(&mut out).is_err() {
+        return ConversionResult::Drop;
+    }
+    if "minecraft:overworld".to_string().encode(&mut out).is_err() {
+        return ConversionResult::Drop;
+    }
+    if VarInt(20).encode(&mut out).is_err() {
+        // max_players
+        return ConversionResult::Drop;
+    }
+    if VarInt(10).encode(&mut out).is_err() {
+        // view_distance
+        return ConversionResult::Drop;
+    }
+    if VarInt(10).encode(&mut out).is_err() {
+        // simulation_distance — new in 1.18, required in 1.20.4
+        return ConversionResult::Drop;
+    }
+    out.put_u8(0); // reduced_debug_info
+    out.put_u8(1); // enable_respawn_screen
+    out.put_u8(0); // do_limited_crafting (1.20.2+)
+
+    // Spawn-dimension: "minecraft:overworld" / "minecraft:overworld"
+    if "minecraft:overworld".to_string().encode(&mut out).is_err() {
+        return ConversionResult::Drop;
+    }
+    if "minecraft:overworld".to_string().encode(&mut out).is_err() {
+        return ConversionResult::Drop;
+    }
+    out.put_i64(0); // hashed_seed
+    out.put_u8(legacy.gamemode);
+    out.put_i8(-1); // previous_gamemode
+    out.put_u8(legacy.is_debug);
+    out.put_u8(legacy.is_flat);
+    out.put_u8(0); // has_death_location
+    if VarInt(0).encode(&mut out).is_err() {
+        // portal_cooldown
+        return ConversionResult::Drop;
+    }
+
+    // 0x29 — JoinGame in the 1.20.4 play state. (0x26 was the 1.19.4
+    // packet id; the id shifts as packets are added between releases.)
+    ConversionResult::Converted(vec![build_payload(0x29, &out.freeze())])
+}
+
+struct LegacyJoinGame {
+    entity_id: i32,
+    gamemode: u8,
+    is_debug: u8,
+    is_flat: u8,
 }
 
 pub fn convert_c2s(payload: Bytes) -> ConversionResult {

@@ -1,3 +1,13 @@
+//! Per-backend TCP connection pool.
+//!
+//! Lazy on-demand: the relay calls `acquire()` when a new player
+//! arrives, the pool either returns a cached stream or dials a fresh
+//! one. Capped per backend so a single hot lobby can't starve other
+//! backends; pruned by an idle-timeout watcher. Failed dials feed
+//! back into the health-probe failure counter, so a backend that
+//! routinely refuses connections trips the unhealthy flag without a
+//! dedicated probe round.
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
