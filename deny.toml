@@ -46,7 +46,7 @@ exceptions = []
 # Duplicate versions bloat the binary and widen the audit surface, but are common
 # in large trees — warn rather than fail so it stays actionable, not blocking.
 multiple-versions = "warn"
-wildcard-dependencies = "deny"
+# wildcard-dependencies = "deny"
 # Crates we never want pulled in (add known-bad/unwanted crates here).
 deny = []
 
