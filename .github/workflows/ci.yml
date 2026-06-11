@@ -61,11 +61,6 @@ jobs:
         run: |
           cd crates/plugin-system
           cargo build --release
-      
-      - name: Build plugin builder
-        run: |
-          cd cargo-kpl
-          cargo build --release
 
   build-check:
     name: Build Check
