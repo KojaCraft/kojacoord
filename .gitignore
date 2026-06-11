@@ -125,7 +125,6 @@ temp/
 
 # Build directories
 build/
-bin/
 obj/
 
 # Release artifacts
