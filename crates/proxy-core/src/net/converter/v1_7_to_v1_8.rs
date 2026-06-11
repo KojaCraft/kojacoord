@@ -191,13 +191,21 @@ fn s2c_chat(body: Bytes) -> ConversionResult {
 
 fn s2c_spawn_position(mut body: Bytes) -> ConversionResult {
     // 1.7: i32 x; i32 y; i32 z. 1.8: packed Position (i64).
+    //
+    // The 1.8 packed layout puts Y in the MIDDLE 12 bits (26..37) per
+    // `kojacoord_protocol::types::position::encode_legacy_position`:
+    //   `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`.
+    // 1.14+ moved Y to the LOW 12 bits. The previous code here used the
+    // 1.14+ packing for a 1.8 target → every 1.8 client receiving a
+    // SpawnPosition spawned at the wrong block (Y and Z bits crossed).
     if body.remaining() < 12 {
         return ConversionResult::Passthrough;
     }
-    let x = body.get_i32() as i64;
-    let y = body.get_i32() as i64;
-    let z = body.get_i32() as i64;
-    let packed = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+    let x = body.get_i32();
+    let y = body.get_i32();
+    let z = body.get_i32();
+    let pos = kojacoord_protocol::types::Position { x, y, z };
+    let packed = kojacoord_protocol::types::encode_legacy_position(pos);
     let mut out = BytesMut::with_capacity(8);
     out.put_i64(packed);
     ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_POSITION, &out)])
@@ -273,7 +281,9 @@ fn s2c_update_sign(mut body: Bytes) -> ConversionResult {
     let x = body.get_i32() as i64;
     let y = body.get_i16() as i64;
     let z = body.get_i32() as i64;
-    let packed = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+    // 1.8 packed Position layout = legacy (Y in middle 12 bits).
+    // See `kojacoord_protocol::types::encode_legacy_position`.
+    let packed = ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF);
 
     let mut out = BytesMut::new();
     out.put_i64(packed);
@@ -412,7 +422,9 @@ fn c2s_player_digging(mut body: Bytes) -> ConversionResult {
     let z = body.get_i32() as i64;
     let face = body.get_i8();
 
-    let packed = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+    // 1.8 packed Position layout = legacy (Y in middle 12 bits).
+    // See `kojacoord_protocol::types::encode_legacy_position`.
+    let packed = ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF);
     let mut out = BytesMut::new();
     out.put_i8(status);
     out.put_i64(packed);
@@ -430,7 +442,9 @@ fn c2s_player_block_place(mut body: Bytes) -> ConversionResult {
     let y = body.get_u8() as i64;
     let z = body.get_i32() as i64;
     let dir = body.get_i8();
-    let packed = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+    // 1.8 packed Position layout = legacy (Y in middle 12 bits).
+    // See `kojacoord_protocol::types::encode_legacy_position`.
+    let packed = ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF);
 
     let mut out = BytesMut::new();
     out.put_i64(packed);
@@ -447,7 +461,9 @@ fn c2s_update_sign(mut body: Bytes) -> ConversionResult {
     let x = body.get_i32() as i64;
     let y = body.get_i16() as i64;
     let z = body.get_i32() as i64;
-    let packed = ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF);
+    // 1.8 packed Position layout = legacy (Y in middle 12 bits).
+    // See `kojacoord_protocol::types::encode_legacy_position`.
+    let packed = ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF);
 
     let mut out = BytesMut::new();
     out.put_i64(packed);
@@ -480,7 +496,9 @@ mod tests {
     }
 
     fn pack_pos(x: i64, y: i64, z: i64) -> i64 {
-        ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF)
+        // Test helper — matches the converter's 1.8 packed Position layout
+        // (legacy: Y in middle 12 bits).
+        ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF)
     }
 
     #[test]

@@ -15,9 +15,9 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kojacoord_protocol::codec::{Decode, Encode};
-use kojacoord_protocol::types::VarInt;
 #[cfg(test)]
 use kojacoord_protocol::types::Position;
+use kojacoord_protocol::types::VarInt;
 use kojacoord_protocol::{decode_legacy_position, encode_modern_position, BlockFlatteningTable};
 
 use super::helpers::rebuild_with_id;
@@ -59,17 +59,29 @@ const V12_S2C_DESTROY_ENTITIES: u8 = 0x32;
 const V12_S2C_ENTITY_HEAD_LOOK: u8 = 0x36;
 const V12_S2C_ENTITY_VELOCITY: u8 = 0x3E;
 
-const V16_S2C_KEEP_ALIVE: u8 = 0x20;
-const V16_S2C_JOIN_GAME: u8 = 0x25;
+// Per BungeeCord `Protocol.java` TO_CLIENT tables: 1.16.5 = proto 754
+// inherits from the `MINECRAFT_1_16_2 = 751` mapping. The previous
+// constants here used the `MINECRAFT_1_16 = 735` mapping which is +1
+// vs the 1.16.2+ values for almost every packet that changed
+// position. Every 1.16.5 client receiving these packets would
+// desync. Corrected against BungeeCord + verified against
+// crates/protocol/src/registry.rs proto-754 table:
+const V16_S2C_KEEP_ALIVE: u8 = 0x1F; // was 0x20 (MINECRAFT_1_16 value)
+const V16_S2C_JOIN_GAME: u8 = 0x24; // was 0x25
 const V16_S2C_CHAT: u8 = 0x0E;
-const V16_S2C_PLAYER_POS_LOOK: u8 = 0x35;
+const V16_S2C_PLAYER_POS_LOOK: u8 = 0x34; // was 0x35
 const V16_S2C_SPAWN_POSITION: u8 = 0x42;
-const V16_S2C_RESPAWN: u8 = 0x3A;
+const V16_S2C_RESPAWN: u8 = 0x39; // was 0x3A
 const V16_S2C_DISCONNECT: u8 = 0x19;
 const V16_S2C_HELD_ITEM_CHANGE: u8 = 0x3F;
-const V16_S2C_PLAYER_ABILITIES: u8 = 0x31;
+const V16_S2C_PLAYER_ABILITIES: u8 = 0x30; // was 0x31
 const V16_S2C_SET_EXPERIENCE: u8 = 0x48;
 const V16_S2C_ENTITY_TELEPORT: u8 = 0x56;
+// Entity-movement packet IDs left unchanged. BungeeCord does not
+// define typed classes for these (it passes them through generically),
+// so the BungeeCord `Protocol.java` table cannot confirm 1.16.5
+// values. The original constants are kept until cross-referenced
+// against PrismarineJS minecraft-data per [[project-prismarine-generator]].
 const V16_S2C_MOVE_ENTITY_POS: u8 = 0x28;
 const V16_S2C_MOVE_ENTITY_POS_ROT: u8 = 0x29;
 const V16_S2C_MOVE_ENTITY_ROT: u8 = 0x2A;
@@ -80,7 +92,7 @@ const V16_S2C_BLOCK_CHANGE: u8 = 0x0B;
 const V16_S2C_MULTI_BLOCK_CHANGE: u8 = 0x0F;
 const V16_S2C_SET_SLOT: u8 = 0x15;
 const V16_S2C_WINDOW_ITEMS: u8 = 0x13;
-const V16_S2C_CHUNK_DATA: u8 = 0x21;
+const V16_S2C_CHUNK_DATA: u8 = 0x20; // was 0x21 (was MINECRAFT_1_16 value)
 const V16_S2C_ENTITY_EQUIPMENT: u8 = 0x47;
 
 const V12_C2S_TELEPORT_CONFIRM: u8 = 0x00;
@@ -225,10 +237,17 @@ pub fn convert_s2c(
         V12_S2C_CHUNK_DATA => {
             // Use chunk repacker to convert from Legacy (1.12.2) to Flattened (1.16.5)
             if let Some(repacker) = repacker {
-                match repacker.repack(&body, kojacoord_protocol::ProtocolVersion::V1_12_2, kojacoord_protocol::ProtocolVersion::V1_16_5) {
+                match repacker.repack(
+                    &body,
+                    kojacoord_protocol::ProtocolVersion::V1_12_2,
+                    kojacoord_protocol::ProtocolVersion::V1_16_5,
+                ) {
                     Ok(converted_body) => {
                         tracing::debug!("v1_12_2_to_v1_16_5: Successfully repacked chunk data");
-                        rebuild_with_id(V16_S2C_CHUNK_DATA, &bytes::Bytes::copy_from_slice(&converted_body))
+                        rebuild_with_id(
+                            V16_S2C_CHUNK_DATA,
+                            &bytes::Bytes::copy_from_slice(&converted_body),
+                        )
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, "v1_12_2_to_v1_16_5: Chunk repacking failed, dropping packet");
@@ -275,7 +294,12 @@ pub fn convert_s2c(
                         .0;
                     let nbt = if nbt_len > 0 {
                         let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
-                        Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+                        Some(
+                            kojacoord_protocol::types::Nbt::decode(
+                                &mut bytes::Bytes::copy_from_slice(&nbt_bytes),
+                            )
+                            .unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")),
+                        )
                     } else {
                         None
                     };
@@ -319,7 +343,12 @@ pub fn convert_s2c(
                     .0;
                 let nbt = if nbt_len > 0 {
                     let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
-                    Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+                    Some(
+                        kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(
+                            &nbt_bytes,
+                        ))
+                        .unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")),
+                    )
                 } else {
                     None
                 };

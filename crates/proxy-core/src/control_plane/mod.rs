@@ -19,6 +19,7 @@ use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
 // Include the generated protobuf code
+#[allow(clippy::module_inception)]
 pub mod control_plane {
     tonic::include_proto!("kojacoord.control_plane");
 }

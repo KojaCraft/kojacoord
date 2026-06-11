@@ -23,8 +23,22 @@ impl LimboPackets for V1_20 {
                 simulation_distance: VarInt(8),
                 reduced_debug_info: false,
                 enable_respawn_screen: true,
-                do_limited_crafting: false,
-                dimension_type: VarInt(0),
+                // `do_limited_crafting` was added in 1.20.2 (proto 764)
+                // per BungeeCord `protocol/Login.java`:
+                //   `if ( protocolVersion >= MINECRAFT_1_20_2 ) {
+                //        limitedCrafting = buf.readBoolean();`
+                // The Configuration-phase split also landed at 764, so
+                // the entire post-1.20.2 Login(Play) compact form starts
+                // here. 1.20-1.20.1 (763) do NOT carry it.
+                do_limited_crafting: if proto >= 764 { Some(false) } else { None },
+                // 1.20.2 / 1.20.4 (proto 764 / 765) expect an Identifier
+                // here (`minecraft:overworld`); 1.20.5+ (proto 766) flipped
+                // to a VarInt registry index. See DimensionTypeRef.
+                dimension_type: if proto >= 766 {
+                    p::DimensionTypeRef::Registry(VarInt(0))
+                } else {
+                    p::DimensionTypeRef::Identifier("minecraft:overworld".to_owned())
+                },
                 dimension_name: world_name.to_owned(),
                 hashed_seed: 0,
                 game_mode: 3,
@@ -33,6 +47,9 @@ impl LimboPackets for V1_20 {
                 is_flat: true,
                 death_location: None,
                 portal_cooldown: VarInt(0),
+                // `secure_profile` was added in proto 766 (1.20.5). For
+                // 1.20-1.20.4 it must be absent. Per BungeeCord Login.java.
+                secure_profile: if proto >= 766 { Some(false) } else { None },
             },
         )
     }

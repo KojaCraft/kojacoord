@@ -33,7 +33,12 @@ impl LimboPackets for V1_21 {
                 is_flat: true,
                 death_location: None,
                 portal_cooldown: VarInt(0),
-                sea_level: VarInt(0),
+                // `sea_level` is on the wire only from proto 768 (1.21.2+).
+                // Proto 767 (1.21 / 1.21.1) must omit it.
+                sea_level: if proto >= 768 { Some(VarInt(63)) } else { None },
+                // `secure_profile` has been mandatory since proto 766
+                // (1.20.5+); always present for the V1_21 bucket.
+                secure_profile: false,
             },
         )
     }

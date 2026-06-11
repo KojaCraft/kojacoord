@@ -66,16 +66,20 @@ mod clientbound {
         }
     }
 
+    // Per https://minecraft.wiki/w/Java_Edition_protocol/Packets#Encryption_Request:
+    // 1.7.x carried over the pre-netty Short(i16)-prefix for the public_key and
+    // verify_token byte arrays. Mojang only switched these to VarInt in 1.8.
+    // server_id is still a VarInt-prefixed UTF-8 String in 1.7.x.
     impl Encode for ClientboundEncryptionRequest {
         fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
             let id_bytes = self.server_id.as_bytes();
             VarInt(id_bytes.len() as i32).encode(dst)?;
             dst.put_slice(id_bytes);
 
-            VarInt(self.public_key.len() as i32).encode(dst)?;
+            dst.put_i16(self.public_key.len() as i16);
             dst.put_slice(&self.public_key);
 
-            VarInt(self.verify_token.len() as i32).encode(dst)?;
+            dst.put_i16(self.verify_token.len() as i16);
             dst.put_slice(&self.verify_token);
 
             Ok(())
@@ -100,7 +104,13 @@ mod clientbound {
                 ))
             })?;
 
-            let key_len = VarInt::decode(src)?.0 as usize;
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Missing Short length for ClientboundEncryptionRequest public_key",
+                )));
+            }
+            let key_len = src.get_i16() as usize;
             if src.remaining() < key_len {
                 return Err(ProtocolError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -110,7 +120,13 @@ mod clientbound {
             let mut public_key = vec![0u8; key_len];
             src.copy_to_slice(&mut public_key);
 
-            let tok_len = VarInt::decode(src)?.0 as usize;
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Missing Short length for ClientboundEncryptionRequest verify_token",
+                )));
+            }
+            let tok_len = src.get_i16() as usize;
             if src.remaining() < tok_len {
                 return Err(ProtocolError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -257,12 +273,14 @@ mod serverbound {
         }
     }
 
+    // 1.7.x Encryption Response also uses Short(i16) length-prefixes for
+    // shared_secret and verify_token. Mojang switched to VarInt in 1.8.
     impl Encode for ServerboundEncryptionResponse {
         fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
-            VarInt(self.shared_secret.len() as i32).encode(dst)?;
+            dst.put_i16(self.shared_secret.len() as i16);
             dst.put_slice(&self.shared_secret);
 
-            VarInt(self.verify_token.len() as i32).encode(dst)?;
+            dst.put_i16(self.verify_token.len() as i16);
             dst.put_slice(&self.verify_token);
 
             Ok(())
@@ -271,7 +289,13 @@ mod serverbound {
 
     impl Decode for ServerboundEncryptionResponse {
         fn decode(src: &mut Bytes) -> Result<Self, ProtocolError> {
-            let ss_len = VarInt::decode(src)?.0 as usize;
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Missing Short length for ServerboundEncryptionResponse shared_secret",
+                )));
+            }
+            let ss_len = src.get_i16() as usize;
             if src.remaining() < ss_len {
                 return Err(ProtocolError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -281,7 +305,13 @@ mod serverbound {
             let mut shared_secret = vec![0u8; ss_len];
             src.copy_to_slice(&mut shared_secret);
 
-            let vt_len = VarInt::decode(src)?.0 as usize;
+            if src.remaining() < 2 {
+                return Err(ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Missing Short length for ServerboundEncryptionResponse verify_token",
+                )));
+            }
+            let vt_len = src.get_i16() as usize;
             if src.remaining() < vt_len {
                 return Err(ProtocolError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

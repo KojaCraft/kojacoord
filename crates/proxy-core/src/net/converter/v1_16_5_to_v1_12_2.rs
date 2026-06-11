@@ -31,7 +31,11 @@ const V16_S2C_SPAWN_POSITION: u8 = 0x42;
 const V16_S2C_RESPAWN: u8 = 0x39;
 const V16_S2C_DISCONNECT: u8 = 0x19;
 const V16_S2C_HELD_ITEM_CHANGE: u8 = 0x3F;
-const V16_S2C_PLAYER_ABILITIES: u8 = 0x2F;
+// Per `crates/protocol/src/registry.rs` proto-754 table (verified
+// against BungeeCord for the KeepAlive line). The previous 0x2F value
+// here did not match the codebase's own registry and was inconsistent
+// with the forward converter `v1_12_2_to_v1_16_5` which uses 0x30.
+const V16_S2C_PLAYER_ABILITIES: u8 = 0x30;
 const V16_S2C_SET_EXPERIENCE: u8 = 0x48;
 const V16_S2C_BLOCK_CHANGE: u8 = 0x0B;
 const V16_S2C_MULTI_BLOCK_CHANGE: u8 = 0x3B;
@@ -233,10 +237,17 @@ pub fn convert_s2c(
         V16_S2C_CHUNK_DATA => {
             // Use chunk repacker to convert from Flattened (1.16.5) to Legacy (1.12.2)
             if let Some(repacker) = repacker {
-                match repacker.repack(&body, kojacoord_protocol::ProtocolVersion::V1_16_5, kojacoord_protocol::ProtocolVersion::V1_12_2) {
+                match repacker.repack(
+                    &body,
+                    kojacoord_protocol::ProtocolVersion::V1_16_5,
+                    kojacoord_protocol::ProtocolVersion::V1_12_2,
+                ) {
                     Ok(converted_body) => {
                         tracing::debug!("v1_16_5_to_v1_12_2: Successfully repacked chunk data");
-                        rebuild_with_id(V12_S2C_CHUNK_DATA, &bytes::Bytes::copy_from_slice(&converted_body))
+                        rebuild_with_id(
+                            V12_S2C_CHUNK_DATA,
+                            &bytes::Bytes::copy_from_slice(&converted_body),
+                        )
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, "v1_16_5_to_v1_12_2: Chunk repacking failed, dropping packet");
@@ -386,12 +397,23 @@ fn s2c_spawn_position(mut body: Bytes) -> ConversionResult {
 }
 
 fn s2c_join_game(mut body: Bytes) -> ConversionResult {
-    // 1.16.5 simplified layout (matches this codebase's `ClientboundJoinGame`):
-    // i32 eid, u8 hardcore, u8 gm, i8 prev_gm,
-    // VarInt n_worlds, n × String world_names,
-    // String dimension, String world_name,
-    // i64 hashed_seed, VarInt max_players, VarInt view_distance,
-    // u8 reduced_debug, u8 enable_respawn, u8 is_debug, u8 is_flat.
+    // 1.16.5 wire shape per BungeeCord `Login.java::read` for proto 754
+    // (`MINECRAFT_1_16_2`):
+    //   i32 entityId, bool hardcore, u8 gameMode, i8 prevGameMode,
+    //   VarInt n_worlds, n × String worldNames,
+    //   NBT dimension_codec, NBT dimension,    ← previously missed
+    //   String worldName, i64 hashedSeed, VarInt maxPlayers,
+    //   VarInt viewDistance, bool reducedDebug, bool normalRespawn,
+    //   bool debug, bool flat.
+    //
+    // The previous reader treated `dimension` as a length-prefixed String
+    // and skipped the `dimension_codec` entirely — when a real 1.16.5
+    // backend sent JoinGame, the parser ran straight into the codec NBT
+    // bytes treating them as a VarInt world-count, producing garbage for
+    // every following field. This converter then emitted a 1.12.2
+    // JoinGame with wrong gamemode / dimension / level_type — the 1.12.2
+    // client either disconnected or spawned in the wrong world.
+    use kojacoord_protocol::types::nbt;
     if body.remaining() < 4 + 3 {
         return ConversionResult::Passthrough;
     }
@@ -408,14 +430,24 @@ fn s2c_join_game(mut body: Bytes) -> ConversionResult {
             return ConversionResult::Passthrough;
         }
     }
-    let dimension = match decode_string(&mut body) {
+    // Skip dimension_codec NBT (self-framing). If the skip fails treat
+    // as Passthrough so the upstream pipeline can decide.
+    if nbt::skip(&mut body).is_err() {
+        return ConversionResult::Passthrough;
+    }
+    // Skip dimension NBT (self-framing). Real 1.16.5 servers send this as
+    // a `minecraft:dimension_type` element NBT. We don't need its
+    // contents — we map by world_name below.
+    if nbt::skip(&mut body).is_err() {
+        return ConversionResult::Passthrough;
+    }
+    let world_name = match decode_string(&mut body) {
         Some(s) => s,
         None => return ConversionResult::Passthrough,
     };
-    let _world_name = match decode_string(&mut body) {
-        Some(s) => s,
-        None => return ConversionResult::Passthrough,
-    };
+    // Map 1.16.5 dimension to legacy int by world name. This is what the
+    // 1.12.2 client expects in its dimension field.
+    let dimension = world_name.clone();
     if body.remaining() < 8 {
         return ConversionResult::Passthrough;
     }
@@ -454,11 +486,16 @@ fn s2c_join_game(mut body: Bytes) -> ConversionResult {
 }
 
 fn s2c_respawn(mut body: Bytes) -> ConversionResult {
-    let dimension = match decode_string(&mut body) {
-        Some(s) => s,
-        None => return ConversionResult::Passthrough,
-    };
-    let _world_name = match decode_string(&mut body) {
+    // Per BungeeCord `Respawn.java::read` for proto 754
+    // (`MINECRAFT_1_16_2 <= proto < MINECRAFT_1_19`), the leading
+    // `dimension` field is NBT, not String. Same shape bug as
+    // `s2c_join_game` above — read NBT, then `worldName` String, then
+    // the post-1.16 tail.
+    use kojacoord_protocol::types::nbt;
+    if nbt::skip(&mut body).is_err() {
+        return ConversionResult::Passthrough;
+    }
+    let world_name = match decode_string(&mut body) {
         Some(s) => s,
         None => return ConversionResult::Passthrough,
     };
@@ -472,7 +509,7 @@ fn s2c_respawn(mut body: Bytes) -> ConversionResult {
     let is_flat = body.get_u8() != 0;
     let _copy_metadata = body.get_u8();
 
-    let dim_i32 = dimension_key_to_i32(&dimension);
+    let dim_i32 = dimension_key_to_i32(&world_name);
 
     let mut out = BytesMut::new();
     out.put_i32(dim_i32);
@@ -635,6 +672,22 @@ mod tests {
 
     #[test]
     fn join_game_strips_codec_and_translates_dimension() {
+        // Construct a real 1.16.5 JoinGame body — per BungeeCord
+        // `Login.java::read` for proto 754:
+        //   i32 eid, bool hardcore, u8 gm, i8 prev_gm,
+        //   VarInt n_worlds, n × String worldNames,
+        //   NBT dimension_codec, NBT dimension,
+        //   String worldName, i64 seed, VarInt maxPlayers,
+        //   VarInt viewDistance, bool reducedDebug, bool normalRespawn,
+        //   bool debug, bool flat.
+        //
+        // Minimal NBT (Java named-tag format): [0x0A (Compound)]
+        //   [0x00 0x00 (empty name length u16)] [0x00 (TAG_End)] =
+        // 4 bytes total. `nbt::skip` consumes the leading tag byte,
+        // the empty name, then iterates compound children until the
+        // closing TAG_End — perfect for an empty compound.
+        const MINIMAL_NBT: &[u8] = &[0x0A, 0x00, 0x00, 0x00];
+
         let mut body = BytesMut::new();
         body.put_i32(7); // eid
         body.put_u8(0); // hardcore
@@ -644,8 +697,8 @@ mod tests {
         let w = b"minecraft:the_nether";
         VarInt(w.len() as i32).encode(&mut body).unwrap();
         body.extend_from_slice(w);
-        VarInt(w.len() as i32).encode(&mut body).unwrap();
-        body.extend_from_slice(w); // dimension key
+        body.extend_from_slice(MINIMAL_NBT); // NBT dimension_codec
+        body.extend_from_slice(MINIMAL_NBT); // NBT dimension
         VarInt(w.len() as i32).encode(&mut body).unwrap();
         body.extend_from_slice(w); // world name
         body.put_i64(0);

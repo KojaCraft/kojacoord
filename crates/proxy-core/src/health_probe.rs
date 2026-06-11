@@ -22,7 +22,11 @@ use crate::server::ServerRegistry;
 /// across it.
 async fn probe_server(address: std::net::SocketAddr, timeout_secs: u64) -> bool {
     matches!(
-        timeout(Duration::from_secs(timeout_secs), TcpStream::connect(address)).await,
+        timeout(
+            Duration::from_secs(timeout_secs),
+            TcpStream::connect(address)
+        )
+        .await,
         Ok(Ok(_))
     )
 }

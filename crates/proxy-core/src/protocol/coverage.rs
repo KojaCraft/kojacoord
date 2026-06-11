@@ -197,6 +197,7 @@ impl ProtocolCoverage {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_converter(
         coverage: &mut HashMap<(Epoch, Epoch), CoverageStatus>,
         canonical_coverage: &mut HashMap<(CanonicalVersion, CanonicalVersion), CoverageStatus>,

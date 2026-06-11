@@ -56,7 +56,12 @@ const V1204_CONFIG_C2S_FINISH_CONFIGURATION_ACK: u8 = 0x02;
 
 const V1204_PLAY_C2S_CHAT_COMMAND: u8 = 0x04;
 const V1204_PLAY_C2S_CHAT_MESSAGE: u8 = 0x05;
-const V1204_PLAY_C2S_KEEP_ALIVE: u8 = 0x14;
+/// Per BungeeCord `Protocol.java::TO_SERVER` KeepAlive table:
+///   `map(MINECRAFT_1_20_2, 0x14)` then `map(MINECRAFT_1_20_3, 0x15)`.
+/// Proto 765 covers 1.20.3 / 1.20.4 → ID 0x15. (The 0x14 value was
+/// the 1.20.2 ID; using it on a 1.20.4 client desyncs every
+/// keepalive and the connection times out after ~30 s.)
+const V1204_PLAY_C2S_KEEP_ALIVE: u8 = 0x15;
 
 // ---- 1.16.5 target IDs ----
 const V165_LOGIN_C2S_LOGIN_START: u8 = 0x00;
@@ -65,7 +70,7 @@ const V165_LOGIN_C2S_ENCRYPTION_RESPONSE: u8 = 0x01;
 const V165_PLAY_C2S_CHAT_MESSAGE: u8 = 0x03;
 const V165_PLAY_C2S_KEEP_ALIVE: u8 = 0x10;
 
-pub fn convert_c2s(payload: Bytes) -> ConversionResult {
+pub fn convert_c2s(payload: Bytes, client_proto: u32) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
         return ConversionResult::Passthrough;
     };
@@ -74,7 +79,7 @@ pub fn convert_c2s(payload: Bytes) -> ConversionResult {
         // Login
         V1204_LOGIN_C2S_LOGIN_START => c2s_login_start(body),
         V1204_LOGIN_C2S_ENCRYPTION_RESPONSE => c2s_login_encryption_response(body),
-        V1204_LOGIN_C2S_LOGIN_ACK => c2s_login_ack_swallow(),
+        V1204_LOGIN_C2S_LOGIN_ACK => c2s_login_ack_swallow(client_proto),
 
         // Configuration-state Finish Configuration Acknowledged: heuristically
         // empty-body 0x02 sent right after the client transitions out of
@@ -161,21 +166,26 @@ fn c2s_login_encryption_response(mut body: Bytes) -> ConversionResult {
     )])
 }
 
-fn c2s_login_ack_swallow() -> ConversionResult {
+fn c2s_login_ack_swallow(client_proto: u32) -> ConversionResult {
     // 1.16.5 has no configuration phase, so we swallow the LoginAcknowledged
     // c2s packet (the legacy server would error on it). We must also drive the
     // modern client out of the configuration phase that the client transitions
     // into immediately after sending LoginAck — otherwise the client stalls
     // waiting for Registry Data + Finish Configuration packets that will never
-    // come. We inject a synthetic Finish Configuration (configuration-state
-    // s2c id 0x02, empty body) back toward the client. The client then ACKs
-    // (c2s 0x02 in configuration state) and transitions into play state, where
-    // it can receive the converted JoinGame from the 1.16.5 backend.
+    // come. We inject a synthetic Finish Configuration back toward the client.
+    //
+    // Per registry: configuration-state clientbound FinishConfiguration was
+    // `0x02` for proto 764/765 (1.20.2-1.20.4) and shifted to `0x03` at
+    // proto 766 (1.20.5/1.20.6) when Cookie Request was inserted at 0x00.
+    // The V1_20_4 canonical bucket covers protos 763-766, so we must
+    // dispatch — using the wrong id for a 1.20.5/1.20.6 client leaves
+    // them stuck in configuration state.
     //
     // Source: <https://minecraft.wiki/w/Java_Edition_protocol/Packets>
-    // §Finish Configuration (clientbound).
-    const V1204_CONFIG_S2C_FINISH_CONFIGURATION: u8 = 0x02;
-    let finish = build_payload(V1204_CONFIG_S2C_FINISH_CONFIGURATION, &[]);
+    // §Finish Configuration (clientbound) + crates/protocol/src/registry.rs
+    // CONFIGURATION table entries for proto 764 and 766.
+    let finish_id: u8 = if client_proto >= 766 { 0x03 } else { 0x02 };
+    let finish = build_payload(finish_id, &[]);
     ConversionResult::InjectS2C(vec![finish])
 }
 
@@ -251,7 +261,7 @@ mod tests {
         body.put_i64(0xDEADBEEF);
         body.put_i64(0xCAFEBABE);
         let payload = build_payload(V1204_LOGIN_C2S_LOGIN_START, &body);
-        let out = convert_c2s(payload);
+        let out = convert_c2s(payload, 765);
         match out {
             ConversionResult::Converted(p) => {
                 let (id, mut rest) = split_id(p[0].clone()).unwrap();
@@ -266,7 +276,7 @@ mod tests {
     #[test]
     fn login_ack_injects_finish_configuration() {
         let payload = build_payload(V1204_LOGIN_C2S_LOGIN_ACK, &[]);
-        match convert_c2s(payload) {
+        match convert_c2s(payload, 765) {
             ConversionResult::InjectS2C(packets) => {
                 assert_eq!(packets.len(), 1, "exactly one synthetic packet");
                 // The injected packet is configuration-state s2c id 0x02
@@ -281,7 +291,7 @@ mod tests {
     #[test]
     fn finish_configuration_ack_is_dropped() {
         let payload = build_payload(V1204_CONFIG_C2S_FINISH_CONFIGURATION_ACK, &[]);
-        assert!(matches!(convert_c2s(payload), ConversionResult::Drop));
+        assert!(matches!(convert_c2s(payload, 765), ConversionResult::Drop));
     }
 
     fn other_label(r: &ConversionResult) -> &'static str {
@@ -303,7 +313,7 @@ mod tests {
         VarInt(0).encode(&mut body).unwrap();
         // BitSet skipped — converter only reads up to the chat string.
         let payload = build_payload(V1204_PLAY_C2S_CHAT_MESSAGE, &body);
-        let out = convert_c2s(payload);
+        let out = convert_c2s(payload, 765);
         match out {
             ConversionResult::Converted(p) => {
                 let (id, mut rest) = split_id(p[0].clone()).unwrap();
@@ -326,7 +336,7 @@ mod tests {
         VarInt(token.len() as i32).encode(&mut body).unwrap();
         body.extend_from_slice(&token);
         let payload = build_payload(V1204_LOGIN_C2S_ENCRYPTION_RESPONSE, &body);
-        let out = convert_c2s(payload);
+        let out = convert_c2s(payload, 765);
         match out {
             ConversionResult::Converted(p) => {
                 let (id, mut rest) = split_id(p[0].clone()).unwrap();

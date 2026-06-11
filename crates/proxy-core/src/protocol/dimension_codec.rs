@@ -62,6 +62,42 @@ pub fn determine_injection_mode(client_protocol: u32, backend_protocol: u32) -> 
     }
 }
 
+/// Build a dimension codec NBT for the given protocol.
+///
+/// Per BungeeCord `protocol/Login.java`, the codec field exists from
+/// proto 735 (1.16) onward and was removed when the Configuration
+/// phase split out the registry data at proto 764 (1.20.2).
+///
+/// Strategy: prefer the byte-for-byte PrismarineJS codec for this
+/// proto if `crates/protocol/data/dimension_codec_<proto>.nbt.bin`
+/// was populated by `gen_dimension_codec`. Otherwise fall back to the
+/// synthesised minimal codec which is enough to pass the client's
+/// "did the server send a codec?" check but doesn't enumerate the
+/// nether/end dimensions or the full biome registry.
+pub fn build_dimension_codec_for_proto(proto: u32) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = prismarine_codec_for_proto(proto) {
+        return Ok(bytes.to_vec());
+    }
+    build_minimal_dimension_codec()
+}
+
+/// Lookup a baked PrismarineJS dimension codec by proto. Returns
+/// `Some(bytes)` only for protos where the build embedded a real
+/// codec via `include_bytes!`. Empty list today — populate by running
+/// `cargo run -p kojacoord-protocol --bin gen_dimension_codec` against
+/// a local minecraft-data clone, then add `match` arms here pointing
+/// at the resulting `dimension_codec_<proto>.nbt.bin` files. Mirrors
+/// the runtime side of the existing `gen_flattening` pattern.
+fn prismarine_codec_for_proto(proto: u32) -> Option<&'static [u8]> {
+    // Populated by the generator — see file-level comment.
+    // Example (uncomment after running the generator):
+    //   754 => Some(include_bytes!(
+    //       "../../../protocol/data/dimension_codec_754.nbt.bin"
+    //   )),
+    let _ = proto;
+    None
+}
+
 /// Build a minimal `minecraft:dimension_type` + `minecraft:worldgen/biome`
 /// registry NBT — one overworld entry, default biome. Just enough to
 /// pass the client's "did the server send a codec?" check.
@@ -249,7 +285,7 @@ pub fn dimension_codec_nbt() -> Result<Vec<u8>, String> {
 /// since we don't synthesise nether/end worlds at the proxy.
 pub fn dimension_type_nbt(_dim_key: &str) -> Result<Vec<u8>, String> {
     let mut dim_type = Nbt::empty("");
-    
+
     let mut element = NbtTag::compound();
     if let Some(elem) = element.as_compound_mut() {
         elem.insert("height".to_string(), NbtTag::int(256));
@@ -266,13 +302,13 @@ pub fn dimension_type_nbt(_dim_key: &str) -> Result<Vec<u8>, String> {
         elem.insert("ultrawarm".to_string(), NbtTag::byte(0));
         elem.insert("bed_works".to_string(), NbtTag::byte(1));
     }
-    
+
     dim_type.root.insert("element".to_string(), element);
-    
+
     let mut buffer = BytesMut::new();
     dim_type
         .encode(&mut buffer)
         .map_err(|e| format!("Failed to encode dimension type NBT: {}", e))?;
-    
+
     Ok(buffer.to_vec())
 }

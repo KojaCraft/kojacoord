@@ -205,7 +205,7 @@ impl Default for ProxySection {
             server_id: String::new(),
             eula_accepted: false,
             auth_url: default_auth_url(),
-            mojang_public_key: default_public_key()
+            mojang_public_key: default_public_key(),
         }
     }
 }

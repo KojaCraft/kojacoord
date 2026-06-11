@@ -27,7 +27,9 @@ use std::io::{Read, Write};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
-use kojacoord_protocol::{codec::Encode, types::VarInt, Decode, Epoch, ProtocolError, VersionRegistry};
+use kojacoord_protocol::{
+    codec::Encode, types::VarInt, Decode, Epoch, ProtocolError, VersionRegistry,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::buffer_pool::GLOBAL_BUFFER_POOL;
@@ -61,9 +63,7 @@ pub async fn write_legacy_bytes<W: AsyncWriteExt + Unpin>(
 /// Read a single byte from a pre-netty stream. Used to peek at the
 /// next packet id; subsequent fields must be read directly by the
 /// typed v1_6_x decoder since each packet has a static-known shape.
-pub async fn read_legacy_byte<R: AsyncReadExt + Unpin>(
-    src: &mut R,
-) -> Result<u8, ConnectionError> {
+pub async fn read_legacy_byte<R: AsyncReadExt + Unpin>(src: &mut R) -> Result<u8, ConnectionError> {
     Ok(src.read_u8().await?)
 }
 

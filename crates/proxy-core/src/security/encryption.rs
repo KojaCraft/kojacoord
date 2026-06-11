@@ -21,6 +21,18 @@ use std::sync::Arc;
 /// the concrete `Cipher` implementation. `Custom(u32)` is reserved for
 /// operator-defined algorithms registered at runtime; the integer is
 /// caller-meaningful only.
+///
+/// ## Minecraft compatibility
+///
+/// **NONE of these variants are speakable on the Minecraft Java wire.**
+/// Vanilla Java Edition clients (1.7 → 1.21.x) handle the session
+/// handshake by mandate at AES-128/CFB8 with key == IV == shared
+/// secret — that's `auth::encryption` and isn't swappable. The
+/// variants here are for proxy-internal channels (DB column crypto,
+/// cluster gossip, plugin transport) where the proxy controls BOTH
+/// ends and can negotiate freely. If you pipe one of these through a
+/// Minecraft client socket, the client will see noise and disconnect.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EncryptionAlgorithm {
     /// AES-256-GCM (current standard)

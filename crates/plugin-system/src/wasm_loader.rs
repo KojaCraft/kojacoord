@@ -12,14 +12,14 @@
 //! every trait method through the wasm function table.
 
 use crate::api::{
-    PacketDirection, PacketEvent as PacketHookEvent, PacketFilter, PacketHookResult,
-    Plugin, PluginContext, PluginEvent, PluginMetadata, PluginResponse,
+    PacketDirection, PacketEvent as PacketHookEvent, PacketFilter, PacketHookResult, Plugin,
+    PluginContext, PluginEvent, PluginMetadata, PluginResponse,
 };
 use crate::integrity::PluginVerifier;
 use crate::sandbox::SandboxConfig;
 use anyhow::{Context, Result};
-use sha2::Sha256;
 use sha2::digest::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
@@ -69,7 +69,7 @@ impl WasmLoader {
 
         // Set memory limits for security
         config.max_wasm_stack(512 * 1024); // 512KB stack
-        // Memory limits are set via allocation strategy in wasmtime 15
+                                           // Memory limits are set via allocation strategy in wasmtime 15
 
         let engine = Engine::new(&config).context("Failed to create Wasmtime engine")?;
 
@@ -113,7 +113,10 @@ impl WasmLoader {
             .func_wrap(
                 "kojacoord",
                 "log",
-                |mut caller: Caller<'_, WasiCtx>, level: u32, ptr: u32, len: u32|
+                |mut caller: Caller<'_, WasiCtx>,
+                 level: u32,
+                 ptr: u32,
+                 len: u32|
                  -> Result<(), anyhow::Error> {
                     let mem = caller
                         .get_export("memory")
@@ -145,7 +148,11 @@ impl WasmLoader {
             .func_wrap(
                 "kojacoord",
                 "get_config",
-                |mut caller: Caller<'_, WasiCtx>, key_ptr: u32, key_len: u32, out_ptr: u32, out_len: u32|
+                |mut caller: Caller<'_, WasiCtx>,
+                 key_ptr: u32,
+                 key_len: u32,
+                 out_ptr: u32,
+                 out_len: u32|
                  -> Result<u32, anyhow::Error> {
                     let mem = caller
                         .get_export("memory")
@@ -624,7 +631,8 @@ impl Plugin for WasmPluginAdapter {
                                         direction: packet_direction,
                                     },
                                     Box::new(|_| Ok(PacketHookResult::Forward)),
-                                ).with_priority(100);
+                                )
+                                .with_priority(100);
 
                                 hooks.push(hook);
                             }
@@ -681,7 +689,8 @@ impl Plugin for WasmPluginAdapter {
                                     direction: packet_direction,
                                 },
                                 Box::new(|_| Ok(PacketHookResult::Forward)),
-                            ).with_priority(priority as i32);
+                            )
+                            .with_priority(priority as i32);
 
                             hooks.push(hook);
                         }

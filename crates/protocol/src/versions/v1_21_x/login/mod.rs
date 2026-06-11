@@ -90,8 +90,11 @@ impl Decode for ClientboundEncryptionRequest {
         let server_id = String::decode(src)?;
         let public_key = decode_byte_array(src)?;
         let verify_token = decode_byte_array(src)?;
-        let should_authenticate =
-            if src.is_empty() { None } else { Some(bool::decode(src)?) };
+        let should_authenticate = if src.is_empty() {
+            None
+        } else {
+            Some(bool::decode(src)?)
+        };
         Ok(Self {
             server_id,
             public_key,
@@ -169,8 +172,11 @@ impl Decode for ClientboundLoginSuccess {
         let uuid = uuid::Uuid::from_u64_pair(hi, lo);
         let username = String::decode(src)?;
         let properties = Vec::<ProfileProperty>::decode(src)?;
-        let strict_error_handling =
-            if src.is_empty() { None } else { Some(bool::decode(src)?) };
+        let strict_error_handling = if src.is_empty() {
+            None
+        } else {
+            Some(bool::decode(src)?)
+        };
         Ok(Self {
             uuid,
             username,

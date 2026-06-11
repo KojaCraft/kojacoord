@@ -18,12 +18,18 @@ pub mod encryption;
 pub mod error;
 pub mod forwarding;
 pub mod microsoft;
+pub mod mojang_lookup;
 pub mod offline;
 pub mod pipeline;
+pub mod property_sig;
 pub mod session;
 
 pub use error::AuthError;
 pub use pipeline::{
     AuthConfig, AuthEvent, AuthOutbound, AuthPipeline, AuthPipelineConfig, AuthState, AuthType,
+};
+pub use mojang_lookup::{resolve_mojang_uuid, MojangLookupError};
+pub use property_sig::{
+    parse_mojang_public_key, verify_properties, verify_property, PropertySigError,
 };
 pub use session::{AuthenticatedProfile, ProfileProperty};

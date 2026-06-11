@@ -404,11 +404,22 @@ fn c2s_settings_to_1_12(body: Bytes) -> ConversionResult {
     ConversionResult::Converted(vec![build_payload(V112_C2S_SETTINGS, &out)])
 }
 
-/// Pack (x, y, z) into the standard Mojang u64 Position encoding used from
-/// 1.8 onward: x (signed 26-bit) in bits 38–63, y (12-bit) in bits 0–11,
-/// z (signed 26-bit) in bits 12–37.
+/// Pack (x, y, z) into the 1.8–1.13 (LEGACY) Mojang Position layout:
+/// x in bits 38–63, y in bits 26–37, z in bits 0–25. Mojang moved Y
+/// to the low 12 bits at 1.14 (`encode_modern_position`) — all three
+/// call sites here target 1.12.2 (proto 340), so legacy layout is
+/// what the server actually decodes.
+///
+/// The prior comment + formula here claimed the layout was unchanged
+/// since 1.8 and used the 1.14+ packing, producing 1.12.2 packets with
+/// Y and Z bits crossed. Verified against
+/// `kojacoord_protocol::types::encode_legacy_position` (canonical
+/// legacy packer) and minecraft.wiki Data_types §Position which notes
+/// "the position type was different before 1.14".
 fn pack_position(x: i32, y: i32, z: i32) -> i64 {
-    (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
+    kojacoord_protocol::types::encode_legacy_position(
+        kojacoord_protocol::types::Position { x, y, z },
+    )
 }
 
 #[cfg(test)]

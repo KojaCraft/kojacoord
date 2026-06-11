@@ -313,7 +313,11 @@ mod tests {
             assert_eq!(items.modern_to_legacy(modern), Some(1));
         }
         // Table should not be trivially empty after the generator runs.
-        assert!(items.len() > 50, "expected >50 item mappings, got {}", items.len());
+        assert!(
+            items.len() > 50,
+            "expected >50 item mappings, got {}",
+            items.len()
+        );
     }
 
     #[test]

@@ -29,13 +29,11 @@ use uuid::Uuid;
 use aes::cipher::BlockEncrypt;
 use aes::Aes128;
 use bytes::{BufMut, Bytes, BytesMut};
-use kojacoord_protocol::{CanonicalVersion, Epoch, ProtocolVersion};
+use kojacoord_protocol::{CanonicalVersion, Epoch, MinecraftEdition, ProtocolVersion};
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use rsa::{pkcs1v15::Pkcs1v15Encrypt, pkcs8::DecodePublicKey, RsaPublicKey};
-use sha2::Sha256;
-use base64::prelude::*;
 
 use kojacoord_protocol::{
     codec::{Decode, Encode, PacketId},
@@ -51,7 +49,7 @@ use crate::{
     error::ConnectionError,
     modloader,
     packet_builder::build_system_message_packet,
-    packet_ids::{cb_config, cb_login, cb_play, nearest, sb_config, sb_login, REGISTRY},
+    packet_ids::{cb_config, cb_login, nearest, sb_config, sb_login},
     packet_io::{read_varint, NO_COMPRESSION},
     proxy::ProxyState,
     relay::PacketRelay,
@@ -62,7 +60,6 @@ use kojacoord_auth::{
     forwarding::{bungeecord_suffix, velocity_header},
     AuthEvent, AuthOutbound,
 };
-use kojacoord_protocol::registry::{Direction, ProtocolState};
 
 struct Cfb8State {
     cipher: Aes128,
@@ -249,7 +246,9 @@ impl McStream {
     pub fn enable_encryption(&mut self, key: &[u8]) {
         let old = std::mem::replace(&mut self.kind, McStreamKind::Empty);
         self.kind = match old {
-            McStreamKind::Plain(stream) => McStreamKind::Encrypted(EncryptedStream::new(stream, key)),
+            McStreamKind::Plain(stream) => {
+                McStreamKind::Encrypted(EncryptedStream::new(stream, key))
+            },
             McStreamKind::Encrypted(stream) => McStreamKind::Encrypted(stream),
             McStreamKind::Empty => unreachable!("enable_encryption on Empty stream"),
         };
@@ -374,7 +373,7 @@ impl ClientConnection {
     ///   * `Login` / `Configuration` → LoginDisconnect (login state).
     ///   * `Play`                    → play-state Disconnect.
     ///   * `Status` / `Handshaking`  → silent; the wire spec has no
-    ///                                 disconnect packet for these.
+    ///     disconnect packet for these.
     ///
     /// Errors that mean "the client already left" (`ConnectionError::Closed`,
     /// any `Io` error) are also silent — there's nobody to talk to.
@@ -482,6 +481,50 @@ impl ClientConnection {
         if peek[0] == 0xFE {
             tracing::debug!("detected legacy 0xFE ping from pre-1.7 client");
             return self.handle_legacy_ping().await;
+        }
+
+        // Bedrock Edition detection.
+        //
+        // Bedrock uses RakNet over UDP, NOT TCP — so in steady state a
+        // Bedrock client never lands here. But people DO occasionally
+        // misconfigure their client to point a Bedrock address at the
+        // proxy's TCP port, and some "universal launcher" wrappers
+        // attempt a TCP probe before falling back to UDP. We sniff for
+        // RakNet's `ID_OPEN_CONNECTION_REQUEST_1 = 0x05` followed by
+        // the well-known 16-byte "Offline Message Data ID" magic
+        // `00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78`. If we
+        // see that, we know it's Bedrock and can disconnect cleanly
+        // with a message instead of letting the modern parser misread
+        // those bytes as a Java handshake frame.
+        //
+        // `MinecraftEdition::Bedrock.is_implemented()` returns `false`
+        // today; once the dedicated Bedrock pipeline lands, this
+        // branch will dispatch into it instead of kicking.
+        if peek[0] == 0x05 {
+            if self.peek_looks_like_bedrock().await {
+                return self.handle_bedrock_unsupported().await;
+            }
+        }
+
+        // Pre-netty (1.6.x) login detection.
+        //
+        // 1.6.x clients send packet 0x02 (Handshake/Login Start) as the
+        // very first thing on a join — single raw `0x02` byte followed by
+        // `protocol_version(u8), username(UCS-2 short-prefix),
+        // host(UCS-2 short-prefix), port(i32)`. A modern handshake CANNOT
+        // have a length-varint of 2 (the smallest valid modern handshake
+        // frame is ~10 bytes — packet id + protocol VarInt + 1-byte addr
+        // length + addr + u16 port + next-state VarInt), so a peek byte
+        // of `0x02` is unambiguously a 1.6.x join attempt.
+        //
+        // Without this branch, the modern parser at the bottom of this
+        // function would interpret `0x02` as a frame-length of 2, read
+        // two bytes of legacy payload, then try to VarInt-decode those
+        // garbage bytes as a packet id — failure looks like a confusing
+        // protocol error rather than the obvious "wrong epoch" it is.
+        if peek[0] == 0x02 {
+            tracing::debug!("detected legacy 0x02 handshake from pre-1.7 client");
+            return self.handle_legacy_login().await;
         }
 
         // Push the peeked byte back so the modern handshake parser
@@ -627,12 +670,263 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// Handle a legacy (pre-netty / 1.6.x) join attempt.
+    ///
+    /// Mojang's pre-1.7 session.minecraft.net auth endpoint has been
+    /// dead since 2014 — online-mode auth is impossible for 1.6.4 in
+    /// practice, so the proxy forces offline-mode for these clients
+    /// and skips the encryption dance entirely. Flow:
+    ///   1. Parse the legacy Handshake packet 0x02
+    ///      (protocol_version u8, username/host UCS-2 short-prefix,
+    ///       port i32) per minecraft.wiki / Spigot 1.6.4 sources.
+    ///   2. Generate the canonical "OfflinePlayer:<name>" v3 UUID.
+    ///   3. Hand off to `finalise_login`, which sends the 1.6.4
+    ///      LoginRequest (0x01) — `send_login_success` already
+    ///      dispatches on V1_6_4 to use pre-netty framing — then
+    ///      routes the connection into the relay/limbo loop.
+    /// On any decode failure or pipeline error we fall back to a
+    /// legacy 0xFF disconnect packet so the user sees a real message
+    /// instead of a TCP reset.
+    async fn handle_legacy_login(&mut self) -> Result<(), ConnectionError> {
+        use kojacoord_protocol::codec::Decode;
+        use kojacoord_protocol::versions::v1_6_x::login::{
+            ClientboundLoginDisconnect, HandshakeC2S,
+        };
+        use tokio::io::AsyncReadExt;
+
+        // Read everything the client has buffered. 1.6.4 handshakes are
+        // small (≈40–80 bytes), so a single bounded read is fine.
+        let mut buf = vec![0u8; 1024];
+        let n = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            self.stream.read(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(ConnectionError::Io(e)),
+            Err(_) => {
+                return Err(ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "legacy handshake timed out",
+                )))
+            },
+        };
+        buf.truncate(n);
+
+        // The leading 0x02 packet-id byte was already consumed by the
+        // accept-loop peek, so the buffer starts at the body.
+        let mut body = bytes::Bytes::from(buf);
+        let handshake = match HandshakeC2S::decode(&mut body) {
+            Ok(hs) => {
+                self.protocol_version = hs.protocol_version as u32;
+                self.conn_state = ConnectionState::Login;
+                tracing::info!(
+                    username = %hs.username,
+                    host = %hs.host,
+                    port = hs.port,
+                    protocol = hs.protocol_version,
+                    "pre-netty (1.6.x) login attempt — offline mode (session.minecraft.net pre-1.7 endpoint is unreachable)"
+                );
+                hs
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode pre-netty handshake; closing");
+                return Ok(());
+            },
+        };
+
+        // 1.6.x identity resolution. Mojang killed session.minecraft.net
+        // in 2014 so we can't run a real Yggdrasil session — but we can
+        // still ask `api.mojang.com/users/profiles/minecraft/<name>` for
+        // the player's REAL UUID. That UUID is what `cached_profiles`
+        // is keyed on (written when the same player joined on 1.7+) so
+        // using it here lights up the skin / properties recovery path.
+        //
+        // Policy:
+        //   * Mojang lookup succeeds      → use the real UUID.
+        //   * Mojang says "no such user"  → no paid account exists.
+        //     In `online_mode = true`     → reject (anyone could claim
+        //                                   the name otherwise).
+        //     In `online_mode = false`    → fall back to the offline
+        //                                   NAMESPACE_OID UUID.
+        //   * Network failure             → fall back to offline UUID
+        //                                   regardless of online_mode
+        //                                   (a flaky network must not
+        //                                   lock everyone out).
+        let online_mode = self.state.config.proxy.online_mode;
+        let resolved_uuid: Uuid = match kojacoord_auth::resolve_mojang_uuid(&handshake.username)
+            .await
+        {
+            Ok(uuid) => {
+                tracing::info!(
+                    username = %handshake.username,
+                    uuid = %uuid,
+                    "Resolved 1.6.x username to real Mojang UUID"
+                );
+                uuid
+            },
+            Err(kojacoord_auth::MojangLookupError::NotFound(_)) if online_mode => {
+                tracing::warn!(
+                    username = %handshake.username,
+                    "1.6.x login rejected — no Mojang account exists for this username and online_mode is on"
+                );
+                let reason_json = r#"{"text":"This server requires a Minecraft.net account. The username you joined with isn't registered.","color":"red"}"#;
+                let plaintext = crate::packet_builder::plaintext_from_chat_json(reason_json);
+                let pkt = ClientboundLoginDisconnect { reason: plaintext };
+                let mut body = BytesMut::new();
+                pkt.encode(&mut body)
+                    .map_err(ConnectionError::Protocol)?;
+                let mut frame = BytesMut::new();
+                frame.put_u8(0xFF);
+                frame.extend_from_slice(&body);
+                use tokio::io::AsyncWriteExt;
+                let _ = self.stream.write_all(&frame).await;
+                let _ = self.stream.flush().await;
+                return Ok(());
+            },
+            Err(e) => {
+                tracing::warn!(
+                    username = %handshake.username,
+                    error = %e,
+                    "Mojang UUID lookup failed; falling back to offline NAMESPACE_OID UUID"
+                );
+                // Canonical offline-player UUID per the Notchian server:
+                // version-3 (MD5-namespaced) UUID over the ASCII bytes
+                // of "OfflinePlayer:<username>". Same algorithm
+                // Bukkit/Spigot use in `OfflinePlayer.getUniqueId`.
+                Uuid::new_v3(
+                    &Uuid::NAMESPACE_OID,
+                    format!("OfflinePlayer:{}", handshake.username).as_bytes(),
+                )
+            },
+        };
+
+        fn client_gone(e: &ConnectionError) -> bool {
+            matches!(e, ConnectionError::Closed | ConnectionError::Io(_))
+        }
+
+        match self
+            .finalise_login(
+                resolved_uuid,
+                handshake.username.clone(),
+                Vec::new(),
+                handshake.host,
+                &client_gone,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "1.6.4 finalise_login failed; sending legacy kick");
+            },
+        }
+
+        // Kick with a real 1.6.x disconnect packet: `0xFF` followed by a
+        // UCS-2 short-prefixed reason. crate::packet_builder converts the
+        // chat-component JSON to plaintext since 1.6.x has no JSON chat.
+        let reason_json = r#"{"text":"1.6.4 login is not yet supported by this proxy. Use 1.7+ to connect.","color":"red"}"#;
+        let plaintext = crate::packet_builder::plaintext_from_chat_json(reason_json);
+        let pkt = ClientboundLoginDisconnect { reason: plaintext };
+        let mut wire = bytes::BytesMut::new();
+        use bytes::BufMut;
+        wire.put_u8(0xFF);
+        use kojacoord_protocol::codec::Encode;
+        pkt.encode(&mut wire)?;
+        crate::packet_io::write_legacy_bytes(&mut self.stream, &wire).await?;
+        tracing::debug!("sent legacy disconnect to 1.6.x client");
+        Ok(())
+    }
+
     /// Handle legacy 0xFE ping from pre-1.7/1.6.x clients.
     /// These clients use a completely different protocol without varint framing.
+    /// Read the next 16 bytes from the stream and check whether they
+    /// match RakNet's Offline Message Data ID magic. Called only after
+    /// the lead byte already matched `0x05`
+    /// (`ID_OPEN_CONNECTION_REQUEST_1`). Magic value per the RakNet
+    /// reference impl + minecraft.wiki Bedrock_Edition_protocol §RakNet.
+    async fn peek_looks_like_bedrock(&mut self) -> bool {
+        const RAKNET_MAGIC: [u8; 16] = [
+            0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34,
+            0x56, 0x78,
+        ];
+        let mut probe = [0u8; 16];
+        let read_result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut probe),
+        )
+        .await;
+        match read_result {
+            Ok(Ok(_)) => probe == RAKNET_MAGIC,
+            _ => false,
+        }
+    }
+
+    /// Kick a Bedrock client with a clear "not yet supported" message.
+    /// Writes a tiny Bedrock-shaped `ID_INCOMPATIBLE_PROTOCOL_VERSION`
+    /// (0x19) reply followed by closing the socket — that's the
+    /// closest thing to a graceful kick that RakNet defines. Once
+    /// `MinecraftEdition::Bedrock.is_implemented()` returns true the
+    /// caller will dispatch into the real pipeline instead.
+    async fn handle_bedrock_unsupported(&mut self) -> Result<(), ConnectionError> {
+        use tokio::io::AsyncWriteExt;
+        let edition = MinecraftEdition::Bedrock;
+        tracing::info!(
+            edition = edition.slug(),
+            implemented = edition.is_implemented(),
+            "rejected Bedrock connection — pipeline not yet implemented"
+        );
+        // RakNet `ID_INCOMPATIBLE_PROTOCOL_VERSION`: 0x19, then u8
+        // (server's RakNet proto), then the 16-byte magic, then a i64
+        // server GUID. Bedrock clients show "Unable to connect to
+        // world" rather than a textual reason — that's the best the
+        // protocol gives us without a real RakNet stack.
+        let mut reply = BytesMut::new();
+        reply.put_u8(0x19);
+        reply.put_u8(0); // we don't actually speak any RakNet proto
+        reply.put_slice(&[
+            0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34,
+            0x56, 0x78,
+        ]);
+        reply.put_i64(0); // synthetic server GUID
+        let _ = self.stream.write_all(&reply).await;
+        let _ = self.stream.flush().await;
+        Err(ConnectionError::Closed)
+    }
+
     async fn handle_legacy_ping(&mut self) -> Result<(), ConnectionError> {
+        // Drain the extended SLP payload that 1.4+ / 1.6 clients tack
+        // onto the bare `0xFE` ping byte. Per minecraft.wiki Server
+        // List Ping:
+        //   * pre-1.4: bare 0xFE only
+        //   * 1.4 - 1.5: 0xFE 0x01
+        //   * 1.6: 0xFE 0x01 0xFA [u16-be channel len] "MC|PingHost"
+        //          [u16-be payload len] [u8 proto] [u16-be host len UCS-2]
+        //          [host bytes] [i32 port]
+        // Reading these bytes before writing the response matters
+        // because the 1.6 client expects a tidy TCP exchange — it
+        // sends the request as one block and waits for the response.
+        // If we write back before it's done sending, on Windows
+        // (where the user reported the issue) the kernel raises an
+        // RST and the client never sees the MOTD.
+        //
+        // We tolerate truncated reads silently — older clients legitimately
+        // stop mid-payload depending on which subform they speak.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut throwaway = [0u8; 256];
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            self.stream.read(&mut throwaway),
+        )
+        .await;
+
         let cached = self.state.cached_status.load();
+        // `cached.suffix` already supplies the closing brace of the outer
+        // status object plus the players/description sections, so the
+        // pre-suffix half must leave `version` open: `{"version":{...}`,
+        // never `{"version":{...}}`.
         let json = format!(
-            r#"{{"version":{{"name":"Koja","protocol":"{}"}}{}}}"#,
+            r#"{{"version":{{"name":"Koja","protocol":{}}}{}"#,
             78, // 1.6.4 protocol
             cached.suffix
         );
@@ -640,15 +934,16 @@ impl ClientConnection {
         let legacy_motd = ClientboundLegacyMotd::from_json(&json);
         let response = legacy_motd.encode_legacy();
 
-        // Write the legacy response directly to the stream
-        use tokio::io::AsyncWriteExt;
         self.stream
             .write_all(&response)
             .await
             .map_err(ConnectionError::Io)?;
         self.stream.flush().await.map_err(ConnectionError::Io)?;
 
-        tracing::debug!("sent legacy 0xFE ping response to pre-1.7 client");
+        tracing::debug!(
+            response_bytes = response.len(),
+            "sent legacy 0xFE ping response to pre-1.7 client"
+        );
         Ok(())
     }
 
@@ -768,8 +1063,32 @@ impl ClientConnection {
                     encryption_requested = true;
                 },
                 AuthOutbound::SetCompression { threshold } => {
+                    // CRITICAL: only mutate `self.compression_threshold`
+                    // if the SetCompression packet was actually emitted
+                    // to the client. 1.6.x and 1.7.x have no
+                    // SetCompression packet (added in 1.8 = proto 47
+                    // per minecraft.wiki), so
+                    // `send_set_compression_with_threshold` skips on
+                    // those epochs — and we must NOT enable compression
+                    // framing on a client that never agreed to it.
+                    //
+                    // Without this guard, every subsequent limbo packet
+                    // got a `VarInt(0)` uncompressed-marker prefix on
+                    // the wire. The 1.7.x client reads that leading 0x00
+                    // as packet id 0x00 (KeepAlive) and reports
+                    // "Packet 0 has N extra bytes" before disconnecting
+                    // — exactly the symptom in the user-reported log
+                    // (JoinGame + PlayerAbilities then immediate abort).
                     self.send_set_compression_with_threshold(threshold).await?;
-                    self.compression_threshold = threshold;
+                    let ep = nearest(self.protocol_version).epoch();
+                    if ep != Epoch::PreNetty && ep != Epoch::V1_7 {
+                        self.compression_threshold = threshold;
+                    } else {
+                        tracing::debug!(
+                            protocol = self.protocol_version,
+                            "pre-1.8 client — leaving compression_threshold at NO_COMPRESSION so wire framing matches"
+                        );
+                    }
                 },
                 AuthOutbound::LoginSuccess {
                     uuid,
@@ -824,8 +1143,32 @@ impl ClientConnection {
         for event in outbound {
             match event {
                 AuthOutbound::SetCompression { threshold } => {
+                    // CRITICAL: only mutate `self.compression_threshold`
+                    // if the SetCompression packet was actually emitted
+                    // to the client. 1.6.x and 1.7.x have no
+                    // SetCompression packet (added in 1.8 = proto 47
+                    // per minecraft.wiki), so
+                    // `send_set_compression_with_threshold` skips on
+                    // those epochs — and we must NOT enable compression
+                    // framing on a client that never agreed to it.
+                    //
+                    // Without this guard, every subsequent limbo packet
+                    // got a `VarInt(0)` uncompressed-marker prefix on
+                    // the wire. The 1.7.x client reads that leading 0x00
+                    // as packet id 0x00 (KeepAlive) and reports
+                    // "Packet 0 has N extra bytes" before disconnecting
+                    // — exactly the symptom in the user-reported log
+                    // (JoinGame + PlayerAbilities then immediate abort).
                     self.send_set_compression_with_threshold(threshold).await?;
-                    self.compression_threshold = threshold;
+                    let ep = nearest(self.protocol_version).epoch();
+                    if ep != Epoch::PreNetty && ep != Epoch::V1_7 {
+                        self.compression_threshold = threshold;
+                    } else {
+                        tracing::debug!(
+                            protocol = self.protocol_version,
+                            "pre-1.8 client — leaving compression_threshold at NO_COMPRESSION so wire framing matches"
+                        );
+                    }
                 },
                 AuthOutbound::LoginSuccess {
                     uuid,
@@ -855,7 +1198,7 @@ impl ClientConnection {
         &mut self,
         uuid: uuid::Uuid,
         username: String,
-        properties: Vec<kojacoord_auth::ProfileProperty>,
+        mut properties: Vec<kojacoord_auth::ProfileProperty>,
         original_host: String,
         client_gone: &impl Fn(&ConnectionError) -> bool,
     ) -> Result<SharedSession, ConnectionError> {
@@ -874,7 +1217,103 @@ impl ClientConnection {
             }
         }
 
-        self.check_properties_sig(&properties)?;
+        // ── Profile-property caching / skin recovery ─────────────────
+        //
+        // Two cases the proxy needs to handle around the dead pre-1.7
+        // Mojang auth endpoint:
+        //
+        //  1. Online-mode 1.7+ login → Mojang-verified properties on
+        //     hand. **Verify the signatures** against
+        //     `[proxy.mojang_public_key]` and then **cache** the
+        //     (uuid, username, properties) tuple so we can hand it back
+        //     to a future 1.6.x connection.
+        //
+        //  2. Pre-netty 1.6.x login → no Mojang auth, no skin. **Load**
+        //     the cached profile by username (the only key 1.6.x sends)
+         //     and graft the cached signed property in so downstream
+        //     limbo/relay code can synthesise the skin.
+        //
+        // Online-mode signature verification only runs when the proxy
+        // is configured for online mode AND the client is post-1.6 (a
+        // 1.6.x client never sent us a signature in the first place).
+        let online_mode = self.state.config.proxy.online_mode;
+        let canonical = nearest(self.protocol_version).canonical_typed_packet_version();
+        let is_pre_netty_login = matches!(canonical, CanonicalVersion::V1_6_4);
+
+        if online_mode && !is_pre_netty_login && !properties.is_empty() {
+            match kojacoord_auth::parse_mojang_public_key(
+                &self.state.config.proxy.mojang_public_key,
+            ) {
+                Ok(key) => match kojacoord_auth::verify_properties(&properties, &key, true) {
+                    Ok(n) => {
+                        tracing::debug!(
+                            username = %username,
+                            verified = n,
+                            "Mojang property signatures verified"
+                        );
+                        if let Some(db) = &self.state.db {
+                            if let Err(e) =
+                                db.cache_player_profile(uuid, &username, &properties).await
+                            {
+                                tracing::warn!(error = %e, "failed to cache verified profile");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        // A bad signature in online mode means someone
+                        // is forging properties. Reject the login —
+                        // skipping this check would let a MITM inject
+                        // arbitrary skin/cape data.
+                        let reason = serde_json::json!({
+                            "text": format!("Profile signature check failed: {}", e),
+                            "color": "red"
+                        })
+                        .to_string();
+                        let _ = self.send_disconnect_login(&reason).await;
+                        tracing::warn!(
+                            username = %username,
+                            error = %e,
+                            "rejected login: Mojang property signature invalid"
+                        );
+                        return Err(ConnectionError::Auth(format!("bad signature: {}", e)));
+                    },
+                },
+                Err(e) => {
+                    // Misconfigured key. Log loudly but allow the login —
+                    // failing closed here would lock everyone out.
+                    tracing::error!(error = %e, "mojang_public_key in config does not parse");
+                },
+            }
+        }
+
+        // Pre-netty (1.6.x) path: pull whatever signed properties we
+        // cached for this username from a previous 1.7+ login. The
+        // cached `value`/`signature` base64 strings round-trip
+        // verbatim, so a 1.7+ relay-target that re-verifies the
+        // signature will see the same bytes Mojang signed.
+        if is_pre_netty_login && properties.is_empty() {
+            if let Some(db) = &self.state.db {
+                match db.load_cached_profile_by_username(&username).await {
+                    Ok(Some((_cached_uuid, cached_props))) => {
+                        tracing::info!(
+                            username = %username,
+                            count = cached_props.len(),
+                            "restored cached skin properties for 1.6.x login (Mojang auth unreachable for pre-1.7)"
+                        );
+                        properties = cached_props;
+                    },
+                    Ok(None) => {
+                        tracing::debug!(
+                            username = %username,
+                            "no cached profile for 1.6.x login — player will appear with default skin"
+                        );
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load cached profile");
+                    },
+                }
+            }
+        }
 
         self.send_login_success(uuid, &username, &properties)
             .await?;
@@ -1150,61 +1589,6 @@ impl ClientConnection {
         Ok(session)
     }
 
-    /// Verifies that player profile properties (textures, capes, etc.) are signed by Mojang.
-    ///
-    /// This security check ensures that the properties sent during login are authentic
-    /// by verifying their RSA signatures against Mojang's public key. If any property
-    /// signature is invalid or missing, the player is kicked to prevent spoofed profiles.
-    ///
-    /// # Arguments
-    /// * `properties` - The profile properties received from the auth server
-    ///
-    /// # Returns
-    /// * `Ok(())` if all signatures are valid
-    /// * `Err(ConnectionError::Auth)` if verification fails, kicking the player
-    fn check_properties_sig(
-        &self,
-        properties: &[kojacoord_auth::ProfileProperty],
-    ) -> Result<(), ConnectionError> {
-        let mojang_public_key_der = BASE64_STANDARD
-            .decode(self.state.config.proxy.mojang_public_key.trim())
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to decode mojang_public_key from base64 config");
-                ConnectionError::Auth("Failed to decode Mojang public key".into())
-            })?;
-
-        let mojang_public_key = RsaPublicKey::from_public_key_der(&mojang_public_key_der)
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to parse Mojang public key DER");
-                ConnectionError::Auth("Failed to parse Mojang public key".into())
-            })?;
-
-        for property in properties {
-            if let Some(signature) = &property.signature {
-                let signature_bytes = BASE64_STANDARD
-                    .decode(signature.trim())
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, property = %property.name, "Failed to decode signature from base64");
-                        return Err(ConnectionError::Auth("Invalid property signature encoding".into()));
-                    })?;
-
-                mojang_public_key
-                    .verify(
-                        Pkcs1v15Encrypt,
-                        Sha256::new(),
-                        property.value.as_bytes(),
-                        &signature_bytes,
-                    )
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, property = %property.name, "Property signature verification failed");
-                        ConnectionError::Auth("Properties not signed properly. Please restart your game.".into())
-                    })?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Move an in-play player to `target` without dropping the connection:
     /// reset the client into limbo (which transitions its world), then connect,
     /// handshake and complete login against the chosen backend. Returns the new
@@ -1258,7 +1642,14 @@ impl ClientConnection {
         .await?;
         let backend_protocol = self.backend_protocol_for(Some(target));
         let backend_threshold = self
-            .complete_backend_login(&mut backend, backend_protocol, username, uuid, &props, &mode)
+            .complete_backend_login(
+                &mut backend,
+                backend_protocol,
+                username,
+                uuid,
+                &props,
+                &mode,
+            )
             .await?;
 
         if let Some(b) = self.state.server_registry.get(target) {
@@ -1279,50 +1670,31 @@ impl ClientConnection {
         &mut self,
         threshold: i32,
     ) -> Result<(), ConnectionError> {
-        let ver = nearest(self.protocol_version);
-        match ver.canonical_typed_packet_version() {
-            CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 | CanonicalVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
-            CanonicalVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
-            CanonicalVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
-            CanonicalVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
-            CanonicalVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
-            CanonicalVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21_x::login::ClientboundSetCompression;
-                self.write_typed(ClientboundSetCompression {
-                    threshold: VarInt(threshold),
-                })
-                .await
-            },
+        let proto = self.protocol_version;
+        let ver = nearest(proto);
+        // Per https://minecraft.wiki/w/Java_Edition_protocol/Packets — the
+        // SetCompression login packet was introduced in 1.8 (protocol 47).
+        // 1.6.x (pre-netty) has no packet framing layer at all and 1.7.x
+        // has framing but no compression negotiation. Sending the 1.8
+        // packet to either is a wire-format violation; the client treats
+        // the unexpected bytes as a malformed packet and disconnects.
+        //
+        // `build_set_compression` returns `None` for those two epochs,
+        // so the explicit epoch check below is defence-in-depth (and
+        // gives us a tracing breadcrumb for the skip).
+        if ver.epoch() == Epoch::PreNetty || ver.epoch() == Epoch::V1_7 {
+            tracing::debug!(
+                protocol = proto,
+                "skipping SetCompression for pre-1.8 client (compression not supported)"
+            );
+            return Ok(());
+        }
+        let canonical = ver.canonical_typed_packet_version();
+        if let Some(pkt) = crate::login_packets::build_set_compression(canonical, proto, threshold)
+        {
+            self.write_raw_login_packet(pkt).await
+        } else {
+            Ok(())
         }
     }
 
@@ -1341,21 +1713,30 @@ impl ClientConnection {
             "sending LoginSuccess"
         );
         // 1.6.4 pre-netty has a completely different `LoginRequestS2C`
-        // shape — handle it separately. Every other canonical version
-        // routes through the modern login_packets builder.
+        // shape AND framing. The packet goes out as raw bytes
+        // `[0x01][entity_id i32][level_type UCS-2][gamemode u8]
+        //  [dimension i8][difficulty u8][world_height u8][max_players u8]`
+        // — no length VarInt, no packet-id VarInt, no compression. The
+        // previous code path here used `write_typed`, which routes
+        // through the modern `write_packet` framing and so produces a
+        // packet the 1.6.4 client cannot parse (it reads the leading
+        // length VarInt as a garbage packet id and disconnects).
         if matches!(canonical, CanonicalVersion::V1_6_4) {
+            use kojacoord_protocol::codec::Encode;
             use kojacoord_protocol::versions::v1_6_x::login::LoginRequestS2C;
-            return self
-                .write_typed(LoginRequestS2C {
-                    entity_id: 0,
-                    level_type: "default".to_string(),
-                    game_mode: 0,
-                    dimension: 0,
-                    difficulty: 0,
-                    world_height: 250,
-                    max_players: 20,
-                })
-                .await;
+            let pkt = LoginRequestS2C {
+                entity_id: 0,
+                level_type: "default".to_string(),
+                game_mode: 0,
+                dimension: 0,
+                difficulty: 0,
+                world_height: 250,
+                max_players: 20,
+            };
+            let mut wire = BytesMut::new();
+            wire.put_u8(0x01);
+            pkt.encode(&mut wire)?;
+            return crate::packet_io::write_legacy_bytes(&mut self.stream, &wire).await;
         }
         let profile = crate::login_packets::LoginProfile {
             uuid,
@@ -1391,14 +1772,38 @@ impl ClientConnection {
     }
 
     async fn recv_encryption_response(&mut self) -> Result<(Vec<u8>, Vec<u8>), ConnectionError> {
+        use bytes::Buf;
         let mut bytes =
             crate::packet_io::read_packet(&mut self.stream, self.compression_threshold).await?;
         let _id = VarInt::decode(&mut bytes)?;
-        let ss_len = VarInt::decode(&mut bytes)?.0 as usize;
-        let ss: Vec<u8> = bytes.split_to(ss_len).to_vec();
-        let vt_len = VarInt::decode(&mut bytes)?.0 as usize;
-        let vt: Vec<u8> = bytes.split_to(vt_len).to_vec();
-        Ok((ss, vt))
+        // 1.7.x kept Short(i16) length-prefixes on the encryption byte arrays;
+        // 1.8+ uses VarInt. Reading the wrong shape yields a garbage length
+        // (e.g. VarInt(128)=0x80 0x01 read as i16 = -32767 → "Smaller key
+        // than nothing" disconnect on the client).
+        let epoch = nearest(self.protocol_version).epoch();
+        if matches!(epoch, Epoch::V1_7) {
+            if bytes.remaining() < 2 {
+                return Err(ConnectionError::Protocol(
+                    kojacoord_protocol::ProtocolError::UnexpectedEof,
+                ));
+            }
+            let ss_len = bytes.get_i16() as usize;
+            let ss: Vec<u8> = bytes.split_to(ss_len).to_vec();
+            if bytes.remaining() < 2 {
+                return Err(ConnectionError::Protocol(
+                    kojacoord_protocol::ProtocolError::UnexpectedEof,
+                ));
+            }
+            let vt_len = bytes.get_i16() as usize;
+            let vt: Vec<u8> = bytes.split_to(vt_len).to_vec();
+            Ok((ss, vt))
+        } else {
+            let ss_len = VarInt::decode(&mut bytes)?.0 as usize;
+            let ss: Vec<u8> = bytes.split_to(ss_len).to_vec();
+            let vt_len = VarInt::decode(&mut bytes)?.0 as usize;
+            let vt: Vec<u8> = bytes.split_to(vt_len).to_vec();
+            Ok((ss, vt))
+        }
     }
 
     async fn send_disconnect_login(&mut self, reason_json: &str) -> Result<(), ConnectionError> {
@@ -1427,78 +1832,19 @@ impl ClientConnection {
     }
 
     async fn send_play_disconnect(&mut self, reason_json: &str) -> Result<(), ConnectionError> {
+        // Centralised in `login_packets::build_play_disconnect` —
+        // collapses 7 inline canonical-version arms into a single
+        // builder call so this site stays one-liner-clean alongside
+        // `send_login_success` / `send_encryption_request` /
+        // `send_set_compression_with_threshold`.
         let proto = self.protocol_version;
-        let ver = nearest(proto);
-        let pid = cb_play(proto, "ClientboundDisconnect");
-        if pid == 0xFF {
-            return Ok(());
+        let canonical = nearest(proto).canonical_typed_packet_version();
+        if let Some(pkt) = crate::login_packets::build_play_disconnect(canonical, proto, reason_json)
+        {
+            self.write_raw_login_packet(pkt).await
+        } else {
+            Ok(())
         }
-
-        let mut payload = BytesMut::new();
-        VarInt(pid as i32).encode(&mut payload)?;
-
-        match ver.canonical_typed_packet_version() {
-            CanonicalVersion::V1_6_4 => {
-                use kojacoord_protocol::versions::v1_6_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_7_10 => {
-                use kojacoord_protocol::versions::v1_7_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_8 => {
-                use kojacoord_protocol::versions::v1_8_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_12_2 => {
-                use kojacoord_protocol::versions::v1_12_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_16_5 => {
-                use kojacoord_protocol::versions::v1_16_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_19_4 => {
-                use kojacoord_protocol::versions::v1_19_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_20_4 => {
-                use kojacoord_protocol::versions::v1_20_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-            CanonicalVersion::V1_21 => {
-                use kojacoord_protocol::versions::v1_21_x::play::ClientboundDisconnect;
-                let pkt = ClientboundDisconnect {
-                    reason: reason_json.to_owned(),
-                };
-                pkt.encode(&mut payload)?;
-            },
-        }
-
-        crate::packet_io::write_packet(&mut self.stream, &payload, self.compression_threshold)
-            .await?;
-        Ok(())
     }
 
     pub async fn send_system_message(&mut self, text: &str) -> Result<(), ConnectionError> {
@@ -1565,7 +1911,14 @@ impl ClientConnection {
                         }
                         let backend_protocol = self.backend_protocol_for(Some(&server_name));
                         match self
-                            .complete_backend_login(&mut conn, backend_protocol, username, uuid, &props, &mode)
+                            .complete_backend_login(
+                                &mut conn,
+                                backend_protocol,
+                                username,
+                                uuid,
+                                &props,
+                                &mode,
+                            )
                             .await
                         {
                             Ok(backend_threshold) => {
@@ -1626,10 +1979,12 @@ impl ClientConnection {
             self.ml_session.kind,
         );
         let mut backend = limbo.run().await?;
+        // Route through the failover-aware path so a downed primary
+        // gets transparently swapped for its currently-active standby.
         let selected_server = self
             .state
-            .routing
-            .select_with_region(&self.state.server_registry, Some(self.addr.ip()));
+            .route_via_failover(Some(self.addr.ip()))
+            .await;
         let mode = self.effective_forwarding_mode(
             selected_server
                 .as_ref()
@@ -1657,7 +2012,14 @@ impl ClientConnection {
         let backend_protocol =
             self.backend_protocol_for(selected_server.as_ref().map(|b| b.name.as_str()));
         let backend_threshold = self
-            .complete_backend_login(&mut backend, backend_protocol, username, uuid, &props, &mode)
+            .complete_backend_login(
+                &mut backend,
+                backend_protocol,
+                username,
+                uuid,
+                &props,
+                &mode,
+            )
             .await?;
         if let Some(b) = selected_server.as_ref() {
             b.player_count.fetch_add(1, Ordering::Relaxed);
@@ -1794,69 +2156,33 @@ impl ClientConnection {
             "sending backend handshake address"
         );
 
-        {
-            let hs_id = REGISTRY
-                .get_id_for_version(
-                    proto,
-                    ProtocolState::Handshake,
-                    Direction::Serverbound,
-                    "ServerboundHandshake",
-                )
-                .unwrap_or(0x00);
-            let pkt = ServerboundHandshake {
-                protocol_version: VarInt(proto as i32),
-                server_address: handshake_address,
-                server_port: 25565,
-                next_state: VarInt(2),
-            };
+        // Centralised through `login_packets::build_backend_handshake` /
+        // `build_backend_login_start` — collapses the inline 4-arm
+        // canonical_version matches into the same builder pattern the
+        // rest of connection.rs uses for clientbound login packets.
+        let canonical = nearest(proto).canonical_typed_packet_version();
+
+        if let Some(pkt) = crate::login_packets::build_backend_handshake(
+            canonical,
+            proto,
+            handshake_address,
+            25565,
+        ) {
             let mut payload = BytesMut::new();
-            VarInt(hs_id as i32).encode(&mut payload)?;
-            pkt.encode(&mut payload)?;
+            VarInt(pkt.id as i32).encode(&mut payload)?;
+            payload.extend_from_slice(&pkt.body);
             crate::packet_io::write_packet(conn, &payload, NO_COMPRESSION).await?;
         }
 
-        {
-            let ls_id = sb_login(proto, "ServerboundLoginStart");
+        if let Some(pkt) = crate::login_packets::build_backend_login_start(
+            canonical,
+            proto,
+            username.to_string(),
+            uuid,
+        ) {
             let mut ls_payload = BytesMut::new();
-            VarInt(ls_id as i32).encode(&mut ls_payload)?;
-            // LoginStart shape:
-            //   1.19.x (proto 759-762)  → username, Option<UUID>
-            //   1.20.2+ (proto 764+)    → username, mandatory UUID
-            //   1.20.0/1.20.1 (proto 763) → username, Option<UUID>
-            // The v1_19_x struct holds Option<UUID>; v1_20_x holds mandatory UUID.
-            let canonical = nearest(proto).canonical_typed_packet_version();
-            if matches!(canonical, CanonicalVersion::V1_19_4)
-                || (canonical == CanonicalVersion::V1_20_4 && proto < 764)
-            {
-                use kojacoord_protocol::versions::v1_19_x::login::ServerboundLoginStart;
-                ServerboundLoginStart {
-                    username: username.to_string(),
-                    uuid: Some(uuid),
-                }
-                .encode(&mut ls_payload)?;
-            } else if matches!(
-                canonical,
-                CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21
-            ) {
-                use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginStart;
-                ServerboundLoginStart {
-                    username: username.to_string(),
-                    uuid,
-                }
-                .encode(&mut ls_payload)?;
-            } else if matches!(canonical, CanonicalVersion::V1_16_5) {
-                use kojacoord_protocol::versions::v1_16_x::login::ServerboundLoginStart;
-                ServerboundLoginStart {
-                    username: username.to_string(),
-                }
-                .encode(&mut ls_payload)?;
-            } else {
-                use kojacoord_protocol::versions::v1_8_x::login::ServerboundLoginStart;
-                ServerboundLoginStart {
-                    username: username.to_string(),
-                }
-                .encode(&mut ls_payload)?;
-            }
+            VarInt(pkt.id as i32).encode(&mut ls_payload)?;
+            ls_payload.extend_from_slice(&pkt.body);
             crate::packet_io::write_packet(conn, &ls_payload, NO_COMPRESSION).await?;
         }
 
@@ -1957,44 +2283,14 @@ impl ClientConnection {
                 tracing::debug!(threshold, "backend enabled compression");
             } else if packet_id == id_login_success {
                 tracing::debug!("backend sent LoginSuccess — login sequence complete");
-                // LoginSuccess wire shape changes per release:
-                //   1.7.x / 1.8: UUID-as-string + username
-                //   1.12.2:      UUID-bytes (16) + username
-                //   1.16.5:      same as 1.12.2 in this codebase
-                //   1.19+:       + properties array
-                //   1.20.5/1.21: + strict-error-handling bool
-                // Decode using the BACKEND's shape so the cursor advances the
-                // correct number of bytes.
-                match backend_canonical {
-                    CanonicalVersion::V1_6_4 | CanonicalVersion::V1_7_10 => {
-                        use kojacoord_protocol::versions::v1_7_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_8 => {
-                        use kojacoord_protocol::versions::v1_8_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_12_2 => {
-                        use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_16_5 => {
-                        use kojacoord_protocol::versions::v1_16_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_19_4 => {
-                        use kojacoord_protocol::versions::v1_19_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_20_4 => {
-                        use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                    CanonicalVersion::V1_21 => {
-                        use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginSuccess;
-                        let _ = ClientboundLoginSuccess::decode(&mut cursor);
-                    },
-                }
+                // LoginSuccess wire shape changes per release (UUID-as-
+                // string vs UUID-bytes, optional properties, optional
+                // strict-error-handling). The skip is centralised in
+                // `login_packets::skip_backend_login_success` so this
+                // site doesn't need 7 inline arms; we don't care about
+                // the field values because the proxy already issued its
+                // own LoginSuccess to the client.
+                crate::login_packets::skip_backend_login_success(backend_canonical, &mut cursor);
 
                 // Velocity modern forwarding is a request/response flow
                 // driven by the backend's `LoginPluginRequest` — we
@@ -2369,33 +2665,6 @@ impl ClientConnection {
         }
         .run()
         .await
-    }
-
-    async fn write_login_packet<P: Encode>(
-        &mut self,
-        packet: P,
-        pid: u8,
-    ) -> Result<(), ConnectionError> {
-        let mut payload = BytesMut::new();
-        VarInt(pid as i32).encode(&mut payload)?;
-        packet.encode(&mut payload)?;
-        crate::packet_io::write_packet(&mut self.stream, &payload, self.compression_threshold)
-            .await?;
-        Ok(())
-    }
-
-    /// Send a typed clientbound packet whose id comes from the
-    /// `PacketId` trait impl on the packet type itself. This replaces
-    /// the older two-step `let pid = cb_login(proto, "Name"); write_login_packet(pkt, pid)`
-    /// pattern — no string-keyed registry lookup, no risk of typo'd
-    /// names, id resolves at compile time. Returns silently on the
-    /// `0xFF` sentinel (packet doesn't exist for this protocol).
-    async fn write_typed<P: Encode + PacketId>(&mut self, packet: P) -> Result<(), ConnectionError> {
-        let pid = P::packet_id(self.protocol_version);
-        if pid == 0xFF {
-            return Ok(());
-        }
-        self.write_login_packet(packet, pid).await
     }
 
     /// Write an already-encoded login-state packet (`id` + `body`)

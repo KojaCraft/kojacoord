@@ -79,19 +79,16 @@ const STANCE_OFFSET: f64 = 1.62;
 // ──────────────────────────────────────────────────────────────────────────
 
 fn unpack_position(packed: i64) -> (i32, i32, i32) {
-    let mut x = (packed >> 38) & 0x3FF_FFFF;
-    let mut y = packed & 0xFFF;
-    let mut z = (packed >> 12) & 0x3FF_FFFF;
-    if x >= 0x200_0000 {
-        x -= 0x400_0000;
-    }
-    if z >= 0x200_0000 {
-        z -= 0x400_0000;
-    }
-    if y >= 0x800 {
-        y -= 0x1000;
-    }
-    (x as i32, y as i32, z as i32)
+    // 1.8 packed Position layout = legacy (Y in middle 12 bits, bits 26..37):
+    //   `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`.
+    // 1.14+ moved Y to the low 12 bits. Reading a 1.8 packet with the
+    // 1.14+ layout (as the previous version of this function did) crossed
+    // the Y and Z bits — every block coord delivered to a 1.7 client
+    // landed in the wrong place. Delegates to
+    // `kojacoord_protocol::types::decode_legacy_position` to keep the
+    // bit-math in exactly one place.
+    let pos = kojacoord_protocol::types::decode_legacy_position(packed as u64);
+    (pos.x, pos.y, pos.z)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -494,7 +491,8 @@ mod tests {
     }
 
     fn pack_pos(x: i64, y: i64, z: i64) -> i64 {
-        ((x & 0x3FF_FFFF) << 38) | ((z & 0x3FF_FFFF) << 12) | (y & 0xFFF)
+        // Test helper — 1.8 packed Position layout (legacy: Y in middle).
+        ((x & 0x3FF_FFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FF_FFFF)
     }
 
     #[test]

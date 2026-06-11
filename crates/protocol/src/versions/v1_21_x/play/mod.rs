@@ -34,7 +34,9 @@ fn decode_string(src: &mut Bytes) -> Result<String, ProtocolError> {
 }
 
 pub use packets::{
-    ClientboundDisconnect, ClientboundKeepAlive, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerPosition, ClientboundRespawn, ClientboundSetCarriedItem, ClientboundSound, ClientboundSystemChat,
+    ClientboundDisconnect, ClientboundKeepAlive, ClientboundLogin, ClientboundPlayerAbilities,
+    ClientboundPlayerPosition, ClientboundRespawn, ClientboundSetCarriedItem, ClientboundSound,
+    ClientboundSystemChat,
 };
 
 mod packets {
@@ -161,7 +163,14 @@ mod packets {
         pub is_flat: bool,
         pub death_location: Option<(String, i64)>,
         pub portal_cooldown: VarInt,
-        pub sea_level: VarInt,
+        /// Per BungeeCord `protocol/Login.java::read`: `seaLevel` was
+        /// added in proto 768 (1.21.2). For proto 767 (1.21 / 1.21.1)
+        /// the field is absent on the wire. `None` ⇒ omit.
+        pub sea_level: Option<VarInt>,
+        /// Per BungeeCord `Login.java::read`: `secureProfile` has been
+        /// mandatory since proto 766 (1.20.5). Every v1_21_x proto
+        /// (767+) carries it.
+        pub secure_profile: bool,
     }
 
     impl PacketId for ClientboundLogin {
@@ -197,7 +206,10 @@ mod packets {
                 None => dst.put_u8(0),
             }
             self.portal_cooldown.encode(dst)?;
-            self.sea_level.encode(dst)?;
+            if let Some(s) = &self.sea_level {
+                s.encode(dst)?;
+            }
+            dst.put_u8(self.secure_profile as u8);
             Ok(())
         }
     }
@@ -235,7 +247,16 @@ mod packets {
                 None
             };
             let portal_cooldown = VarInt::decode(src)?;
-            let sea_level = VarInt::decode(src)?;
+            // Decoder lacks proto context — round-trip defaults to the
+            // 1.21.2+ shape (sea_level present). Pre-1.21.2 callers
+            // reconstructing must set this to None explicitly.
+            let sea_level = if src.remaining() >= 2 {
+                Some(VarInt::decode(src)?)
+            } else {
+                None
+            };
+            need(src, 1)?;
+            let secure_profile = src.get_u8() != 0;
             Ok(Self {
                 entity_id,
                 is_hardcore,
@@ -256,6 +277,7 @@ mod packets {
                 death_location,
                 portal_cooldown,
                 sea_level,
+                secure_profile,
             })
         }
     }
@@ -491,4 +513,3 @@ mod packets {
         }
     }
 }
-

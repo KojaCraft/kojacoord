@@ -83,7 +83,7 @@ impl LimboPackets for V1_12 {
         )
     }
 
-    fn note_sound(&self, proto: u32, pos: SoundParams) -> Option<EncodedPacket> {
+    fn note_sound(&self, _proto: u32, _pos: SoundParams) -> Option<EncodedPacket> {
         None
     }
 
@@ -114,7 +114,17 @@ impl LimboPackets for V1_12 {
     }
 
     fn keepalive(&self, proto: u32, id: i64) -> Option<EncodedPacket> {
-        encode(proto, p::ClientboundKeepAlive { keep_alive_id: id })
+        // Wire type for KeepAlive depends on `proto`:
+        //   1.8 – 1.12.1 (47 ≤ proto ≤ 339) → VarInt
+        //   1.12.2 onward (proto ≥ 340)     → Long (i64)
+        // The struct dispatches internally — see v1_12_x::play::ClientboundKeepAlive.
+        encode(
+            proto,
+            p::ClientboundKeepAlive {
+                keep_alive_id: id,
+                for_proto: proto,
+            },
+        )
     }
 
     fn brand(&self, proto: u32, brand: &str) -> Option<EncodedPacket> {
@@ -123,7 +133,11 @@ impl LimboPackets for V1_12 {
         // clients ignore plugin messages with the new name (and some
         // Forge stacks crash decoding the data with the wrong handler
         // max-length), so we have to keep the old name here.
-        let channel = if proto >= 393 { "minecraft:brand" } else { "MC|Brand" };
+        let channel = if proto >= 393 {
+            "minecraft:brand"
+        } else {
+            "MC|Brand"
+        };
         let mut data = BytesMut::new();
         VarInt(brand.len() as i32).encode(&mut data).ok()?;
         data.put_slice(brand.as_bytes());

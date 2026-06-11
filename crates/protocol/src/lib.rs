@@ -23,14 +23,14 @@ pub mod registry;
 pub mod types;
 pub mod versions;
 
-pub use codec::{
-    read_packet, write_packet, Decode, DecodeVer, Encode, EncodeVer, PacketId,
-};
+pub use codec::{read_packet, write_packet, Decode, DecodeVer, Encode, EncodeVer, PacketId};
 pub use dimension_codec::{
     dimension_codec_nbt, dimension_codec_nbt_1_20_4, dimension_type_nbt, dimension_type_nbt_1_20_4,
 };
 pub use error::ProtocolError;
-pub use negotiation::{CanonicalVersion, Epoch, ProtocolVersion, VersionRegistry};
+pub use negotiation::{
+    CanonicalVersion, Epoch, MinecraftEdition, ProtocolVersion, VersionRegistry,
+};
 pub use registry::{build_default_registry, Direction, PacketMeta, PacketRegistry, ProtocolState};
 pub use types::flattening::{BlockFlatteningTable, ItemFlatteningTable};
 pub use types::position::{

@@ -5,7 +5,8 @@ use crate::error::ProtocolError;
 use crate::types::VarInt;
 
 pub use packets::{
-    ClientboundChatMessage, ClientboundDisconnect, ClientboundJoinGame, ClientboundKeepAlive, ClientboundPlayerAbilities, ClientboundPlayerPosition,
+    ClientboundChatMessage, ClientboundDisconnect, ClientboundJoinGame, ClientboundKeepAlive,
+    ClientboundPlayerAbilities, ClientboundPlayerPosition,
 };
 
 mod packets {
@@ -47,8 +48,6 @@ mod packets {
         }
     }
 
-    // ── KeepAlive (0x00 / 0x00) ───────────────────────────────────────────────
-
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundKeepAlive {
         // 1.7.10 wire encodes this as i32, not VarInt — VarInt was
@@ -77,8 +76,6 @@ mod packets {
             })
         }
     }
-
-    // ── JoinGame (0x01) ───────────────────────────────────────────────────────
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundJoinGame {
@@ -129,8 +126,6 @@ mod packets {
         }
     }
 
-    // ── ChatMessage (0x02 / 0x01) ─────────────────────────────────────────────
-
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundChatMessage {
         pub json_message: String,
@@ -155,11 +150,6 @@ mod packets {
             Ok(Self { json_message })
         }
     }
-
-    // ── Respawn (0x07) ────────────────────────────────────────────────────────
-
-    // ── PlayerPosition (0x08) ─────────────────────────────────────────────────
-    // 1.7.10 uses head_y instead of feet_y and has no teleport_id.
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundPlayerPosition {
@@ -232,88 +222,6 @@ mod packets {
         }
     }
 
-    // ── PluginMessage (0x3F / 0x17) ───────────────────────────────────────────
-    // 1.7.10 uses a signed i16 length prefix for the data payload, not VarInt.
-
-    // ── Interact (0x02) ───────────────────────────────────────────────────────
-    // 1.7.10: no hand field in Interact / InteractAt variants.
-
-    // ── Movement (0x03–0x06) ──────────────────────────────────────────────────
-
-    // ── Set Equipment (0x04) ─────────────────────────────────────────────────────
-
-    // ── Entity Animation (0x0B) ───────────────────────────────────────────────
-
-    // ── Take Item Entity (0x0D) ───────────────────────────────────────────────
-
-    // ── Spawn Experience Orb (0x11) ────────────────────────────────────────────
-
-    // ── Set Entity Motion (0x12) ───────────────────────────────────────────────
-
-    // ── Remove Entities (0x13) ─────────────────────────────────────────────────
-
-    // ── Move Entity Pos (0x15) ───────────────────────────────────────────────
-
-    // ── Move Entity Rot (0x16) ───────────────────────────────────────────────
-
-    // ── Move Entity Pos Rot (0x17) ───────────────────────────────────────────
-
-    // ── Teleport Entity (0x18) ───────────────────────────────────────────────
-
-    // ── Rotate Head (0x19) ───────────────────────────────────────────────────
-
-    // ── Entity Event (0x1A) ─────────────────────────────────────────────────
-
-    // ── Set Entity Link (0x1B) ───────────────────────────────────────────────
-
-    // ── Update Effects (0x1D) ───────────────────────────────────────────────
-
-    // ── Remove Entity Effect (0x1E) ───────────────────────────────────────────
-
-    // ── Update Attributes (0x20) ───────────────────────────────────────────────
-
-    // ── Level Chunk With Light (0x21) ───────────────────────────────────────
-
-    // ── Section Blocks Update (0x22) ─────────────────────────────────────────
-
-    // ── Block Action (0x24) ─────────────────────────────────────────────────
-
-    // ── Block Destroy Stage (0x25) ─────────────────────────────────────────
-
-    // ── Forget Level Chunk (0x26) ───────────────────────────────────────────
-
-    // ── Explosion (0x27) ─────────────────────────────────────────────────────
-
-    // ── Level Event (0x28) ─────────────────────────────────────────────────
-
-    // ── Level Particles (0x2A) ───────────────────────────────────────────────
-
-    // ── Game Event (0x2B) ─────────────────────────────────────────────────
-
-    // ── Open Screen (0x2D) ─────────────────────────────────────────────────
-
-    // ── Container Close (0x2E) ─────────────────────────────────────────────
-
-    // ── Container Set Property (0x31) ───────────────────────────────────────
-
-    // ── Set Time (0x03) ───────────────────────────────────────────────────────
-
-    // ── Set Health (0x06) ───────────────────────────────────────────────────────
-
-    // ── Spawn Player (0x0C) ─────────────────────────────────────────────────────
-
-    // ── Spawn Entity (0x0E) ─────────────────────────────────────────────────────
-
-    // ── Set Experience (0x1F) ───────────────────────────────────────────────────
-
-    // ── Block Update (0x23) ───────────────────────────────────────────────────
-
-    // ── Set Held Item (0x09) ─────────────────────────────────────────────────────
-
-    // ── Named Sound Effect (0x29) ────────────────────────────────────────────────
-
-    // ── Player Abilities (0x39) ───────────────────────────────────────────────────
-
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundPlayerAbilities {
         // 1.7 wire: flags (i8), flyingSpeed (f32), walkingSpeed (f32).
@@ -347,19 +255,4 @@ mod packets {
             })
         }
     }
-
-    // ── ContainerSetContent (0x30) ────────────────────────────────────────────
-
-    // ── ContainerSetSlot (0x2F) ───────────────────────────────────────────────
-
-
-    // ── Open Sign Editor (0x36) ─────────────────────────────────────────────
-
-    // ── Player Info Update (0x38) ─────────────────────────────────────────────
-
-    // ── Tab List (0x47) ─────────────────────────────────────────────────────
-
-    // ── Resource Pack Push (0x48) ───────────────────────────────────────────
-
 }
-

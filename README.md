@@ -254,6 +254,7 @@ We couldn't have built accurate protocol support without these amazing resources
 
 - [Minecraft Wiki - Java Edition Protocol](https://minecraft.wiki/w/Java_Edition_protocol/Packets) - Comprehensive packet documentation and version history
 - [PrismarineJS minecraft-data](https://github.com/PrismarineJS/minecraft-data) - Detailed protocol data and mappings
+- [ProtocolSupport](https://www.javatips.net/api/ProtocolSupportBungee-master/src/protocolsupport/protocol/transformer/v_1_4_1_5_1_6_core/) - For legacy protocols with detailled informations.
 
 Huge thanks to the maintainers of these projects for providing such invaluable information about Minecraft's protocols.
 

@@ -71,8 +71,15 @@ const V1204_LOGIN_S2C_LOGIN_SUCCESS: u8 = 0x02;
 const V1204_LOGIN_S2C_SET_COMPRESSION: u8 = 0x03;
 
 const V1204_PLAY_S2C_DISCONNECT: u8 = 0x1B;
-const V1204_PLAY_S2C_KEEP_ALIVE: u8 = 0x22;
-const V1204_PLAY_S2C_SYSTEM_CHAT: u8 = 0x55;
+const V1204_PLAY_S2C_KEEP_ALIVE: u8 = 0x24;
+// Per BungeeCord `Protocol.java::TO_CLIENT` SystemChat table:
+//   `map(MINECRAFT_1_20_2, 0x67)` then `map(MINECRAFT_1_20_3, 0x69)`.
+// Proto 765 (the converter's target) maps to `MINECRAFT_1_20_3 = 0x69`.
+// The previous `0x55` did not correspond to any 1.20.x mapping; the
+// 1.16.5 → 1.20.4 chat conversion was emitting a packet id no 1.20.4
+// client would recognise. Forwarded packets were silently dropped by
+// the client's id-dispatcher.
+const V1204_PLAY_S2C_SYSTEM_CHAT: u8 = 0x69;
 
 /// S2C entry point. We don't know the connection state here (login vs play vs
 /// configuration) — we use a heuristic: small IDs that decode as a known login

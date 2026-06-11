@@ -249,10 +249,27 @@ mod packets {
     // ── SpawnEntity (0x00) ────────────────────────────────────────────────────
 
     // ── KeepAlive (0x1F / 0x0B) ──────────────────────────────────────────────
+    //
+    // Per https://minecraft.wiki/w/Java_Edition_protocol/Packets#Keep_Alive
+    // (clientbound) the on-wire type for this packet changed twice:
+    //   • 1.7.x  (proto 4 / 5)        → i32 (handled in v1_7_x module)
+    //   • 1.8 to 1.12.1 (47 ≤ p ≤ 339) → VarInt
+    //   • 1.12.2 onward (p ≥ 340)     → Long (i64)
+    //
+    // This module's canonical bucket is V1_12_2 but it covers protos
+    // 107 – 498 (1.9 through 1.14.x) in the registry, so the encoder
+    // must dispatch on the negotiated protocol or pre-1.12.2 clients
+    // misparse the 8-byte i64 as a VarInt and disconnect on timeout.
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundKeepAlive {
         pub keep_alive_id: i64,
+        /// Negotiated protocol number for the destination client. Used
+        /// only by `encode` / `decode` to pick the right wire type.
+        /// Defaults to `u32::MAX` ⇒ "use the modern (Long) shape" for
+        /// callers that don't know better — Long has been current since
+        /// 1.12.2, so that's the safe default.
+        pub for_proto: u32,
     }
 
     impl PacketId for ClientboundKeepAlive {
@@ -263,16 +280,28 @@ mod packets {
 
     impl Encode for ClientboundKeepAlive {
         fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
-            dst.put_i64(self.keep_alive_id);
-            Ok(())
+            if self.for_proto < 340 {
+                // 1.8 – 1.12.1 wire: VarInt.
+                // The id is stored as i64 internally; truncate cleanly to i32 —
+                // server-emitted IDs are small monotonic counters, so this is
+                // safe in practice.
+                VarInt(self.keep_alive_id as i32).encode(dst)
+            } else {
+                dst.put_i64(self.keep_alive_id);
+                Ok(())
+            }
         }
     }
 
     impl Decode for ClientboundKeepAlive {
         fn decode(src: &mut Bytes) -> Result<Self, ProtocolError> {
+            // Symmetric default — assume modern Long. Callers needing to
+            // round-trip a pre-1.12.2 frame must build the VarInt path
+            // explicitly (the proxy doesn't decode these from clients).
             need(src, 8)?;
             Ok(Self {
                 keep_alive_id: src.get_i64(),
+                for_proto: u32::MAX,
             })
         }
     }

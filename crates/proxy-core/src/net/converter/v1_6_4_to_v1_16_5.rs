@@ -7,21 +7,26 @@ use super::items;
 use super::{build_payload, split_id};
 use crate::converter::ConversionResult;
 
-const V164_S2C_KEEP_ALIVE: u8 = 0x00;
-const V164_S2C_CHAT: u8 = 0x03;
-const V164_S2C_PLAYER_POS_LOOK: u8 = 0x13;
-const V164_S2C_SPAWN_PLAYER: u8 = 0x14;
-const V164_S2C_ENTITY_TELEPORT: u8 = 0x18;
-const V164_S2C_ENTITY_REL_MOVE: u8 = 0x15;
-const V164_S2C_ENTITY: u8 = 0x1E;
-const V164_S2C_BLOCK_CHANGE: u8 = 0x35;
-const V164_S2C_SET_SLOT: u8 = 0x67;
-const V164_S2C_WINDOW_ITEMS: u8 = 0x68;
-const V164_S2C_ENTITY_EQUIPMENT: u8 = 0x1C;
-const V164_S2C_EXPERIENCE: u8 = 0x2B;
-const V164_S2C_HELD_ITEM_CHANGE: u8 = 0x09;
-const V164_S2C_PLAYER_ABILITIES: u8 = 0x43;
-const V164_S2C_DISCONNECT: u8 = 0xFF;
+// Per the Notchian 1.6.4 pre-netty packet table (MCP-doc convention
+// `Packet<N><Name>` — N decimal = hex id). Same two bugs as in
+// `v1_6_4_to_v1_12_2.rs` fixed in lock-step: PLAYER_POS_LOOK was 0x13
+// (= Packet19EntityAction) and HELD_ITEM_CHANGE was 0x09 (= Packet9
+// Respawn). Correct values:
+const V164_S2C_KEEP_ALIVE: u8 = 0x00;       // Packet0KeepAlive
+const V164_S2C_CHAT: u8 = 0x03;             // Packet3Chat
+const V164_S2C_PLAYER_POS_LOOK: u8 = 0x0D;  // Packet13PlayerLookMove (was 0x13)
+const V164_S2C_SPAWN_PLAYER: u8 = 0x14;     // Packet20NamedEntitySpawn
+const V164_S2C_ENTITY_TELEPORT: u8 = 0x18;  // Packet24EntityTeleport
+const V164_S2C_ENTITY_REL_MOVE: u8 = 0x15;  // Packet21EntityRelativeMove
+const V164_S2C_ENTITY: u8 = 0x1E;           // Packet30Entity
+const V164_S2C_BLOCK_CHANGE: u8 = 0x35;     // Packet53BlockChange
+const V164_S2C_SET_SLOT: u8 = 0x67;         // Packet103SetSlot
+const V164_S2C_WINDOW_ITEMS: u8 = 0x68;     // Packet104WindowItems
+const V164_S2C_ENTITY_EQUIPMENT: u8 = 0x1C; // Packet28EntityEquipment
+const V164_S2C_EXPERIENCE: u8 = 0x2B;       // Packet43Experience
+const V164_S2C_HELD_ITEM_CHANGE: u8 = 0x10; // Packet16BlockItemSwitch (was 0x09)
+const V164_S2C_PLAYER_ABILITIES: u8 = 0x43; // Packet67PlayerAbilities
+const V164_S2C_DISCONNECT: u8 = 0xFF;       // Packet255KickDisconnect
 
 const V165_S2C_KEEP_ALIVE: u8 = 0x1F;
 const V165_S2C_CHAT: u8 = 0x0E;
@@ -65,13 +70,19 @@ pub fn convert_s2c(payload: Bytes) -> ConversionResult {
 }
 
 fn s2c_keep_alive(mut body: Bytes) -> ConversionResult {
+    // 1.6.4 KeepAlive: i32 id.
+    // 1.16.5 (proto 754) KeepAlive S2C: i64 id — Mojang switched from
+    // VarInt to Long at proto 340 (1.12.2) per BungeeCord
+    // `Protocol.java::TO_CLIENT` KeepAlive table; every proto ≥ 340
+    // including 754 carries the Long shape.
+    // The previous code wrote two VarInts — total garbage shape that
+    // every 1.16.5 client misparsed → ~30s timeout disconnect.
     if body.remaining() < 4 {
         return ConversionResult::Passthrough;
     }
     let id = body.get_i32();
     let mut out = BytesMut::with_capacity(8);
-    VarInt(id).encode(&mut out).unwrap();
-    VarInt(0).encode(&mut out).unwrap();
+    out.put_i64(id as i64);
     ConversionResult::Converted(vec![build_payload(V165_S2C_KEEP_ALIVE, &out)])
 }
 
@@ -91,7 +102,7 @@ fn s2c_chat(mut body: Bytes) -> ConversionResult {
     let utf8_string = String::from_utf16_lossy(
         &utf16_bytes
             .chunks(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .collect::<Vec<_>>(),
     );
 
@@ -109,24 +120,35 @@ fn s2c_chat(mut body: Bytes) -> ConversionResult {
 }
 
 fn s2c_player_pos_look(mut body: Bytes) -> ConversionResult {
-    if body.remaining() < 33 {
+    // 1.6.4 wire (Packet13PlayerLookMove): f64 x, f64 stance, f64 y,
+    // f64 z, f32 yaw, f32 pitch, u8 onGround = 41 bytes.
+    // 1.16.5 wire (PlayerPositionAndLook S2C): f64 x, f64 y, f64 z,
+    // f32 yaw, f32 pitch, u8 flags, VarInt teleport_id.
+    //
+    // Same triple bug as v1_6_4_to_v1_12_2::s2c_player_pos_look:
+    // i32 reads (should be f64), wrong field order (Y/stance swapped),
+    // wrong size check (33 vs 41). 1.16.5 ALSO requires the trailing
+    // VarInt teleport_id which was being omitted entirely → either
+    // disconnect or arrival at (0, 0, 0).
+    if body.remaining() < 41 {
         return ConversionResult::Passthrough;
     }
-    let x = body.get_i32() as f64;
-    let y = body.get_i32() as f64;
-    let _stance = body.get_i32() as f64;
-    let z = body.get_i32() as f64;
+    let x = body.get_f64();
+    let _stance = body.get_f64();
+    let y = body.get_f64();
+    let z = body.get_f64();
     let yaw = body.get_f32();
     let pitch = body.get_f32();
-    let on_ground = body.get_u8() != 0;
+    let _on_ground = body.get_u8() != 0;
 
-    let mut out = BytesMut::with_capacity(33);
+    let mut out = BytesMut::new();
     out.put_f64(x);
     out.put_f64(y);
     out.put_f64(z);
     out.put_f32(yaw);
     out.put_f32(pitch);
-    out.put_u8(if on_ground { 1 } else { 0 });
+    out.put_u8(0); // flags bitfield = "all absolute"
+    VarInt(0).encode(&mut out).unwrap(); // teleport_id
     ConversionResult::Converted(vec![build_payload(V165_S2C_PLAYER_POS_LOOK, &out)])
 }
 
@@ -149,7 +171,7 @@ fn s2c_spawn_player(mut body: Bytes) -> ConversionResult {
     let _username = String::from_utf16_lossy(
         &utf16_bytes
             .chunks(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .collect::<Vec<_>>(),
     );
 
@@ -315,7 +337,12 @@ fn s2c_window_items(body: Bytes) -> ConversionResult {
                 .0;
             let nbt = if nbt_len > 0 {
                 let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
-                Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+                Some(
+                    kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(
+                        &nbt_bytes,
+                    ))
+                    .unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")),
+                )
             } else {
                 None
             };
@@ -366,7 +393,12 @@ fn s2c_entity_equipment(body: Bytes) -> ConversionResult {
             .0;
         let nbt = if nbt_len > 0 {
             let nbt_bytes = body_mut.split_to(nbt_len as usize).to_vec();
-            Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+            Some(
+                kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(
+                    &nbt_bytes,
+                ))
+                .unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")),
+            )
         } else {
             None
         };
@@ -464,7 +496,7 @@ fn s2c_disconnect(mut body: Bytes) -> ConversionResult {
     let plain_text = String::from_utf16_lossy(
         &utf16_bytes
             .chunks(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .collect::<Vec<_>>(),
     );
 
@@ -477,21 +509,59 @@ fn s2c_disconnect(mut body: Bytes) -> ConversionResult {
     ConversionResult::Converted(vec![build_payload(V165_S2C_DISCONNECT, &out)])
 }
 
-const V164_C2S_KEEP_ALIVE: u8 = 0x00;
-const V164_C2S_CHAT: u8 = 0x01;
-const V164_C2S_PLAYER_POS_LOOK: u8 = 0x05;
-const V164_C2S_PLAYER_DIGGING: u8 = 0x0E;
-const V164_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x0F;
-const V164_C2S_HELD_ITEM_CHANGE: u8 = 0x10;
-const V164_C2S_ENTITY_ACTION: u8 = 0x13;
+// Per the Notchian 1.6.4 pre-netty C2S packet table verified against
+// HexaCord (`Packet0KeepAlive`, `Packet3Chat`) and MCP-doc convention
+// `Packet<N><Name>` where decimal N = hex id.
+// Previous values 0x01 (CHAT) and 0x05 (PLAYER_POS_LOOK) decoded to
+// `Packet1Login` and `Packet5EntityEquipment` — entirely different
+// packets. The converter silently passed 1.6.4 chat and movement c2s
+// through unconverted, and the 1.16.5 backend dropped them as
+// malformed.
+const V164_C2S_KEEP_ALIVE: u8 = 0x00;          // Packet0KeepAlive
+const V164_C2S_CHAT: u8 = 0x03;                // Packet3Chat (was 0x01)
+const V164_C2S_USE_ENTITY: u8 = 0x07;          // Packet7UseEntity
+const V164_C2S_PLAYER_ON_GROUND: u8 = 0x0A;    // Packet10Flying
+const V164_C2S_MOVE_PLAYER_POS: u8 = 0x0B;     // Packet11PlayerPosition
+const V164_C2S_MOVE_PLAYER_ROT: u8 = 0x0C;     // Packet12PlayerLook
+const V164_C2S_PLAYER_POS_LOOK: u8 = 0x0D;     // Packet13PlayerLookMove (was 0x05)
+const V164_C2S_PLAYER_DIGGING: u8 = 0x0E;      // Packet14BlockDig
+const V164_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x0F; // Packet15Place
+const V164_C2S_HELD_ITEM_CHANGE: u8 = 0x10;    // Packet16BlockItemSwitch
+const V164_C2S_ANIMATION: u8 = 0x12;           // Packet18Animation
+const V164_C2S_ENTITY_ACTION: u8 = 0x13;       // Packet19EntityAction
+const V164_C2S_CLIENT_COMMAND: u8 = 0x16;      // Packet22ClientCommand
+const V164_C2S_CLOSE_WINDOW: u8 = 0x65;        // Packet101CloseWindow
+const V164_C2S_UPDATE_SIGN: u8 = 0x82;         // Packet130UpdateSign
+const V164_C2S_PLAYER_ABILITIES: u8 = 0xCA;    // PacketCAPlayerAbilities
+const V164_C2S_CLIENT_SETTINGS: u8 = 0xCC;     // PacketCCSettings
+const V164_C2S_PLUGIN_MESSAGE: u8 = 0xFA;      // PacketFAPluginMessage
 
+// Per `v1_16_5_to_v1_12_2.rs` sibling table + BungeeCord `Protocol.java::
+// TO_SERVER` mappings for `MINECRAFT_1_16_2` (proto 751+ which 754 inherits).
+// PLAYER_POS_LOOK was previously `0x11` — registry shows 0x14 is the actual
+// MovePlayerPosRot id. Fixed below in the new constants block.
+/// 1.16.5 c2s TeleportConfirm id. Pre-netty 1.6.4 had no concept of
+/// teleport-acks so the converter doesn't synthesise these — kept as
+/// documentation of the proto-754 table.
+#[allow(dead_code)]
+const V165_C2S_TELEPORT_CONFIRM: u8 = 0x00;
 const V165_C2S_KEEP_ALIVE: u8 = 0x10;
 const V165_C2S_CHAT: u8 = 0x03;
-const V165_C2S_PLAYER_POS_LOOK: u8 = 0x11;
+const V165_C2S_PLAYER_POS_LOOK: u8 = 0x14; // MovePlayerPosRot (was 0x11)
+const V165_C2S_MOVE_PLAYER_POS: u8 = 0x12;
+const V165_C2S_MOVE_PLAYER_ROT: u8 = 0x13;
 const V165_C2S_PLAYER_DIGGING: u8 = 0x1B;
 const V165_C2S_PLAYER_BLOCK_PLACEMENT: u8 = 0x2E;
 const V165_C2S_HELD_ITEM_CHANGE: u8 = 0x25;
 const V165_C2S_ENTITY_ACTION: u8 = 0x1C;
+const V165_C2S_CLIENT_SETTINGS: u8 = 0x05;
+const V165_C2S_CLIENT_STATUS: u8 = 0x04;
+const V165_C2S_PLUGIN_MESSAGE: u8 = 0x0B;
+const V165_C2S_ANIMATION: u8 = 0x2C;
+const V165_C2S_PLAYER_ABILITIES: u8 = 0x19;
+const V165_C2S_USE_ENTITY: u8 = 0x0E;
+const V165_C2S_CLOSE_WINDOW: u8 = 0x0A;
+const V165_C2S_UPDATE_SIGN: u8 = 0x2B;
 
 pub fn convert_c2s(payload: Bytes) -> ConversionResult {
     let Some((id, body)) = split_id(payload.clone()) else {
@@ -501,11 +571,22 @@ pub fn convert_c2s(payload: Bytes) -> ConversionResult {
     match id {
         V164_C2S_KEEP_ALIVE => c2s_keep_alive(body),
         V164_C2S_CHAT => c2s_chat(body),
+        V164_C2S_USE_ENTITY => c2s_use_entity(body),
+        V164_C2S_PLAYER_ON_GROUND => ConversionResult::Drop,
+        V164_C2S_MOVE_PLAYER_POS => c2s_move_player_pos(body),
+        V164_C2S_MOVE_PLAYER_ROT => c2s_move_player_rot(body),
         V164_C2S_PLAYER_POS_LOOK => c2s_player_pos_look(body),
         V164_C2S_PLAYER_DIGGING => c2s_player_digging(body),
         V164_C2S_PLAYER_BLOCK_PLACEMENT => c2s_player_block_placement(body),
         V164_C2S_HELD_ITEM_CHANGE => c2s_held_item_change(body),
+        V164_C2S_ANIMATION => c2s_animation(body),
         V164_C2S_ENTITY_ACTION => c2s_entity_action(body),
+        V164_C2S_CLIENT_COMMAND => c2s_client_command(body),
+        V164_C2S_CLOSE_WINDOW => c2s_close_window(body),
+        V164_C2S_UPDATE_SIGN => c2s_update_sign(body),
+        V164_C2S_PLAYER_ABILITIES => c2s_player_abilities(body),
+        V164_C2S_CLIENT_SETTINGS => c2s_client_settings(body),
+        V164_C2S_PLUGIN_MESSAGE => c2s_plugin_message(body),
         _ => ConversionResult::Passthrough,
     }
 }
@@ -536,7 +617,7 @@ fn c2s_chat(mut body: Bytes) -> ConversionResult {
     let utf8_string = String::from_utf16_lossy(
         &utf16_bytes
             .chunks(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .collect::<Vec<_>>(),
     );
 
@@ -548,13 +629,19 @@ fn c2s_chat(mut body: Bytes) -> ConversionResult {
 }
 
 fn c2s_player_pos_look(mut body: Bytes) -> ConversionResult {
-    if body.remaining() < 33 {
+    // Same triple bug as the v1_6_4 → v1_12_2 sibling: 1.6.4 wire is
+    // 4×f64 + 2×f32 + bool = 41 bytes; field order is X/Stance/Y/Z per
+    // MCP `Packet13PlayerLookMove` constructor (verified against
+    // HexaCord). Previous code read i32 in X/Y/Stance/Z order with a
+    // 33-byte minimum check — every coord arrived garbage-cast and
+    // Y/Stance were swapped.
+    if body.remaining() < 41 {
         return ConversionResult::Passthrough;
     }
-    let x = body.get_i32() as f64;
-    let y = body.get_i32() as f64;
-    let _stance = body.get_i32() as f64;
-    let z = body.get_i32() as f64;
+    let x = body.get_f64();
+    let _stance = body.get_f64();
+    let y = body.get_f64();
+    let z = body.get_f64();
     let yaw = body.get_f32();
     let pitch = body.get_f32();
     let on_ground = body.get_u8() != 0;
@@ -647,4 +734,215 @@ fn c2s_entity_action(mut body: Bytes) -> ConversionResult {
     VarInt(0).encode(&mut out).unwrap();
 
     ConversionResult::Converted(vec![build_payload(V165_C2S_ENTITY_ACTION, &out)])
+}
+
+// ── New batch: cover the c2s packets a real 1.6.4 client emits during
+// steady-state gameplay against a 1.16.5 backend. Field shapes verified
+// against KettleCord (1.6.x) + BungeeCord (1.16+) packet classes.
+
+/// 1.6.4 Packet11PlayerPosition: f64 x, f64 y, f64 stance, f64 z, bool
+/// on_ground. 1.16.5 MovePlayerPos: 3xf64 + bool on_ground.
+fn c2s_move_player_pos(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 33 {
+        return ConversionResult::Passthrough;
+    }
+    let x = body.get_f64();
+    let y = body.get_f64();
+    let _stance = body.get_f64();
+    let z = body.get_f64();
+    let on_ground = body.get_u8() != 0;
+    let mut out = BytesMut::new();
+    out.put_f64(x);
+    out.put_f64(y);
+    out.put_f64(z);
+    out.put_u8(if on_ground { 1 } else { 0 });
+    ConversionResult::Converted(vec![build_payload(V165_C2S_MOVE_PLAYER_POS, &out)])
+}
+
+/// 1.6.4 Packet12PlayerLook: f32 yaw, f32 pitch, bool on_ground.
+/// 1.16.5 MovePlayerRot: same shape.
+fn c2s_move_player_rot(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 9 {
+        return ConversionResult::Passthrough;
+    }
+    let yaw = body.get_f32();
+    let pitch = body.get_f32();
+    let on_ground = body.get_u8() != 0;
+    let mut out = BytesMut::with_capacity(9);
+    out.put_f32(yaw);
+    out.put_f32(pitch);
+    out.put_u8(if on_ground { 1 } else { 0 });
+    ConversionResult::Converted(vec![build_payload(V165_C2S_MOVE_PLAYER_ROT, &out)])
+}
+
+/// 1.6.4 Packet7UseEntity: i32 user, i32 target, bool leftClick.
+/// 1.16.5 Interact: VarInt target, VarInt type (0=interact, 1=attack),
+/// bool sneaking.
+fn c2s_use_entity(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 9 {
+        return ConversionResult::Passthrough;
+    }
+    let _user = body.get_i32();
+    let target = body.get_i32();
+    let left_click = body.get_u8() != 0;
+    let mut out = BytesMut::new();
+    VarInt(target).encode(&mut out).unwrap();
+    VarInt(if left_click { 1 } else { 0 })
+        .encode(&mut out)
+        .unwrap();
+    out.put_u8(0);
+    ConversionResult::Converted(vec![build_payload(V165_C2S_USE_ENTITY, &out)])
+}
+
+/// 1.6.4 Packet18Animation: i32 entity_id, i8 animation.
+/// 1.16.5 Animation: VarInt hand.
+fn c2s_animation(_body: Bytes) -> ConversionResult {
+    let mut out = BytesMut::new();
+    VarInt(0).encode(&mut out).unwrap();
+    ConversionResult::Converted(vec![build_payload(V165_C2S_ANIMATION, &out)])
+}
+
+/// 1.6.4 Packet22ClientCommand: i8 payload. 1.16.5 ClientStatus: VarInt action.
+fn c2s_client_command(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 1 {
+        return ConversionResult::Passthrough;
+    }
+    let action = body.get_i8() as i32;
+    let mut out = BytesMut::new();
+    VarInt(action).encode(&mut out).unwrap();
+    ConversionResult::Converted(vec![build_payload(V165_C2S_CLIENT_STATUS, &out)])
+}
+
+/// 1.6.4 Packet101CloseWindow: u8 window_id. 1.16.5: same.
+fn c2s_close_window(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 1 {
+        return ConversionResult::Passthrough;
+    }
+    let wid = body.get_u8();
+    let mut out = BytesMut::with_capacity(1);
+    out.put_u8(wid);
+    ConversionResult::Converted(vec![build_payload(V165_C2S_CLOSE_WINDOW, &out)])
+}
+
+/// 1.6.4 Packet130UpdateSign: i32 x, i16 y, i32 z, 4 UCS-2 BE lines.
+/// 1.16.5 UpdateSign: packed Position + 4 VarInt-string lines.
+fn c2s_update_sign(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 4 + 2 + 4 {
+        return ConversionResult::Passthrough;
+    }
+    let x = body.get_i32();
+    let y = body.get_i16() as i32;
+    let z = body.get_i32();
+    let pos = kojacoord_protocol::types::Position { x, y, z };
+    let packed = kojacoord_protocol::types::encode_legacy_position(pos);
+
+    let mut lines: [String; 4] = [
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ];
+    for line in lines.iter_mut() {
+        if body.remaining() < 2 {
+            break;
+        }
+        let n = body.get_u16() as usize;
+        if body.remaining() < n * 2 {
+            break;
+        }
+        let mut u16s = Vec::with_capacity(n);
+        for _ in 0..n {
+            u16s.push(body.get_u16());
+        }
+        *line = String::from_utf16_lossy(&u16s);
+    }
+
+    let mut out = BytesMut::new();
+    out.put_i64(packed);
+    for line in &lines {
+        VarInt(line.len() as i32).encode(&mut out).unwrap();
+        out.extend_from_slice(line.as_bytes());
+    }
+    ConversionResult::Converted(vec![build_payload(V165_C2S_UPDATE_SIGN, &out)])
+}
+
+/// 1.6.4 PacketCAPlayerAbilities: i8 flags, f32 fly_speed, f32 walk_speed.
+/// 1.16.5 PlayerAbilities: i8 flags only (1.16 dropped the speeds).
+fn c2s_player_abilities(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 9 {
+        return ConversionResult::Passthrough;
+    }
+    let flags = body.get_i8();
+    let _ = body.get_f32();
+    let _ = body.get_f32();
+    let mut out = BytesMut::with_capacity(1);
+    out.put_i8(flags);
+    ConversionResult::Converted(vec![build_payload(V165_C2S_PLAYER_ABILITIES, &out)])
+}
+
+/// 1.6.4 PacketCCSettings: UCS-2 BE locale, i8 view_distance, i8 chat_flags,
+/// i8 difficulty, bool show_cape.
+/// 1.16.5 ClientSettings: String locale, i8 view_distance, VarInt chat_mode,
+/// bool chat_colors, u8 displayed_skin_parts, VarInt main_hand.
+fn c2s_client_settings(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 2 {
+        return ConversionResult::Passthrough;
+    }
+    let n = body.get_u16() as usize;
+    if body.remaining() < n * 2 {
+        return ConversionResult::Passthrough;
+    }
+    let mut u16s = Vec::with_capacity(n);
+    for _ in 0..n {
+        u16s.push(body.get_u16());
+    }
+    let locale = String::from_utf16_lossy(&u16s);
+    if body.remaining() < 4 {
+        return ConversionResult::Passthrough;
+    }
+    let view_distance = body.get_i8();
+    let chat_flags = body.get_i8();
+    let _difficulty = body.get_i8();
+    let _show_cape = body.get_u8();
+
+    let mut out = BytesMut::new();
+    VarInt(locale.len() as i32).encode(&mut out).unwrap();
+    out.extend_from_slice(locale.as_bytes());
+    out.put_i8(view_distance);
+    VarInt((chat_flags & 0x03) as i32).encode(&mut out).unwrap();
+    out.put_u8(1);
+    out.put_u8(0x7F);
+    VarInt(1).encode(&mut out).unwrap();
+    ConversionResult::Converted(vec![build_payload(V165_C2S_CLIENT_SETTINGS, &out)])
+}
+
+/// 1.6.4 PacketFAPluginMessage: UCS-2 BE channel + u16 BE length + bytes.
+/// 1.16.5 PluginMessage: String channel + raw bytes.
+fn c2s_plugin_message(mut body: Bytes) -> ConversionResult {
+    if body.remaining() < 2 {
+        return ConversionResult::Passthrough;
+    }
+    let n = body.get_u16() as usize;
+    if body.remaining() < n * 2 {
+        return ConversionResult::Passthrough;
+    }
+    let mut u16s = Vec::with_capacity(n);
+    for _ in 0..n {
+        u16s.push(body.get_u16());
+    }
+    let channel = String::from_utf16_lossy(&u16s);
+    if body.remaining() < 2 {
+        return ConversionResult::Passthrough;
+    }
+    let payload_len = body.get_u16() as usize;
+    if body.remaining() < payload_len {
+        return ConversionResult::Passthrough;
+    }
+    let payload = body.copy_to_bytes(payload_len);
+
+    let mut out = BytesMut::new();
+    VarInt(channel.len() as i32).encode(&mut out).unwrap();
+    out.extend_from_slice(channel.as_bytes());
+    out.extend_from_slice(&payload);
+    ConversionResult::Converted(vec![build_payload(V165_C2S_PLUGIN_MESSAGE, &out)])
 }

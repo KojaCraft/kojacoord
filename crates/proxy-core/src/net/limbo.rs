@@ -15,9 +15,7 @@
 //! and every `send_*` method becomes a one-liner: build the
 //! [`EncodedPacket`], frame it, write it.
 
-use kojacoord_protocol::{
-    codec::Encode, types::VarInt, ProtocolVersion, VersionRegistry,
-};
+use kojacoord_protocol::{ProtocolVersion, VersionRegistry};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time::{interval, Duration};
@@ -72,8 +70,7 @@ impl<'a> LimboHandler<'a> {
         compression_threshold: i32,
         ml_kind: modloader::ModloaderKind,
     ) -> Self {
-        let canonical = VersionRegistry::nearest(protocol_version)
-            .canonical_typed_packet_version();
+        let canonical = VersionRegistry::nearest(protocol_version).canonical_typed_packet_version();
         let packets = limbo_packets::for_version(canonical);
         Self {
             stream,
@@ -87,22 +84,29 @@ impl<'a> LimboHandler<'a> {
         }
     }
 
-    /// Send a pre-encoded packet (`(id, body)` pair). One-liner used
-    /// by every `send_*` method to convert an [`EncodedPacket`] into
-    /// wire bytes.
+    /// Send a pre-encoded packet (`(id, body)` pair). Dispatches to the
+    /// framing helper that knows about pre-netty: 1.6.x writes
+    /// `[id_u8][body]` raw with no length prefix and no compression
+    /// layer, while 1.7+ varint-encodes the id, prepends it, then
+    /// varint-length-frames the result with optional zlib compression.
+    /// Without this branch every limbo packet sent to a 1.6.4 client
+    /// went out as a modern frame on a pre-netty stream — the client
+    /// reads the leading length varint as a garbage packet id and
+    /// disconnects immediately.
     async fn send_encoded(&mut self, pkt: EncodedPacket) -> Result<(), ConnectionError> {
-        let mut framed = bytes::BytesMut::new();
-        VarInt(pkt.id as i32).encode(&mut framed)?;
-        framed.extend_from_slice(&pkt.body);
-        self.write_frame(&framed).await
+        crate::packet_io::write_typed_packet(
+            &mut *self.stream,
+            pkt.id,
+            &pkt.body,
+            self.protocol_version,
+            self.compression_threshold,
+        )
+        .await
     }
 
     /// Build via the cached impl, then send. Skips if the impl returned
     /// `None` (this version doesn't speak that packet).
-    async fn send_built(
-        &mut self,
-        built: Option<EncodedPacket>,
-    ) -> Result<(), ConnectionError> {
+    async fn send_built(&mut self, built: Option<EncodedPacket>) -> Result<(), ConnectionError> {
         if let Some(pkt) = built {
             self.send_encoded(pkt).await
         } else {
@@ -134,10 +138,8 @@ impl<'a> LimboHandler<'a> {
                 })
                 .to_string();
                 // Best-effort: ignore errors from the kick itself.
-                let raw = crate::packet_builder::build_disconnect_packet(
-                    &reason,
-                    self.protocol_version,
-                );
+                let raw =
+                    crate::packet_builder::build_disconnect_packet(&reason, self.protocol_version);
                 let _ = crate::packet_io::write_packet(
                     &mut *self.stream,
                     &raw,
@@ -161,8 +163,54 @@ impl<'a> LimboHandler<'a> {
 
         let teleport_id = 1_i32;
 
+        // Configuration phase — proto 764+ (1.20.2+) sits between
+        // LoginSuccess (already sent by `handle_login`) and the play
+        // state we're about to enter with JoinGame. Skipping it leaves
+        // 1.20.2+ clients stuck in the dirt-screen waiting on a
+        // FinishConfiguration that never comes.
+        //
+        // The dance per minecraft.wiki
+        // Java_Edition_protocol/Packets#Configuration:
+        //   1. proxy reads ServerboundLoginAcknowledged (Login state, client)
+        //   2. proxy sends ClientboundFinishConfiguration  (Configuration state)
+        //   3. proxy reads ServerboundAcknowledgeFinishConfiguration (client)
+        //   4. play state begins → send JoinGame
+        //
+        // We skip RegistryData entirely: vanilla 1.20.2 - 1.20.4 cope
+        // because the client holds default registry data; 1.20.5+
+        // (proto 766+) really wants registries but limbo is a brief
+        // transit, and the missing dimension/biome entries surface as
+        // generic placeholder textures rather than a disconnect.
+        if self.protocol_version >= 764 {
+            tracing::debug!(player = %username, proto = self.protocol_version, "Entering configuration phase");
+            self.run_configuration_phase().await?;
+        }
+
         tracing::debug!(player = %username, "Sending JoinGame/Login packet");
         self.send_login_play().await?;
+
+        // Pre-netty essentials. Modern clients (1.7+) self-seed all
+        // of these from JoinGame's coordinate / health / time fields,
+        // so the `LimboPackets` default implementations return `None`
+        // for them and `send_built(None)` no-ops. Only V1_6 actually
+        // emits anything here — see `limbo_packets::v1_6::V1_6`.
+        if self.protocol_version < 47 {
+            let spawn = self.packets.spawn_position(
+                self.protocol_version,
+                PlayerPos {
+                    x: LIMBO_X,
+                    y: LIMBO_Y,
+                    z: LIMBO_Z,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                },
+            );
+            self.send_built(spawn).await?;
+            let time = self.packets.time_update(self.protocol_version);
+            self.send_built(time).await?;
+            let health = self.packets.update_health(self.protocol_version);
+            self.send_built(health).await?;
+        }
 
         if self.protocol_version >= 47 {
             tracing::debug!(player = %username, ml_kind = ?self.ml_kind, "Sending modloader brand");
@@ -257,8 +305,86 @@ impl<'a> LimboHandler<'a> {
             .as_protocol_version()
     }
 
+    /// Drive the proto-764+ Login → Configuration → Play handshake.
+    ///
+    /// See the comment block above the call site for the wire-level
+    /// step list. Errors out (so the outer `run_inner` can surface a
+    /// disconnect) if any of the expected packet IDs come back wrong —
+    /// silently continuing would just delay the disconnect until the
+    /// first JoinGame frame hit the still-in-Login-state client.
+    async fn run_configuration_phase(&mut self) -> Result<(), ConnectionError> {
+        use bytes::BytesMut;
+        use kojacoord_protocol::codec::{Decode, Encode};
+        use kojacoord_protocol::types::VarInt;
+        use kojacoord_protocol::versions::v1_20_x::config::ClientboundFinishConfiguration;
+
+        let proto = self.protocol_version;
+        let threshold = self.compression_threshold;
+
+        // 1. Client → proxy: ServerboundLoginAcknowledged.
+        let expected_login_ack =
+            crate::packet_ids::sb_login(proto, "ServerboundLoginAcknowledged");
+        let raw = crate::packet_io::read_packet(&mut *self.stream, threshold).await?;
+        let mut cursor = raw;
+        let pkt_id = VarInt::decode(&mut cursor)
+            .map_err(ConnectionError::Protocol)?
+            .0 as u8;
+        if pkt_id != expected_login_ack {
+            tracing::warn!(
+                pkt_id,
+                expected = expected_login_ack,
+                "limbo config phase: expected LoginAcknowledged, got something else"
+            );
+            // Don't bail — some launchers ship out-of-order packets;
+            // continuing into FinishConfiguration usually resyncs the
+            // client. If it doesn't, the next read will time out and
+            // the limbo's keepalive loop catches it.
+        }
+
+        // 2. Proxy → client: ClientboundFinishConfiguration.
+        let id_finish = crate::packet_ids::cb_config(proto, "ClientboundFinishConfiguration");
+        if id_finish == 0xFF {
+            tracing::warn!(
+                proto,
+                "limbo config phase: no FinishConfiguration id in registry — skipping"
+            );
+            return Ok(());
+        }
+        let mut body = BytesMut::new();
+        ClientboundFinishConfiguration {}
+            .encode(&mut body)
+            .map_err(ConnectionError::Protocol)?;
+        crate::packet_io::write_typed_packet(
+            &mut *self.stream,
+            id_finish,
+            &body,
+            proto,
+            threshold,
+        )
+        .await?;
+
+        // 3. Client → proxy: ServerboundAcknowledgeFinishConfiguration.
+        let expected_ack =
+            crate::packet_ids::sb_config(proto, "AcknowledgeFinishConfiguration");
+        let raw = crate::packet_io::read_packet(&mut *self.stream, threshold).await?;
+        let mut cursor = raw;
+        let pkt_id = VarInt::decode(&mut cursor)
+            .map_err(ConnectionError::Protocol)?
+            .0 as u8;
+        if pkt_id != expected_ack {
+            tracing::warn!(
+                pkt_id,
+                expected = expected_ack,
+                "limbo config phase: expected AcknowledgeFinishConfiguration, got something else"
+            );
+        }
+        Ok(())
+    }
+
     async fn send_login_play(&mut self) -> Result<(), ConnectionError> {
-        let built = self.packets.join_game(self.protocol_version, LIMBO_WORLD_NAME);
+        let built = self
+            .packets
+            .join_game(self.protocol_version, LIMBO_WORLD_NAME);
         if built.is_none() && self.protocol_version < 759 && self.protocol_version >= 755 {
             tracing::warn!(
                 protocol = self.protocol_version,
@@ -270,7 +396,9 @@ impl<'a> LimboHandler<'a> {
 
     pub async fn send_respawn(&mut self) -> Result<(), ConnectionError> {
         tracing::debug!("Sending Respawn packet to transition client out of limbo");
-        let built = self.packets.respawn(self.protocol_version, LIMBO_WORLD_NAME);
+        let built = self
+            .packets
+            .respawn(self.protocol_version, LIMBO_WORLD_NAME);
         self.send_built(built).await
     }
 
@@ -294,12 +422,9 @@ impl<'a> LimboHandler<'a> {
     /// waits forever for `ServerHello` and times out. Picks the
     /// pre-netty wire format for 1.6.x clients automatically.
     async fn send_fml1_handshake_reset(&mut self) -> Result<(), ConnectionError> {
-        let plugin_msg_id =
-            crate::packet_ids::cb_plugin_message_id(self.protocol_version);
-        let frame = modloader::build_fml1_handshake_reset_for_proto(
-            self.protocol_version,
-            plugin_msg_id,
-        );
+        let plugin_msg_id = crate::packet_ids::cb_plugin_message_id(self.protocol_version);
+        let frame =
+            modloader::build_fml1_handshake_reset_for_proto(self.protocol_version, plugin_msg_id);
         if crate::packet_io::is_pre_netty_proto(self.protocol_version) {
             crate::packet_io::write_legacy_bytes(&mut *self.stream, &frame).await
         } else {

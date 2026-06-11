@@ -383,6 +383,47 @@ impl ProtocolVersion {
 /// modules under `kojacoord_protocol::versions::`. Returned by
 /// [`ProtocolVersion::canonical_typed_packet_version`] so dispatch matches are
 /// exhaustive.
+/// Top-level Minecraft client edition.
+///
+/// The proxy is currently Java-only end-to-end, but Bedrock support is
+/// on the roadmap — the enum exists now so call sites that need to
+/// branch on edition can be written in terms of `MinecraftEdition`
+/// rather than ad-hoc string checks, and so the inevitable Bedrock
+/// path doesn't require touching every dispatch site again.
+///
+/// Default is `Java` everywhere the edition isn't explicitly known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MinecraftEdition {
+    /// Java Edition (formerly Minecraft: Java Edition). Uses the
+    /// Notchian TCP/varint-framed protocol covered by this crate.
+    /// Default — every existing dispatch site is Java today.
+    #[default]
+    Java,
+    /// Bedrock Edition. UDP/RakNet-framed. Wire shape, packet IDs and
+    /// auth flow are completely different from Java; the proxy's
+    /// current handlers will refuse Bedrock connections cleanly until
+    /// the Bedrock pipeline lands.
+    Bedrock,
+}
+
+impl MinecraftEdition {
+    /// Short kebab-case identifier for telemetry / logs.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Java => "java",
+            Self::Bedrock => "bedrock",
+        }
+    }
+
+    /// Whether this edition is implemented end-to-end by the proxy
+    /// today. Bedrock returns `false` until the dedicated pipeline
+    /// lands; callers handling an "unsupported" path should use the
+    /// edition's `.slug()` in their error/disconnect message.
+    pub fn is_implemented(self) -> bool {
+        matches!(self, Self::Java)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum CanonicalVersion {

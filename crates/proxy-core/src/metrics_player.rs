@@ -45,8 +45,7 @@ impl PlayerMetrics {
 
     /// Reconstruct the last-activity `Instant` from the stored offset.
     pub fn last_activity(&self) -> Instant {
-        self.connected_at
-            + Duration::from_micros(self.last_activity_micros.load(Ordering::Relaxed))
+        self.connected_at + Duration::from_micros(self.last_activity_micros.load(Ordering::Relaxed))
     }
 
     /// Snapshot the metrics into a plain `PlayerMetricsSnapshot` for

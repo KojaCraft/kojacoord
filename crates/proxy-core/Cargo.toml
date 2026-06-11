@@ -23,6 +23,8 @@ kojacoord-plugin-system = { path = "../plugin-system" }
 kojacoord-cluster = { path = "../cluster" }
 kojacoord-metrics = { path = "../metrics" }
 sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 flate2 = "1"
 lazy_static = "1"
 dashmap = { workspace = true }

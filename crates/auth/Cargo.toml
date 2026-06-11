@@ -15,7 +15,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
-sha1 = { workspace = true }
+sha1 = { workspace = true, features = ["oid"] }
 md-5 = { workspace = true }
 aes = { workspace = true }
 cfb-mode = { workspace = true }
@@ -23,4 +23,6 @@ cipher = "0.4"
 hmac = { workspace = true }
 sha2 = "0.10"
 hex = { workspace = true }
+base64 = "0.22.1"
+pkcs8 = "0.10"
 kojacoord-protocol = { path = "../protocol" }

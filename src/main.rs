@@ -185,7 +185,70 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    kojacoord_proxy_core::proxy::accept_loop(state).await
+    // Graceful shutdown. We race `accept_loop` against signal handlers
+    // so any way out — Ctrl+C, SIGTERM, panic that propagates up — runs
+    // the same disconnect-all path. The reason JSON is the literal
+    // string the client should see in its disconnect dialog.
+    //
+    // Why a hardcoded reason instead of pulling from config: the
+    // shutdown can fire before the config is reachable (early panic,
+    // failed reload swap, etc.). A static string is always safe and
+    // matches the spec the user gave us verbatim.
+    let shutdown_state = Arc::clone(&state);
+    // Inlined to avoid pulling in a workspace dep here — the literal
+    // is what the client will render verbatim. Single quotes inside
+    // values are JSON-safe.
+    let shutdown_reason =
+        r#"{"text":"Proxy is restarting, Please try again later.","color":"yellow"}"#
+            .to_string();
+
+    let accept_fut = kojacoord_proxy_core::proxy::accept_loop(state);
+
+    // Signal aggregator. Ctrl+C is portable; SIGTERM and SIGQUIT are
+    // Unix-only and only registered on those targets. Whichever fires
+    // first wins — the others are dropped on the floor.
+    let signal_fut = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).ok();
+            let mut quit = signal(SignalKind::quit()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "Ctrl+C",
+                _ = async {
+                    match term.as_mut() {
+                        Some(s) => { s.recv().await; },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => "SIGTERM",
+                _ = async {
+                    match quit.as_mut() {
+                        Some(s) => { s.recv().await; },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => "SIGQUIT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl+C"
+        }
+    };
+
+    let result = tokio::select! {
+        r = accept_fut => {
+            tracing::warn!("Accept loop exited — beginning graceful shutdown");
+            r
+        }
+        sig = signal_fut => {
+            tracing::warn!(signal = sig, "Shutdown signal received");
+            Ok(())
+        }
+    };
+
+    shutdown_state.shutdown_gracefully(&shutdown_reason).await;
+    result
 }
 
 fn save_config(config: &kojacoord_config::ProxyConfig, path: &str) -> anyhow::Result<()> {

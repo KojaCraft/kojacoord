@@ -127,6 +127,9 @@ impl Default for TpsTracker {
     }
 }
 
+type HotReloadMessage = (std::path::PathBuf, std::collections::HashMap<String, String>);
+type HotReloadReceiver = tokio::sync::mpsc::UnboundedReceiver<HotReloadMessage>;
+
 pub struct ProxyState {
     pub config: Arc<ProxyConfig>,
     pub server_registry: Arc<ServerRegistry>,
@@ -172,14 +175,7 @@ pub struct ProxyState {
     /// Receiver side of `hot_reload_tx`, parked inside an option so the
     /// processor can `take()` it on startup. Wrapped in `std::sync::Mutex`
     /// because this is only touched once during boot.
-    hot_reload_rx: std::sync::Mutex<
-        Option<
-            tokio::sync::mpsc::UnboundedReceiver<(
-                std::path::PathBuf,
-                std::collections::HashMap<String, String>,
-            )>,
-        >,
-    >,
+    hot_reload_rx: std::sync::Mutex<Option<HotReloadReceiver>>,
 
     pub tps_tracker: Arc<TpsTracker>,
 
@@ -652,6 +648,96 @@ impl ProxyState {
         }
     }
 
+    /// Pick a backend for a connecting player, threading the choice
+    /// through the failover manager.
+    ///
+    /// The flow:
+    ///   1. `RoutingRules::select_with_region` returns the routing-rule
+    ///      candidate. (Lobby-by-region rules win over default.)
+    ///   2. If that candidate belongs to a failover group, swap it for
+    ///      the group's currently-active backend. The failover
+    ///      monitor flips that field whenever the primary goes down,
+    ///      so step 2 keeps routing in sync with health probes.
+    ///   3. If the swapped-in backend is offline (rare — usually means
+    ///      ALL standbys in the group are down too), keep the original
+    ///      candidate and let the upstream connect attempt surface the
+    ///      error. That's a better failure mode than silently routing
+    ///      to a different group entirely.
+    ///
+    /// Returns `None` only if the registry has no servers at all — at
+    /// which point the proxy would have logged a startup error and the
+    /// caller will drop into limbo.
+    pub async fn route_via_failover(
+        &self,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Option<Arc<crate::server::BackendServer>> {
+        let candidate = self
+            .routing
+            .select_with_region(&self.server_registry, client_ip)?;
+
+        // Walk the failover map once to find the group (if any) this
+        // candidate participates in; ask the manager for that group's
+        // current_active; swap if it differs and the new pick is up.
+        if let Some(group) = self
+            .failover_manager
+            .get_group_for_server(candidate.name.as_str())
+            .await
+        {
+            if let Some(active_name) = self.failover_manager.get_active_server(&group).await {
+                if active_name != candidate.name {
+                    if let Some(active) = self.server_registry.get(&active_name) {
+                        if active.is_online() {
+                            tracing::debug!(
+                                group = %group,
+                                original = %candidate.name,
+                                active = %active_name,
+                                "Failover-aware routing: candidate replaced with current_active",
+                            );
+                            return Some(active);
+                        }
+                    }
+                }
+            }
+        }
+        Some(candidate)
+    }
+
+    /// Graceful shutdown: kick every connected player with the same
+    /// "Proxy is restarting" message, give the writers a brief grace
+    /// window to flush the disconnect packet to the socket, then
+    /// return so the runtime can drop the listener.
+    ///
+    /// Triggered from any exit code path — Ctrl+C, SIGTERM, panic
+    /// inside the accept loop, etc. — by wiring this through a single
+    /// shutdown future at the top level (see `main.rs`).
+    ///
+    /// Without this the OS just rips the sockets out, the client sees
+    /// "Connection reset" and has to retry blindly. With it, the
+    /// client sees a textual reason and knows to try again in a few
+    /// seconds.
+    pub async fn shutdown_gracefully(&self, reason_json: &str) {
+        let total = self.sessions.len();
+        tracing::warn!(
+            sessions = total,
+            "Graceful shutdown: notifying every connected player"
+        );
+        // Collect UUIDs first so we don't hold a DashMap shard lock
+        // across `kick_player`'s `.await`s (which themselves take
+        // session locks). `kick_player` removes nothing; the writer
+        // task drops the session when the socket closes.
+        let uuids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
+        for uuid in &uuids {
+            self.kick_player(uuid, reason_json).await;
+        }
+        // Brief flush window — the outbound queue is async, and a
+        // bare-return would race the runtime drop and lose the
+        // disconnect packets we just queued. 500ms is empirically
+        // enough for the writer to drain on a healthy socket; failing
+        // sockets time out within the same window via TCP's RST path.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::warn!(notified = total, "Graceful shutdown notification complete");
+    }
+
     pub async fn kick_player(&self, uuid: &Uuid, reason_json: &str) {
         let proto = {
             match self.sessions.get(uuid) {
@@ -856,7 +942,9 @@ impl ProxyState {
                     if !is_plugin {
                         continue;
                     }
-                    let Ok(meta) = entry.metadata().await else { continue };
+                    let Ok(meta) = entry.metadata().await else {
+                        continue;
+                    };
                     let Ok(mtime) = meta.modified() else { continue };
                     let prev = mtimes.insert(path.clone(), mtime);
                     let changed = matches!(prev, Some(p) if p != mtime);

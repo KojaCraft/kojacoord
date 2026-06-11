@@ -5,7 +5,9 @@ use crate::error::ProtocolError;
 use crate::types::VarInt;
 
 pub use packets::{
-    ClientboundChatMessage, ClientboundDisconnect, ClientboundHeldItemChange, ClientboundJoinGame, ClientboundKeepAlive, ClientboundNamedSoundEffect, ClientboundPlayerAbilities, ClientboundPlayerPosition, ClientboundRespawn,
+    ClientboundChatMessage, ClientboundDisconnect, ClientboundHeldItemChange, ClientboundJoinGame,
+    ClientboundKeepAlive, ClientboundNamedSoundEffect, ClientboundPlayerAbilities,
+    ClientboundPlayerPosition, ClientboundRespawn, DimensionRef,
 };
 
 fn need(src: &Bytes, n: usize) -> Result<(), ProtocolError> {
@@ -46,17 +48,6 @@ fn decode_string(src: &mut Bytes) -> Result<String, ProtocolError> {
 mod packets {
     use super::*;
 
-
-
-
-
-
-
-
-
-
-
-
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundPlayerAbilities {
         pub flags: u8,
@@ -93,9 +84,6 @@ mod packets {
         }
     }
 
-
-
-
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundHeldItemChange {
         pub slot: i8,
@@ -121,18 +109,6 @@ mod packets {
             Ok(Self { slot })
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundNamedSoundEffect {
@@ -191,6 +167,43 @@ mod packets {
         }
     }
 
+    /// Wire-format variant for the `dimension` field of
+    /// `ClientboundJoinGame`. Per BungeeCord `protocol/Login.java::read`:
+    ///   * proto 735, 736 (1.16, 1.16.1): `readString` → Identifier
+    ///   * proto 751-758 (1.16.2 — 1.18.2): `readTag` → NBT
+    ///   * proto 759-763 (1.19 — 1.20.1): `readString` → Identifier
+    ///
+    /// The caller (limbo / converter / relay) picks the variant
+    /// matching the negotiated proto. NBT bytes are self-framing.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum DimensionRef {
+        Identifier(String),
+        Nbt(Vec<u8>),
+    }
+
+    impl Encode for DimensionRef {
+        fn encode(&self, dst: &mut BytesMut) -> Result<(), ProtocolError> {
+            match self {
+                DimensionRef::Identifier(s) => encode_string(s, dst),
+                DimensionRef::Nbt(b) => {
+                    dst.put_slice(b);
+                    Ok(())
+                },
+            }
+        }
+    }
+
+    /// Per BungeeCord `protocol/Login.java`, the 1.16+ Login(Play) packet
+    /// carries:
+    ///   * `dimension_codec` (NBT) — full registry codec
+    ///     (`minecraft:dimension_type` + `minecraft:worldgen/biome`)
+    ///   * `dimension` (Identifier or NBT, proto-dispatched — see
+    ///     [`DimensionRef`])
+    /// NBT fields are self-framing so no length prefix is written.
+    /// Use `crate::protocol::dimension_codec::build_minimal_dimension_codec`
+    /// (proxy-core side) for the codec and
+    /// `crate::protocol::dimension_codec::dimension_type_nbt` for the
+    /// NBT dimension element.
     #[derive(Debug, Clone, PartialEq)]
     pub struct ClientboundJoinGame {
         pub entity_id: i32,
@@ -198,7 +211,8 @@ mod packets {
         pub game_mode: u8,
         pub previous_game_mode: i8,
         pub world_names: Vec<String>,
-        pub dimension: String,
+        pub dimension_codec: Vec<u8>,
+        pub dimension: DimensionRef,
         pub world_name: String,
         pub hashed_seed: i64,
         pub max_players: VarInt,
@@ -225,7 +239,10 @@ mod packets {
             for name in &self.world_names {
                 encode_string(name, dst)?;
             }
-            encode_string(&self.dimension, dst)?;
+            // Dimension Codec NBT: written raw (self-framing).
+            dst.put_slice(&self.dimension_codec);
+            // `dimension`: Identifier or NBT per proto — see DimensionRef.
+            self.dimension.encode(dst)?;
             encode_string(&self.world_name, dst)?;
             dst.put_i64(self.hashed_seed);
             self.max_players.encode(dst)?;
@@ -261,7 +278,20 @@ mod packets {
             for _ in 0..world_count {
                 world_names.push(decode_string(src)?);
             }
-            let dimension = decode_string(src)?;
+            // Skip the dimension codec NBT by reading it as a self-framing
+            // blob — defer to crate::types::nbt::skip if available, else
+            // assume the round-trip caller will supply an empty Vec.
+            let codec_start = src.clone();
+            let codec_len = crate::types::nbt::skip(src).unwrap_or(0);
+            let dimension_codec = if codec_len > 0 {
+                codec_start.slice(..codec_len).to_vec()
+            } else {
+                Vec::new()
+            };
+            // Decoder lacks proto context; default to Identifier shape.
+            // Round-tripping NBT-shaped frames requires the caller to
+            // re-encode with the correct DimensionRef variant.
+            let dimension = DimensionRef::Identifier(decode_string(src)?);
             let world_name = decode_string(src)?;
             if src.remaining() < 8 {
                 return Err(ProtocolError::Io(std::io::Error::new(
@@ -288,6 +318,7 @@ mod packets {
                 game_mode,
                 previous_game_mode,
                 world_names,
+                dimension_codec,
                 dimension,
                 world_name,
                 hashed_seed,
@@ -532,4 +563,3 @@ mod packets {
         }
     }
 }
-

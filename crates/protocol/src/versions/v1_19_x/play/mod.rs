@@ -5,7 +5,9 @@ use crate::error::ProtocolError;
 use crate::types::VarInt;
 
 pub use packets::{
-    ClientboundDisconnect, ClientboundKeepAlive, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerPosition, ClientboundRespawn, ClientboundSetCarriedItem, ClientboundSystemChat,
+    ClientboundDisconnect, ClientboundKeepAlive, ClientboundLogin, ClientboundPlayerAbilities,
+    ClientboundPlayerPosition, ClientboundRespawn, ClientboundSetCarriedItem,
+    ClientboundSystemChat,
 };
 
 mod packets {
@@ -340,5 +342,4 @@ mod packets {
             })
         }
     }
-
 }

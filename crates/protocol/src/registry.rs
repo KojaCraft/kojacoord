@@ -170,16 +170,9 @@ pub fn registry() -> &'static PacketRegistry {
 pub fn lookup(proto: u32, state: ProtocolState, dir: Direction, name: &'static str) -> u8 {
     match registry().get_id_for_version(proto, state, dir, name) {
         Some(id) => {
-            tracing::info!(
-                proto,
-                ?state,
-                ?dir,
-                name,
-                id,
-                "packet id resolved"
-            );
+            tracing::info!(proto, ?state, ?dir, name, id, "packet id resolved");
             id
-        }
+        },
         None => {
             tracing::warn!(
                 proto,
@@ -189,7 +182,7 @@ pub fn lookup(proto: u32, state: ProtocolState, dir: Direction, name: &'static s
                 "packet id not found in registry, falling back to 0xFF"
             );
             0xFF
-        }
+        },
     }
 }
 
@@ -259,7 +252,15 @@ type Entry = (u32, ProtocolState, Direction, &'static str, u8);
 /// Pre-netty (1.6.x) — uses single-byte hardcoded IDs, no varint framing.
 /// Kept here as a compatibility shim; the actual netty proxy never speaks this
 /// state machine but downstream code still queries the names.
+// Source <https://github.com/ProtocolSupport/ProtocolSupport/blob/master/src/protocolsupport/protocol/pipeline/version/v_1_6/PacketDecoder.java> (per-version diff)
 const PRE_NETTY: &[Entry] = &[
+    (
+        78,
+        ProtocolState::Login,
+        Direction::Serverbound,
+        "ServerboundPingRequest",
+        0xFE
+    ),
     (
         78,
         ProtocolState::Login,
@@ -478,17 +479,26 @@ const CONFIGURATION: &[Entry] = &[
 /// `get_id_for_version`'s nearest-lower-proto fallback.
 #[rustfmt::skip]
 const PLAY: &[Entry] = &[
-    // ── 1.6.4 (proto 78) — pre-netty (single-byte hardcoded ids).
     //    Verified from minecraft.wiki Java_Edition_protocol_history#1.6.4.
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundKeepAlive",       0x00),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundChatMessage",     0x03),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundRespawn",         0x09),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundHeldItemChange",  0x10),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerPosition",  0x13),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerAbilities", 0x43),
-    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundDisconnect",      0xFF),
+    // Per HexaCord packet/ tree + MCP-doc class-name convention
+    // `Packet<N><Name>` where N is the DECIMAL packet id, so hex id = N.
+    // Previous values `0x13` and `0x43` were decimal `19` and `67`
+    // misread as hex — the 1.6.4 Notchian client reported
+    // "Bad packet id 67" when limbo emitted PlayerAbilities at 0x43
+    // (no recognised 1.6.4 packet at that id). Corrected against
+    // HexaCord packet classes:
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundKeepAlive",       0x00), // Packet0KeepAlive
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundLoginRequest",    0x01), // Packet1Login — the pre-netty "JoinGame"
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundTimeUpdate",      0x04), // Packet4UpdateTime
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundSpawnPosition",   0x06), // Packet6SpawnPosition
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundUpdateHealth",    0x08), // Packet8UpdateHealth
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundChatMessage",     0x03), // Packet3Chat
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundRespawn",         0x09), // Packet9Respawn
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerPosition",  0x0D), // Packet13PlayerLookMove (was 0x13)
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundHeldItemChange",  0x10), // Packet16BlockItemSwitch
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerAbilities", 0xCA), // Packet202PlayerAbilities (was 0x43)
+    (78, ProtocolState::Play, Direction::Clientbound, "ClientboundDisconnect",      0xFF), // Packet255KickDisconnect
 
-    // ── 1.7.10 (proto 5) — netty era begins ──────────────────────────────────
     //    Prismarine `1.7` is the closest equivalent. IDs verified there.
     (5, ProtocolState::Play, Direction::Clientbound, "ClientboundKeepAlive", 0x00),
     (5, ProtocolState::Play, Direction::Clientbound, "ClientboundJoinGame", 0x01),
@@ -1347,7 +1357,10 @@ const PLAY: &[Entry] = &[
     (764, ProtocolState::Play, Direction::Serverbound, "ServerboundCustomPayload", 0x0f),
     (764, ProtocolState::Play, Direction::Serverbound, "ServerboundKeepAlive", 0x14),
 
-    // ── proto 765 (1.20.2) ──
+    // ── proto 765 (1.20.4 — `MINECRAFT_1_20_3` in BungeeCord naming) ──
+    // Comment in source previously said "1.20.2"; proto 765 is actually
+    // 1.20.4 (1.20.2 is proto 764). Per BungeeCord `Protocol.java`,
+    // many IDs shift by +1 between 764 and 765 — corrected below.
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundBossBar", 0x0a),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundPluginMessage", 0x18),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundCustomPayload", 0x18),
@@ -1363,12 +1376,18 @@ const PLAY: &[Entry] = &[
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSetCarriedItem", 0x4f),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSound", 0x64),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundNamedSoundEffect", 0x64),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSystemChat", 0x67),
+    // Per BungeeCord `Protocol.java::TO_CLIENT` SystemChat table:
+    //   `map(MINECRAFT_1_20_2, 0x67)` then `map(MINECRAFT_1_20_3, 0x69)`.
+    // Proto 765 (1.20.4 = `MINECRAFT_1_20_3` in BungeeCord) → 0x69. The
+    // previous 0x67 was the 1.20.2 value.
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSystemChat", 0x69),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundChatCommand", 0x04),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundChatMessage", 0x05),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundPluginMessage", 0x0f),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundCustomPayload", 0x0f),
-    (765, ProtocolState::Play, Direction::Serverbound, "ServerboundKeepAlive", 0x14),
+    // KeepAlive c2s shifts +1 between 1.20.2 (0x14) and 1.20.3/1.20.4 (0x15).
+    // Per BungeeCord `Protocol.java` TO_SERVER table for the KeepAlive packet.
+    (765, ProtocolState::Play, Direction::Serverbound, "ServerboundKeepAlive", 0x15),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundMovePlayerPos", 0x16),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundMovePlayerPosRot", 0x17),
     (765, ProtocolState::Play, Direction::Serverbound, "ServerboundMovePlayerRot", 0x18),
@@ -1745,35 +1764,27 @@ mod tests {
     fn every_subversion_resolves_join_game() {
         for proto in [
             // 1.9.x
-            107, 108, 109, 110,
-            // 1.10
-            210,
-            // 1.11.x
-            315, 316,
-            // 1.12.x
-            335, 338, 340,
-            // 1.13.x
-            393, 401, 404,
-            // 1.14.x
-            477, 480, 485, 490, 498,
-            // 1.15.x
-            573, 575, 578,
-            // 1.16.x
-            735, 736, 751, 753, 754,
-            // 1.17.x
-            755, 756,
-            // 1.18.x
-            757, 758,
-            // 1.19.x
-            759, 760, 761, 762,
-            // 1.20.x
-            763, 764, 765, 766,
-            // 1.21.x
+            107, 108, 109, 110, // 1.10
+            210, // 1.11.x
+            315, 316, // 1.12.x
+            335, 338, 340, // 1.13.x
+            393, 401, 404, // 1.14.x
+            477, 480, 485, 490, 498, // 1.15.x
+            573, 575, 578, // 1.16.x
+            735, 736, 751, 753, 754, // 1.17.x
+            755, 756, // 1.18.x
+            757, 758, // 1.19.x
+            759, 760, 761, 762, // 1.20.x
+            763, 764, 765, 766, // 1.21.x
             767, 768, 769, 770, 771, 772, 773, 774,
         ] {
             // 1.9 through 1.18.2 register under `ClientboundJoinGame`;
             // 1.19+ adds `ClientboundLogin` as an alias for the same id.
-            let name = if proto >= 759 { "ClientboundLogin" } else { "ClientboundJoinGame" };
+            let name = if proto >= 759 {
+                "ClientboundLogin"
+            } else {
+                "ClientboundJoinGame"
+            };
             let id = cb_play(proto, name);
             assert_ne!(
                 id, 0xFF,

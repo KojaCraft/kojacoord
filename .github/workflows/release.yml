@@ -124,9 +124,15 @@ jobs:
 
       # Build the changelog for THIS tag only (commits since the previous tag),
       # grouped by Conventional Commit type via cliff.toml.
+      #
+      # `--latest --strip header` cuts the rendered output to just the
+      # newest section, no top-of-file H1. `OUTPUT` writes the rendered
+      # markdown to a file path we can `cat` later — the action's
+      # `outputs.changelog` value contains that path, NOT the body.
       - name: Generate changelog from semantic commits
         id: changelog
         uses: orhun/git-cliff-action@4a4a951bc43fafe41cd2348d181853f52356bee7 # v4
+        continue-on-error: true
         with:
           config: cliff.toml
           args: --latest --strip header
@@ -134,12 +140,43 @@ jobs:
           OUTPUT: CHANGES.md
           GITHUB_REPO: ${{ github.repository }}
 
+      # Fallback: if git-cliff produces nothing (FIRST tag in the
+      # repo's history — there's no prior tag for `--latest` to bound
+      # against — or the action itself errors), synthesise a minimal
+      # changelog from `git log` so the release notes still ship with
+      # something useful instead of a bare "Downloads" stub.
+      - name: Synthesise changelog fallback if empty
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -s CHANGES.md ]; then
+              echo "git-cliff produced no output — falling back to raw git log."
+              PREV_TAG="$(git describe --tags --abbrev=0 --exclude="${{ github.ref_name }}" 2>/dev/null || true)"
+              {
+                  echo "### Changes"
+                  echo
+                  if [ -n "$PREV_TAG" ]; then
+                      git log --pretty=format:'- %s (%h)' "$PREV_TAG..HEAD"
+                  else
+                      # First-ever tag: include everything from the initial
+                      # commit. Capped at 100 lines so the release notes
+                      # don't blow past GitHub's 125k-char body limit on
+                      # large repos.
+                      git log --pretty=format:'- %s (%h)' | head -100
+                  fi
+                  echo
+              } > CHANGES.md
+          fi
+          echo "--- CHANGES.md ---"
+          cat CHANGES.md
+
       - name: Assemble release notes
+        shell: bash
         run: |
           {
             echo "## Kojacoord Proxy ${{ steps.get_version.outputs.VERSION }}"
             echo
-            cat "${{ steps.changelog.outputs.changelog }}"
+            cat CHANGES.md
             echo
             echo "### Downloads"
             echo "Choose the appropriate binary for your platform:"

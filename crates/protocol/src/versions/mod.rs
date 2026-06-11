@@ -28,10 +28,6 @@
 //! `crate::registry`. The id table covers every protocol number we
 //! support (1.6.4 through 1.21.5); see `registry.rs`.
 
-pub mod v1_6_x;
-pub mod v1_7_x;
-pub mod v1_8_x;
-pub mod v1_9_x;
 pub mod v1_10_x;
 pub mod v1_11_x;
 pub mod v1_12_x;
@@ -44,3 +40,7 @@ pub mod v1_18_x;
 pub mod v1_19_x;
 pub mod v1_20_x;
 pub mod v1_21_x;
+pub mod v1_6_x;
+pub mod v1_7_x;
+pub mod v1_8_x;
+pub mod v1_9_x;

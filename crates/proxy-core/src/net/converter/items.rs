@@ -11,7 +11,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use kojacoord_protocol::codec::{Decode, Encode};
-use kojacoord_protocol::types::slot::{Slot};
+use kojacoord_protocol::types::slot::Slot;
 
 pub use kojacoord_protocol::types::slot::{LegacySlot, LegacySlotData};
 use kojacoord_protocol::types::VarInt;
@@ -168,10 +168,17 @@ pub fn convert_set_slot_legacy_to_modern(body: &mut BytesMut) -> Result<(), Stri
         let item_id = body.get_i16();
         let count = body.get_u8();
         let damage = body.get_i16();
-        let nbt_len = VarInt::decode(&mut body.clone().freeze()).map_err(|e| e.to_string())?.0;
+        let nbt_len = VarInt::decode(&mut body.clone().freeze())
+            .map_err(|e| e.to_string())?
+            .0;
         let nbt = if nbt_len > 0 {
             let nbt_bytes = body.split_to(nbt_len as usize).to_vec();
-            Some(kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(&nbt_bytes)).unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")))
+            Some(
+                kojacoord_protocol::types::Nbt::decode(&mut bytes::Bytes::copy_from_slice(
+                    &nbt_bytes,
+                ))
+                .unwrap_or_else(|_| kojacoord_protocol::types::Nbt::empty("")),
+            )
         } else {
             None
         };

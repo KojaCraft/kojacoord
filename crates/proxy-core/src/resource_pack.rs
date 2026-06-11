@@ -96,7 +96,10 @@ pub fn build_resource_pack_packet(
             payload.put_u8(1);
             // Send a plain-text component as JSON so it works on every
             // 1.20.3+ client without needing the NBT component encoding.
-            let component = format!(r#"{{"text":{}}}"#, serde_json::to_string(p).unwrap_or_else(|_| "\"\"".into()));
+            let component = format!(
+                r#"{{"text":{}}}"#,
+                serde_json::to_string(p).unwrap_or_else(|_| "\"\"".into())
+            );
             let cb = component.as_bytes();
             VarInt(cb.len() as i32)
                 .encode(&mut payload)

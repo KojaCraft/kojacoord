@@ -79,10 +79,7 @@ pub fn write_packet<P: PacketId + EncodeVer>(
 }
 
 /// Read the body of a packet whose id has already been consumed.
-pub fn read_packet<P: PacketId + DecodeVer>(
-    ver: u32,
-    src: &mut Bytes,
-) -> Result<P, ProtocolError> {
+pub fn read_packet<P: PacketId + DecodeVer>(ver: u32, src: &mut Bytes) -> Result<P, ProtocolError> {
     P::decode_ver(ver, src)
 }
 

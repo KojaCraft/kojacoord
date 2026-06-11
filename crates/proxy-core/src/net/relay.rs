@@ -231,6 +231,23 @@ impl PacketRelay {
         let conv_enabled = self.conversion_enabled;
         let backend_proto = self.backend_protocol;
 
+        // ViaVersion detection.
+        //
+        // ViaVersion-instrumented backends announce themselves to proxies
+        // via a clientbound plugin message on the `vv:proxy_details` (or
+        // `viaversion:proxy_details`) channel. When we see one we flip
+        // this flag and skip our own per-packet converter for the rest of
+        // the session — ViaVersion on the backend has already translated
+        // every packet into the client's exact protocol, so any further
+        // conversion on our side would corrupt the wire.
+        //
+        // Both directions check the same atomic, so detection in the
+        // s2c loop flows immediately to the c2s loop's converter gate
+        // without a lock.
+        let via_version_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let via_version_detected_s2c = via_version_detected.clone();
+        let via_version_detected_c2s = via_version_detected.clone();
+
         // Determine chat signing mode if enabled
         let chat_signing_mode = if self.state.config.proxy.chat_signing_translation {
             Some(determine_signing_mode(proto, backend_proto))
@@ -375,7 +392,34 @@ impl PacketRelay {
                     return Ok(());
                 }
 
-                if conv_enabled && proto != backend_proto {
+                // ViaVersion detection: sniff clientbound plugin messages
+                // for the `vv:proxy_details` channel. ViaVersion sends one
+                // shortly after configuration to announce itself.
+                if pkt_id == cb_pm_id {
+                    if let Some(channel) = try_decode_plugin_channel(payload.clone()) {
+                        if channel == "vv:proxy_details"
+                            || channel == "viaversion:proxy_details"
+                        {
+                            if !via_version_detected_s2c
+                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                            {
+                                tracing::info!(
+                                    target: "relay",
+                                    channel = %channel,
+                                    proto,
+                                    backend_proto,
+                                    "ViaVersion detected on backend — disabling proxy-side converter for this session"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let convert_active = conv_enabled
+                    && proto != backend_proto
+                    && !via_version_detected_s2c
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if convert_active {
                     let direction = ConversionDirection::ServerToClient {
                         server_proto: backend_proto,
                         client_proto: proto,
@@ -753,7 +797,15 @@ impl PacketRelay {
                         }
                     }
 
-                    if conv_enabled && proto != backend_proto {
+                    // Same ViaVersion gate as the s2c loop above. Once
+                    // the backend has identified itself as ViaVersion-
+                    // backed, we leave c2s packets alone too — the
+                    // backend will translate them itself.
+                    let convert_active_c2s = conv_enabled
+                        && proto != backend_proto
+                        && !via_version_detected_c2s
+                            .load(std::sync::atomic::Ordering::Acquire);
+                    if convert_active_c2s {
                         let direction = ConversionDirection::ClientToServer {
                             client_proto: proto,
                             server_proto: backend_proto,
@@ -927,9 +979,7 @@ impl PacketRelay {
                     });
                 },
                 Err(_) => {
-                    tracing::error!(
-                        "relay: could not reunite client stream after backend kick"
-                    );
+                    tracing::error!("relay: could not reunite client stream after backend kick");
                     return Err(ConnectionError::Closed);
                 },
             }
@@ -1033,4 +1083,26 @@ async fn handle_transfer_command(
             .ok()
         },
     }
+}
+
+/// Best-effort decode of a clientbound PluginMessage payload's channel
+/// name. Returns `None` if the payload doesn't decode as a VarInt-id +
+/// VarInt-prefixed UTF-8 channel — which is the case for almost every
+/// non-plugin-message packet, so the caller passes a packet body and
+/// this function safely returns `None` for bodies that aren't actually
+/// plugin messages.
+///
+/// The shape we look for matches modern (1.13+) plugin messages:
+/// `[VarInt id][VarInt channel_len][channel UTF-8 bytes][...payload]`.
+/// Pre-1.13 plugin messages used a UCS-2 BE channel; those aren't
+/// detected here, which is correct because ViaVersion's
+/// `vv:proxy_details` channel only appears on modern (post-1.13)
+/// connections where the proxy actually needs to translate.
+fn try_decode_plugin_channel(payload: bytes::Bytes) -> Option<String> {
+    use kojacoord_protocol::codec::Decode;
+    let mut cur = payload;
+    // Drop the leading packet id (VarInt).
+    let _ = kojacoord_protocol::types::VarInt::decode(&mut cur).ok()?;
+    // Channel name is the first VarInt-string field.
+    String::decode(&mut cur).ok()
 }

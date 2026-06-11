@@ -112,6 +112,31 @@ pub trait LimboPackets: Send + Sync {
 
     /// Build a clientbound PluginMessage containing the server brand.
     fn brand(&self, proto: u32, brand: &str) -> Option<EncodedPacket>;
+
+    /// 1.6.x-only essentials. Returning `None` by default makes the
+    /// other canonical buckets no-op these — modern clients don't
+    /// need a SpawnPosition broadcast to render their HUD; they take
+    /// it from the JoinGame coordinate fields directly.
+    ///
+    /// `spawn_position`: tells pre-netty clients where the compass
+    /// should point. Without it the compass UI stays blank.
+    fn spawn_position(&self, _proto: u32, _pos: PlayerPos) -> Option<EncodedPacket> {
+        None
+    }
+
+    /// `time_update`: pre-netty world stays at midnight (black sky)
+    /// without a TimeUpdate. Modern clients use a different packet
+    /// shape per epoch — limbo doesn't need to send it on those.
+    fn time_update(&self, _proto: u32) -> Option<EncodedPacket> {
+        None
+    }
+
+    /// `update_health`: pre-netty clients render the respawn screen
+    /// (and reject input) until they see UpdateHealth with `health > 0`.
+    /// Modern clients seed their HUD from JoinGame.
+    fn update_health(&self, _proto: u32) -> Option<EncodedPacket> {
+        None
+    }
 }
 
 /// Static dispatch: pick the [`LimboPackets`] implementation that
