@@ -1,3 +1,11 @@
+//! Plugin-channel commands for cross-backend player transfer.
+//!
+//! Supports two wire formats: the proxy's native
+//! `kojacoord:send` channel and the BungeeCord-compatible
+//! `BungeeCord` channel (so existing plugin code that targets
+//! BungeeCord works unchanged). Both encode the same command set —
+//! `Connect`, `ConnectOther`, `KickPlayer`, `Message`, …
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

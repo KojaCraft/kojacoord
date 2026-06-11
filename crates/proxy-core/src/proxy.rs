@@ -1,3 +1,18 @@
+//! Proxy state, listener, and background workers.
+//!
+//! [`ProxyState`] is the long-lived `Arc`-shared bag of "everything a
+//! connection might need" — config, server registry, plugin manager,
+//! databases, metrics, the lot. [`accept_loop`] binds the listening
+//! socket, dispatches one `ClientConnection` per TCP accept, and
+//! spawns the per-process background tasks (cached status refresh,
+//! TPS sampling, throttle/rate-limit eviction, failover monitor,
+//! HTTP/gRPC servers).
+//!
+//! Everything in here runs as long as the proxy does. Per-session
+//! state lives on `PlayerSession`; per-connection state lives on
+//! `ClientConnection` in `net::connection`.
+
+use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -12,12 +27,20 @@ use kojacoord_auth::{AuthConfig, AuthPipelineConfig};
 use kojacoord_cluster::{ClusterCoordinator, ServiceDiscovery};
 use kojacoord_config::ProxyConfig;
 use kojacoord_metrics::{AnalyticsEngine, MetricsCollector, MetricsExporter};
-use kojacoord_plugin_system::{PluginEvent, PluginManager, PluginResponse};
+use kojacoord_plugin_system::{PluginCommand, PluginEvent, PluginManager, PluginResponse};
 
 use crate::buffer_pool::BufferPool;
 use crate::connection_throttle::ConnectionThrottle;
+use crate::control_plane::{ControlPlaneConfig, ControlPlaneServer, ControlPlaneState};
+use crate::failover::FailoverManager;
+use crate::health_probe::start_health_probes;
 use crate::metrics::ProxyMetrics;
+use crate::metrics_player::PlayerMetricsRegistry;
+use crate::net::converter::chunk_repack::ChunkRepacker;
+use crate::net::plugin_channel_rate_limit::PluginChannelRateLimiter;
+use crate::protocol::ProtocolCoverage;
 use crate::routing::RoutingRules;
+use crate::security::EncryptionManager;
 use crate::server::ServerRegistry;
 use crate::server_management::ServerManagementServer;
 use crate::session::SharedSession;
@@ -104,6 +127,12 @@ impl Default for TpsTracker {
     }
 }
 
+type HotReloadMessage = (
+    std::path::PathBuf,
+    std::collections::HashMap<String, String>,
+);
+type HotReloadReceiver = tokio::sync::mpsc::UnboundedReceiver<HotReloadMessage>;
+
 pub struct ProxyState {
     pub config: Arc<ProxyConfig>,
     pub server_registry: Arc<ServerRegistry>,
@@ -131,17 +160,59 @@ pub struct ProxyState {
 
     pub analytics: Arc<AnalyticsEngine>,
 
-    pub plugin_manager: Arc<PluginManager>,
+    /// Wrapped in `std::sync::RwLock` for performance in the hot path (packet hooks).
+    /// The hot-reload watcher uses a channel-based approach to avoid holding locks
+    /// across await points.
+    pub plugin_manager: Arc<std::sync::RwLock<PluginManager>>,
+
+    /// Plugin hot-reload channel. The watcher task (started by
+    /// `start_plugin_hot_reload_watcher`) sends `(path, config)` tuples
+    /// here; the processor task (started by the same call) drains them
+    /// and applies the reload off the runtime worker via
+    /// `spawn_blocking`. Stored on state so that other components
+    /// (e.g. the HTTP management API) can also request a reload.
+    pub hot_reload_tx: tokio::sync::mpsc::UnboundedSender<(
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    )>,
+    /// Receiver side of `hot_reload_tx`, parked inside an option so the
+    /// processor can `take()` it on startup. Wrapped in `std::sync::Mutex`
+    /// because this is only touched once during boot.
+    hot_reload_rx: std::sync::Mutex<Option<HotReloadReceiver>>,
 
     pub tps_tracker: Arc<TpsTracker>,
 
     pub connection_throttle: Arc<ConnectionThrottle>,
 
-    /// Author : Starfloof.
+    /// Rate limiter for plugin channel messages (chat, commands, etc.)
+    pub plugin_channel_rate_limiter: Arc<PluginChannelRateLimiter>,
+
+    /// Per-player metrics and packet trace registry
+    pub player_metrics: Arc<PlayerMetricsRegistry>,
+
+    /// Failover manager for active-passive backend groups
+    pub failover_manager: Arc<FailoverManager>,
+
+    /// Pre-built JSON suffix for status responses, regenerated every second.
     pub cached_status: arc_swap::ArcSwap<CachedStatus>,
+
+    /// Protocol coverage tracker for converter management
+    pub protocol_coverage: Arc<ProtocolCoverage>,
+
+    /// Chunk repacker for cross-version chunk data conversion
+    pub chunk_repacker: Arc<ChunkRepacker>,
+
+    /// Encryption manager for pluggable encryption algorithms
+    pub encryption_manager: Arc<EncryptionManager>,
+
+    /// gRPC control plane state for external orchestration
+    pub control_plane_state: Arc<ControlPlaneState>,
+
+    /// gRPC control plane server instance
+    pub control_plane_server: Option<Arc<tokio::sync::Mutex<ControlPlaneServer>>>,
 }
 
-/// Author : Starfloof.
+/// Snapshot of the status-response JSON suffix (players + description).
 pub struct CachedStatus {
     pub suffix: String,
 }
@@ -166,6 +237,14 @@ impl ProxyState {
                     online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     connection_pool: None,
                     backend_type: s.backend_type.clone(),
+                    compression_threshold: s.compression_threshold,
+                    cipher_suites: s.cipher_suites.clone(),
+                    health_probe_interval_secs: s.health_probe_interval_secs,
+                    health_probe_timeout_secs: s.health_probe_timeout_secs,
+                    health_probe_fail_threshold: s.health_probe_fail_threshold,
+                    health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    region: s.region.clone(),
                 })
                 .await;
         }
@@ -200,6 +279,21 @@ impl ProxyState {
         let db = if config.database.url.trim().is_empty() {
             let sqlite_path = "data/proxy.db";
             tracing::info!("No MySQL URL configured — using SQLite at {}", sqlite_path);
+            // sqlx won't create missing parent directories, and the
+            // default config ships with `data/` relative; ensure it
+            // exists so first-run installs don't fail with
+            // "unable to open database file".
+            if let Some(parent) = std::path::Path::new(sqlite_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!(
+                            error = %e,
+                            path = %parent.display(),
+                            "Failed to create SQLite parent directory"
+                        );
+                    }
+                }
+            }
             match crate::data::db::Db::connect_sqlite(sqlite_path).await {
                 Ok(db) => {
                     tracing::info!("Connected to SQLite database");
@@ -288,27 +382,71 @@ impl ProxyState {
         let analytics = Arc::new(AnalyticsEngine::new(config.metrics.retention_hours));
 
         let plugin_manager = if config.plugins.enabled {
-            let mut manager = PluginManager::new();
+            let mut manager = PluginManager::new().context("Failed to create plugin manager")?;
+
+            // Set allowed permissions from config
+            for (plugin_name, perm_strings) in &config.plugin_permissions {
+                let permissions: Vec<kojacoord_plugin_system::api::PluginPermission> = perm_strings
+                    .iter()
+                    .filter_map(|s| {
+                        serde_json::from_str::<kojacoord_plugin_system::api::PluginPermission>(
+                            format!("\"{}\"", s).as_str(),
+                        )
+                        .ok()
+                    })
+                    .collect();
+                manager.set_allowed_permissions(plugin_name.clone(), permissions);
+            }
 
             if !config.plugins.plugin_dir.is_empty() {
                 let plugin_dir = &config.plugins.plugin_dir;
                 let configs = config.plugins.configs.clone();
 
-                if let Err(e) = manager.load_plugins_from_dir(plugin_dir, configs) {
+                if let Err(e) = manager.load_plugins_from_dir(plugin_dir, configs).await {
                     tracing::warn!(error = %e, "Failed to load plugins from directory");
                 }
             }
 
-            Arc::new(manager)
+            Arc::new(std::sync::RwLock::new(manager))
         } else {
-            Arc::new(PluginManager::new())
+            Arc::new(std::sync::RwLock::new(
+                PluginManager::new().context("Failed to create plugin manager")?,
+            ))
         };
 
         let tps_tracker = Arc::new(TpsTracker::new());
 
-        let connection_throttle = Arc::new(ConnectionThrottle::with_max_per_ip(
+        let connection_throttle = Arc::new(ConnectionThrottle::with_limits(
             config.proxy.max_connections_per_ip,
+            0,
         ));
+
+        let plugin_channel_rate_limiter = Arc::new(PluginChannelRateLimiter::default());
+
+        let player_metrics = Arc::new(PlayerMetricsRegistry::new(1000)); // Store up to 1000 trace entries per player
+
+        let failover_manager = Arc::new(FailoverManager::new(Arc::clone(&registry)));
+
+        // Load failover groups from config
+        failover_manager
+            .load_groups(config.failover_groups.clone())
+            .await;
+
+        // Initialize new components
+        let protocol_coverage = Arc::new(ProtocolCoverage::new());
+        tracing::info!("Protocol coverage tracker initialized");
+
+        let chunk_repacker = Arc::new(ChunkRepacker::new());
+        tracing::info!("Chunk repacker initialized");
+
+        let encryption_manager = Arc::new(EncryptionManager::new());
+        tracing::info!(
+            "Encryption manager initialized with algorithms: {:?}",
+            encryption_manager.registered_algorithms()
+        );
+
+        let control_plane_state = Arc::new(ControlPlaneState::new());
+        tracing::info!("gRPC control plane state initialized");
 
         if config.metrics.enabled {
             let exporter = MetricsExporter::new(Arc::clone(&metrics_collector));
@@ -321,6 +459,26 @@ impl ProxyState {
             tracing::info!("Metrics exporter started on {}", config.metrics.bind);
         }
 
+        // Build the plugin hot-reload channel. The watcher writes here;
+        // `start_plugin_hot_reload_watcher` will `take()` the receiver from
+        // `hot_reload_rx` and drive it.
+        let (hot_reload_tx, hot_reload_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            std::path::PathBuf,
+            std::collections::HashMap<String, String>,
+        )>();
+
+        let route_rules: Vec<crate::routing::RouteRule> = config
+            .routing
+            .rules
+            .iter()
+            .map(|r| crate::routing::RouteRule {
+                label: r.label.clone(),
+                name_glob: r.name_glob.clone(),
+                client_cidrs: r.client_cidrs.clone(),
+                target: r.target.clone(),
+            })
+            .collect();
+
         Ok(Self {
             config: Arc::new(config),
             server_registry: registry,
@@ -328,7 +486,7 @@ impl ProxyState {
             rsa_key,
             http_client,
             session_semaphore,
-            routing: Arc::new(RoutingRules::new(default_server)),
+            routing: Arc::new(RoutingRules::with_rules(default_server, route_rules)),
             buffer_pool: Arc::new(BufferPool::new()),
             metrics: Arc::new(ProxyMetrics::new()),
             auth_pipeline_config,
@@ -342,17 +500,27 @@ impl ProxyState {
             metrics_collector,
             analytics,
             plugin_manager,
+            hot_reload_tx,
+            hot_reload_rx: std::sync::Mutex::new(Some(hot_reload_rx)),
             tps_tracker,
             connection_throttle,
+            plugin_channel_rate_limiter,
+            player_metrics,
+            failover_manager,
             cached_status: arc_swap::ArcSwap::new(Arc::new(CachedStatus {
                 suffix:
                     r#"},"players":{"max":0,"online":0,"sample":[]},"description":{"text":""}}"#
                         .to_string(),
             })),
+            protocol_coverage,
+            chunk_repacker,
+            encryption_manager,
+            control_plane_state,
+            control_plane_server: None,
         })
     }
 
-    /// Author : Starfloof.
+    /// Hot-reload the server registry when the config file changes on disk.
     pub async fn reload_servers(&self, new_config: &kojacoord_config::ProxyConfig) {
         let mut new_names = std::collections::HashSet::new();
         for s in &new_config.servers {
@@ -389,6 +557,14 @@ impl ProxyState {
                             online: Arc::new(std::sync::atomic::AtomicBool::new(old_online)),
                             connection_pool: None,
                             backend_type: s.backend_type.clone(),
+                            compression_threshold: s.compression_threshold,
+                            cipher_suites: s.cipher_suites.clone(),
+                            health_probe_interval_secs: s.health_probe_interval_secs,
+                            health_probe_timeout_secs: s.health_probe_timeout_secs,
+                            health_probe_fail_threshold: s.health_probe_fail_threshold,
+                            health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                            health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            region: s.region.clone(),
                         })
                         .await;
                     tracing::info!("Hot-reloaded (updated) server: {}", s.name);
@@ -404,6 +580,14 @@ impl ProxyState {
                         online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                         connection_pool: None,
                         backend_type: s.backend_type.clone(),
+                        compression_threshold: s.compression_threshold,
+                        cipher_suites: s.cipher_suites.clone(),
+                        health_probe_interval_secs: s.health_probe_interval_secs,
+                        health_probe_timeout_secs: s.health_probe_timeout_secs,
+                        health_probe_fail_threshold: s.health_probe_fail_threshold,
+                        health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                        health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        region: s.region.clone(),
                     })
                     .await;
                 tracing::info!("Hot-reloaded new server: {}", s.name);
@@ -419,12 +603,142 @@ impl ProxyState {
         }
     }
 
+    /// Hot-reload everything that can be swapped in-place without rebuilding
+    /// `ProxyState`. Called when the on-disk config changes or (on Unix) on
+    /// SIGHUP.
+    ///
+    /// Server registry entries and the cached status suffix (MOTD + max
+    /// players) live behind `DashMap`/`ArcSwap` and can be mutated freely.
+    /// Routing rules and the top-level `ProxyConfig` are stored as `Arc<…>`
+    /// with no interior mutability — swapping them in-place would require
+    /// `ArcSwap` everywhere they're read, so for now we log that those
+    /// require a restart.
+    pub async fn reload_config(&self, new_config: &kojacoord_config::ProxyConfig) {
+        tracing::info!("Hot-reloading configuration...");
+
+        // MOTD lives in `listeners.motd` (string) or `listeners.motd_json`
+        // (full JSON component). Rebuild the cached status suffix.
+        let motd = &new_config.listeners.motd;
+        let new_suffix = format!(
+            r#"}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":{}}}}}"#,
+            new_config.proxy.max_players,
+            serde_json::to_string(motd).unwrap_or_else(|_| "\"A Minecraft Server\"".into()),
+        );
+        self.cached_status
+            .store(Arc::new(CachedStatus { suffix: new_suffix }));
+        tracing::info!("Hot-reloaded MOTD / max players");
+
+        self.reload_servers(new_config).await;
+
+        // Routing rules and the rest of ProxyConfig are immutable in this
+        // build — they're stored as `Arc<ProxyConfig>` read straight from
+        // the hot path. Swapping them in place would require routing every
+        // access through `ArcSwap`; that's a follow-up. For now: note that
+        // those parts require a restart.
+        let _ = new_config; // suppress unused-when-only-routing-changed warning
+        tracing::info!(
+            "Routing/forwarding/auth changes require a restart; servers + MOTD reloaded live"
+        );
+
+        tracing::info!("Configuration hot-reload complete");
+    }
+
     pub fn send_to_player(&self, uuid: &Uuid, packet: Bytes) -> bool {
         if let Some(tx) = self.outbound.get(uuid) {
             tx.send(packet).is_ok()
         } else {
             false
         }
+    }
+
+    /// Pick a backend for a connecting player, threading the choice
+    /// through the failover manager.
+    ///
+    /// The flow:
+    ///   1. `RoutingRules::select_with_region` returns the routing-rule
+    ///      candidate. (Lobby-by-region rules win over default.)
+    ///   2. If that candidate belongs to a failover group, swap it for
+    ///      the group's currently-active backend. The failover
+    ///      monitor flips that field whenever the primary goes down,
+    ///      so step 2 keeps routing in sync with health probes.
+    ///   3. If the swapped-in backend is offline (rare — usually means
+    ///      ALL standbys in the group are down too), keep the original
+    ///      candidate and let the upstream connect attempt surface the
+    ///      error. That's a better failure mode than silently routing
+    ///      to a different group entirely.
+    ///
+    /// Returns `None` only if the registry has no servers at all — at
+    /// which point the proxy would have logged a startup error and the
+    /// caller will drop into limbo.
+    pub async fn route_via_failover(
+        &self,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Option<Arc<crate::server::BackendServer>> {
+        let candidate = self
+            .routing
+            .select_with_region(&self.server_registry, client_ip)?;
+
+        // Walk the failover map once to find the group (if any) this
+        // candidate participates in; ask the manager for that group's
+        // current_active; swap if it differs and the new pick is up.
+        if let Some(group) = self
+            .failover_manager
+            .get_group_for_server(candidate.name.as_str())
+            .await
+        {
+            if let Some(active_name) = self.failover_manager.get_active_server(&group).await {
+                if active_name != candidate.name {
+                    if let Some(active) = self.server_registry.get(&active_name) {
+                        if active.is_online() {
+                            tracing::debug!(
+                                group = %group,
+                                original = %candidate.name,
+                                active = %active_name,
+                                "Failover-aware routing: candidate replaced with current_active",
+                            );
+                            return Some(active);
+                        }
+                    }
+                }
+            }
+        }
+        Some(candidate)
+    }
+
+    /// Graceful shutdown: kick every connected player with the same
+    /// "Proxy is restarting" message, give the writers a brief grace
+    /// window to flush the disconnect packet to the socket, then
+    /// return so the runtime can drop the listener.
+    ///
+    /// Triggered from any exit code path — Ctrl+C, SIGTERM, panic
+    /// inside the accept loop, etc. — by wiring this through a single
+    /// shutdown future at the top level (see `main.rs`).
+    ///
+    /// Without this the OS just rips the sockets out, the client sees
+    /// "Connection reset" and has to retry blindly. With it, the
+    /// client sees a textual reason and knows to try again in a few
+    /// seconds.
+    pub async fn shutdown_gracefully(&self, reason_json: &str) {
+        let total = self.sessions.len();
+        tracing::warn!(
+            sessions = total,
+            "Graceful shutdown: notifying every connected player"
+        );
+        // Collect UUIDs first so we don't hold a DashMap shard lock
+        // across `kick_player`'s `.await`s (which themselves take
+        // session locks). `kick_player` removes nothing; the writer
+        // task drops the session when the socket closes.
+        let uuids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
+        for uuid in &uuids {
+            self.kick_player(uuid, reason_json).await;
+        }
+        // Brief flush window — the outbound queue is async, and a
+        // bare-return would race the runtime drop and lose the
+        // disconnect packets we just queued. 500ms is empirically
+        // enough for the writer to drain on a healthy socket; failing
+        // sockets time out within the same window via TCP's RST path.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::warn!(notified = total, "Graceful shutdown notification complete");
     }
 
     pub async fn kick_player(&self, uuid: &Uuid, reason_json: &str) {
@@ -470,7 +784,11 @@ impl ProxyState {
         // broadcast_event locks each plugin only for the duration of its
         // handler and returns owned responses, so no plugin lock is held across
         // the awaits below.
-        let responses = self.plugin_manager.broadcast_event(&event);
+        let responses = self
+            .plugin_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .broadcast_event(&event);
 
         let mut subject_kicked = false;
         for response in responses {
@@ -492,6 +810,16 @@ impl ProxyState {
                 PluginResponse::Custom(value) => {
                     tracing::debug!(?value, "plugin returned a custom response");
                 },
+                PluginResponse::Cancel => {
+                    // Event cancellation is handled inside `broadcast_event`
+                    // (which short-circuits propagation). Nothing to do at
+                    // the dispatcher layer.
+                },
+                PluginResponse::UpdatePlayerSample { .. } => {
+                    // Player-sample updates are only meaningful for the
+                    // ServerListPing event and are consumed by the status
+                    // handler directly. Ignore here.
+                },
             }
         }
         subject_kicked
@@ -508,6 +836,366 @@ impl ProxyState {
             let raw = crate::packet_builder::build_system_message_packet(text, proto);
             self.send_to_player(uuid, raw);
         }
+    }
+
+    /// Spawn background tasks that listen to each loaded plugin's command
+    /// channel and execute the requested privileged operations.
+    pub fn start_plugin_command_processors(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut handles = vec![];
+            let receivers = {
+                let mgr = state
+                    .plugin_manager
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut lock = mgr
+                    .command_receivers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *lock)
+            };
+            for (name, mut rx) in receivers {
+                let state_clone = Arc::clone(&state);
+                let name_clone = name.clone();
+                let handle = tokio::spawn(async move {
+                    while let Some(cmd) = rx.recv().await {
+                        state_clone.process_plugin_command(&name_clone, cmd).await;
+                    }
+                    tracing::info!("Plugin command channel closed for {}", name_clone);
+                });
+                handles.push(handle);
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    }
+
+    /// Watch `plugins.plugin_dir` for changes and run the reload processor.
+    ///
+    /// Two background tasks are spawned:
+    ///   1. A poll-based watcher that scans the plugin directory with
+    ///      `tokio::fs::read_dir` (so the runtime worker isn't blocked on
+    ///      synchronous I/O) and sends reload requests through
+    ///      `hot_reload_tx` when a known plugin file's mtime advances.
+    ///   2. A processor that drains those requests and applies them on a
+    ///      blocking thread (the plugin manager's `std::sync::RwLock`
+    ///      contains a non-`Send` wasmtime guard, so we can't hold it
+    ///      across awaits).
+    ///
+    /// No-op when `plugins.hot_reload = false` or the directory isn't set.
+    pub fn start_plugin_hot_reload_watcher(self: &Arc<Self>) {
+        if !self.config.plugins.enabled || !self.config.plugins.hot_reload {
+            return;
+        }
+        let dir = self.config.plugins.plugin_dir.clone();
+        if dir.is_empty() {
+            return;
+        }
+        let interval_secs = self.config.plugins.hot_reload_interval_secs.max(1);
+
+        // Take ownership of the rx that was minted in `ProxyState::new`. If
+        // this function is called twice (it shouldn't be) the second call
+        // is a no-op rather than a panic.
+        let rx = match self
+            .hot_reload_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(rx) => rx,
+            None => {
+                tracing::warn!("hot-reload watcher already started; ignoring second start");
+                return;
+            },
+        };
+
+        // ── watcher ────────────────────────────────────────────────
+        let watcher_state = Arc::clone(self);
+        let watcher_dir = dir.clone();
+        tokio::spawn(async move {
+            let dir_path = std::path::PathBuf::from(&watcher_dir);
+            let mut mtimes: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+                std::collections::HashMap::new();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Skip the first immediate tick — record file mtimes once on
+            // startup as the baseline; only changes after launch trigger
+            // reloads.
+            interval.tick().await;
+            tracing::info!(
+                dir = %watcher_dir,
+                interval_secs,
+                "hot-reload watcher active"
+            );
+            loop {
+                interval.tick().await;
+                let mut entries = match tokio::fs::read_dir(&dir_path).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::trace!(error = %e, "hot-reload: read_dir failed");
+                        continue;
+                    },
+                };
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    let is_plugin = path
+                        .extension()
+                        .is_some_and(|ext| ext == "dll" || ext == "so" || ext == "dylib");
+                    if !is_plugin {
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata().await else {
+                        continue;
+                    };
+                    let Ok(mtime) = meta.modified() else { continue };
+                    let prev = mtimes.insert(path.clone(), mtime);
+                    let changed = matches!(prev, Some(p) if p != mtime);
+                    if !changed {
+                        continue;
+                    }
+                    let plugin_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let cfg = watcher_state
+                        .config
+                        .plugins
+                        .configs
+                        .get(&plugin_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    tracing::info!(
+                        plugin = %plugin_name,
+                        path = %path.display(),
+                        "hot-reload: change detected, queueing reload"
+                    );
+                    let _ = watcher_state.hot_reload_tx.send((path, cfg));
+                }
+            }
+        });
+
+        // ── processor ──────────────────────────────────────────────
+        let proc_state = Arc::clone(self);
+        let mut rx = rx;
+        tokio::spawn(async move {
+            while let Some((path, cfg)) = rx.recv().await {
+                let plugin_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                tracing::info!(
+                    plugin = %plugin_name,
+                    path = %path.display(),
+                    "hot-reload: processing reload request"
+                );
+                // The plugin manager is a `std::sync::RwLock` (kept that
+                // way for hot-path performance — every relayed packet
+                // takes a read guard). The guard contains a wasmtime
+                // `MutexGuard` which is `!Send`, so we can't hold the
+                // write lock across `reload_plugin`'s await points.
+                // Drive the reload on a blocking thread with its own
+                // current-thread runtime.
+                let state_for_reload = Arc::clone(&proc_state);
+                let path_for_reload = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut mgr = state_for_reload
+                        .plugin_manager
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build single-thread runtime for plugin reload");
+                    rt.block_on(mgr.reload_plugin(&path_for_reload, cfg))
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task panicked: {e}")));
+                match result {
+                    Ok(meta) => tracing::info!(
+                        plugin = %plugin_name,
+                        version = %meta.version,
+                        "hot-reload: plugin reloaded"
+                    ),
+                    Err(e) => tracing::warn!(
+                        plugin = %plugin_name,
+                        error = %e,
+                        "hot-reload: reload failed"
+                    ),
+                }
+            }
+        });
+    }
+
+    /// Start the gRPC control plane server if enabled
+    pub fn start_grpc_control_plane(self: &Arc<Self>) {
+        if !self.config.grpc_control_plane.enabled {
+            tracing::info!("gRPC control plane disabled in config, skipping");
+            return;
+        }
+
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let grpc_config = ControlPlaneConfig {
+                bind_address: state.config.grpc_control_plane.bind_address.clone(),
+                port: state.config.grpc_control_plane.port,
+                tls_enabled: state.config.grpc_control_plane.tls_enabled,
+                tls_cert_path: state.config.grpc_control_plane.tls_cert_path.clone(),
+                tls_key_path: state.config.grpc_control_plane.tls_key_path.clone(),
+                auth_enabled: state.config.grpc_control_plane.auth_enabled,
+                auth_token: state.config.grpc_control_plane.auth_token.clone(),
+            };
+
+            let mut server =
+                ControlPlaneServer::new(grpc_config, state.control_plane_state.clone());
+
+            if let Err(e) = server.start().await {
+                tracing::error!(error = %e, "Failed to start gRPC control plane");
+            } else {
+                tracing::info!(
+                    "gRPC control plane started successfully on {}:{}",
+                    state.config.grpc_control_plane.bind_address,
+                    state.config.grpc_control_plane.port
+                );
+            }
+        });
+    }
+
+    async fn process_plugin_command(&self, plugin_name: &str, cmd: PluginCommand) {
+        match cmd {
+            PluginCommand::RegisterServer {
+                name,
+                address,
+                port,
+                max_players: _,
+            } => {
+                let addr = match format!("{}:{}", address, port).parse::<std::net::SocketAddr>() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(plugin = %plugin_name, name = %name, error = %e, "Plugin requested invalid server address");
+                        return;
+                    },
+                };
+                if self.server_registry.get(&name).is_some() {
+                    self.server_registry.remove(&name);
+                }
+                let server = crate::server::BackendServer {
+                    name: name.clone(),
+                    address: addr,
+                    restricted: false,
+                    forwarding_override: None,
+                    player_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    connection_pool: None,
+                    backend_type: kojacoord_config::BackendType::default(),
+                    compression_threshold: 0,
+                    cipher_suites: String::new(),
+                    health_probe_interval_secs: 0,
+                    health_probe_timeout_secs: 5,
+                    health_probe_fail_threshold: 3,
+                    health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    region: String::new(),
+                };
+                self.server_registry.register(server).await;
+                tracing::info!(plugin = %plugin_name, "Registered server {} at {}:{}", name, address, port);
+            },
+            PluginCommand::DeregisterServer { name } => {
+                if self.server_registry.get(&name).is_some() {
+                    let default_server = self
+                        .config
+                        .servers
+                        .first()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "lobby".to_owned());
+                    self.evacuate_players(&name, &default_server).await;
+                    self.server_registry.remove(&name);
+                    tracing::info!(plugin = %plugin_name, "Deregistered server {}", name);
+                }
+            },
+            PluginCommand::TransferPlayer { uuid, server } => {
+                if let Some(target) = self.sessions.get(&uuid) {
+                    if let Some(old_name) = target.read().await.current_server.clone() {
+                        if let Some(old) = self.server_registry.get(&old_name) {
+                            old.player_count
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    if let Some(new_srv) = self.server_registry.get(&server) {
+                        new_srv
+                            .player_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    target.write().await.current_server = Some(server.clone());
+                    tracing::info!(plugin = %plugin_name, "Transferred player {} to {}", uuid, server);
+                }
+            },
+            PluginCommand::KickPlayer { uuid, reason } => {
+                let json = serde_json::json!({ "text": reason }).to_string();
+                self.kick_player(&uuid, &json).await;
+                tracing::info!(plugin = %plugin_name, "Kicked player {}: {}", uuid, reason);
+            },
+            PluginCommand::SendSystemMessage { uuid, message } => {
+                self.send_system_message_to(&uuid, &message).await;
+            },
+            PluginCommand::UpdatePlayerStatus {
+                uuid,
+                server,
+                online,
+            } => {
+                if let Some(db) = &self.db {
+                    let server_name = server.unwrap_or_default();
+                    if let Err(e) = db.update_player_status(uuid, &server_name, online).await {
+                        tracing::warn!(plugin = %plugin_name, error = %e, "Failed to update player status");
+                    }
+                }
+            },
+        }
+    }
+
+    /// Move all players currently on `from_server` to `to_server`.
+    ///
+    /// We snapshot `(uuid, SharedSession)` from the DashMap into a `Vec`
+    /// up front and only then start awaiting. Iterating a DashMap holds
+    /// per-shard guards, and `kick_player()` reaches back into the same
+    /// `sessions` map — re-entering a held shard would deadlock. The
+    /// snapshot is cheap (an `Arc` clone per session) and decouples the
+    /// shard-lifetime from the await-lifetime.
+    async fn evacuate_players(&self, from_server: &str, to_server: &str) -> usize {
+        let snapshot: Vec<(Uuid, SharedSession)> = self
+            .sessions
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+
+        let mut evacuated = 0usize;
+        for (uuid, session) in snapshot {
+            let current = {
+                let s = session.read().await;
+                s.current_server.clone()
+            };
+            if current.as_deref() == Some(from_server) {
+                {
+                    let mut s = session.write().await;
+                    s.current_server = Some(to_server.to_owned());
+                }
+                if let Some(old) = self.server_registry.get(from_server) {
+                    old.player_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(new_srv) = self.server_registry.get(to_server) {
+                    new_srv
+                        .player_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let reason = r#"{"text":"§cThe server you were on has shut down. Reconnecting you to the lobby..."}"#;
+                self.kick_player(&uuid, reason).await;
+                evacuated += 1;
+            }
+        }
+        evacuated
     }
 }
 
@@ -543,6 +1231,9 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         });
     }
 
+    // Start gRPC control plane if enabled
+    state.start_grpc_control_plane();
+
     // Start modpack online counts background reporting loop
     crate::metrics_report::start_reporting(Arc::clone(&state));
 
@@ -558,6 +1249,38 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
             }
         }
     });
+
+    // Periodically evict stale plugin channel rate limit records
+    tokio::spawn({
+        let rate_limiter = Arc::clone(&state.plugin_channel_rate_limiter);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rate_limiter.evict_stale().await;
+            }
+        }
+    });
+
+    // Periodically evict inactive player metrics
+    tokio::spawn({
+        let player_metrics = Arc::clone(&state.player_metrics);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                interval.tick().await;
+                player_metrics
+                    .evict_inactive(std::time::Duration::from_secs(3600))
+                    .await; // 1 hour timeout
+            }
+        }
+    });
+
+    // Start health probe task for backend servers
+    start_health_probes(Arc::clone(&state.server_registry));
+
+    // Start failover monitoring task
+    Arc::clone(&state.failover_manager).start_monitoring();
 
     tokio::spawn({
         let metrics = Arc::clone(&state.metrics);
@@ -578,7 +1301,8 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         }
     });
 
-    // Author : Starfloof.
+    // Refresh the cached status response every second so the MOTD and player
+    // list shown to pingers stays up-to-date without blocking the accept loop.
     tokio::spawn({
         let state = Arc::clone(&state);
         async move {

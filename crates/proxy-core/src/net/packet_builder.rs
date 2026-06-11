@@ -1,3 +1,11 @@
+//! One-off packet builders for proxy-originated messages.
+//!
+//! When the proxy needs to talk to a client without proxying
+//! something from the backend (disconnect reasons, system chat,
+//! brand info, the XRay honeypot's fake block updates), the
+//! per-version constructors live here. Most return raw `Bytes` ready
+//! for `write_packet`; the dispatch is per protocol family.
+
 use bytes::{Bytes, BytesMut};
 use kojacoord_protocol::{codec::Encode, types::VarInt, ProtocolVersion};
 use uuid::Uuid;
@@ -15,17 +23,24 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
     VarInt(pid as i32).encode(&mut payload).unwrap();
 
     match nearest(proto) {
-        ProtocolVersion::V1_6_4 | ProtocolVersion::V1_7_10 => {
-            use kojacoord_protocol::versions::v1_7_10::play::ClientboundChatMessage;
+        ProtocolVersion::V1_6_4 => {
+            // 1.6.4 chat is a raw string, not JSON. Strip the JSON
+            // wrapper and send the plain text.
+            use kojacoord_protocol::versions::v1_6_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
-                json_message: json,
-                position: 1,
+                message: text.to_string(),
             }
             .encode(&mut payload)
             .unwrap();
         },
+        ProtocolVersion::V1_7_10 => {
+            use kojacoord_protocol::versions::v1_7_x::play::ClientboundChatMessage;
+            ClientboundChatMessage { json_message: json }
+                .encode(&mut payload)
+                .unwrap();
+        },
         ProtocolVersion::V1_8 | ProtocolVersion::V1_12_2 => {
-            use kojacoord_protocol::versions::v1_12_2::play::ClientboundChatMessage;
+            use kojacoord_protocol::versions::v1_12_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
                 json_message: json,
                 position: 1,
@@ -34,7 +49,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_16_5 => {
-            use kojacoord_protocol::versions::v1_16_5::play::ClientboundChatMessage;
+            use kojacoord_protocol::versions::v1_16_x::play::ClientboundChatMessage;
             ClientboundChatMessage {
                 json_message: json,
                 position: 1,
@@ -44,7 +59,7 @@ pub fn build_system_message_packet(text: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         _ => {
-            use kojacoord_protocol::versions::v1_20_4::play::ClientboundSystemChat;
+            use kojacoord_protocol::versions::v1_20_x::play::ClientboundSystemChat;
             ClientboundSystemChat {
                 content: json,
                 overlay: false,
@@ -91,6 +106,7 @@ pub fn build_brand_packet(kind: modloader::ModloaderKind, proto: u32) -> Bytes {
         modloader::ModloaderKind::Fml3 => "forge",
         modloader::ModloaderKind::NeoForge => "neoforge",
         modloader::ModloaderKind::Fabric => "fabric",
+        modloader::ModloaderKind::Quilt => "quilt",
         modloader::ModloaderKind::Unknown | modloader::ModloaderKind::Vanilla => "Kojacoord",
     };
 
@@ -108,6 +124,50 @@ pub fn build_brand_packet(kind: modloader::ModloaderKind, proto: u32) -> Bytes {
     payload.freeze()
 }
 
+/// Extract a plain-text rendering of a Minecraft chat-component JSON
+/// string. Pre-netty (1.6.x) clients don't parse JSON — if we feed
+/// them `{"text":"hi"}` they show the braces literally. Walks the
+/// `text` / `extra[]` keys recursively and concatenates them.
+pub fn plaintext_from_chat_json(s: &str) -> String {
+    fn walk(v: &serde_json::Value, out: &mut String) {
+        match v {
+            serde_json::Value::String(s) => out.push_str(s),
+            serde_json::Value::Object(m) => {
+                if let Some(serde_json::Value::String(t)) = m.get("text") {
+                    out.push_str(t);
+                }
+                if let Some(serde_json::Value::Array(extras)) = m.get("extra") {
+                    for e in extras {
+                        walk(e, out);
+                    }
+                }
+            },
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            },
+            _ => {},
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => {
+            let mut out = String::new();
+            walk(&v, &mut out);
+            // Empty result usually means the input wasn't a chat
+            // component (just a bare string in JSON form). Fall
+            // back to the input.
+            if out.is_empty() {
+                s.to_string()
+            } else {
+                out
+            }
+        },
+        // Not JSON — assume it's already plain text.
+        Err(_) => s.to_string(),
+    }
+}
+
 pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
     let pkt_id = cb_play(proto, "ClientboundDisconnect");
     let mut payload = BytesMut::new();
@@ -115,15 +175,18 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
 
     match nearest(proto) {
         ProtocolVersion::V1_6_4 => {
-            use kojacoord_protocol::versions::v1_6_4::play::ClientboundDisconnect;
+            // 1.6.4 (pre-netty) doesn't understand JSON chat
+            // components — the disconnect reason is a single raw
+            // string (§-prefixed colour codes are honoured).
+            use kojacoord_protocol::versions::v1_6_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
-                reason: json_reason.to_string(),
+                reason: plaintext_from_chat_json(json_reason),
             }
             .encode(&mut payload)
             .unwrap();
         },
         ProtocolVersion::V1_7_10 => {
-            use kojacoord_protocol::versions::v1_7_10::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_7_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -131,7 +194,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_8 | ProtocolVersion::V1_12_2 => {
-            use kojacoord_protocol::versions::v1_12_2::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_12_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -139,7 +202,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_16_5 => {
-            use kojacoord_protocol::versions::v1_16_5::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_16_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -147,7 +210,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_19_4 => {
-            use kojacoord_protocol::versions::v1_19_4::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_19_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -155,7 +218,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_20_4 => {
-            use kojacoord_protocol::versions::v1_20_4::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_20_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -163,7 +226,7 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
             .unwrap();
         },
         ProtocolVersion::V1_21 => {
-            use kojacoord_protocol::versions::v1_21::play::ClientboundDisconnect;
+            use kojacoord_protocol::versions::v1_21_x::play::ClientboundDisconnect;
             ClientboundDisconnect {
                 reason: json_reason.to_string(),
             }
@@ -189,9 +252,9 @@ pub fn build_disconnect_packet(json_reason: &str, proto: u32) -> Bytes {
 /// client's world without touching the real server's block state.
 ///
 /// Protocol version mapping:
-/// | Version | Packet ID | Position encoding         |
-/// |---------|-----------|---------------------------|
-/// | 1.7     | 0x23      | i32 x + u8 y + i32 z      |
+/// | Version | Packet ID | Position encoding          |
+/// |---------|-----------|----------------------------|
+/// | 1.7     | 0x23      | i32 x + u8 y + i32 z       |
 /// | 1.8-1.12| 0x23/0x0B | packed i64                 |
 /// | 1.13-1.17| 0x0B     | packed i64 + VarInt state  |
 /// | 1.18+   | 0x09      | packed i64 + VarInt state  |

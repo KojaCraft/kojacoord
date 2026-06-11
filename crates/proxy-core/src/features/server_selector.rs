@@ -1,3 +1,11 @@
+//! Backend selector GUI (`kojacoord:serverlist` plugin channel).
+//!
+//! Custom protocol that lets modded clients render a server-picker
+//! UI inside the game without leaving the proxy. We respond to
+//! `serverlist` channel queries with the current backend list plus
+//! status, and act on `connect`/`modpack` channel commands by
+//! transferring the player.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

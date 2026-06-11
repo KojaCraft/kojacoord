@@ -1,3 +1,10 @@
+//! Rolling event log for the management dashboard.
+//!
+//! Buckets events by hour and trims to the operator-configured
+//! retention window. Storage is in-memory only — this isn't a
+//! persistence layer, just a way to surface "what happened in the
+//! last N hours" without going through the metrics scrape.
+
 use chrono::{DateTime, Timelike, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -6,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct AnalyticsEngine {
-    hourly_buckets: Arc<DashMap<String, (u64, u64)>>, // (Joins, Leaves)
+    hourly_buckets: Arc<DashMap<String, (u64, u64)>>, // Each hour tracks (joins, leaves).
     aggregates: Arc<RwLock<AnalyticsAggregates>>,
     retention_hours: u64,
 }
@@ -85,7 +92,7 @@ impl AnalyticsEngine {
         }
         drop(entry);
 
-        // Cleanup old buckets (roughly by checking keys)
+        // Prune stale hourly buckets so the map doesn't grow forever.
         let cutoff = Utc::now() - chrono::Duration::hours(self.retention_hours as i64);
         let cutoff_str = cutoff.format("%Y-%m-%d-%H").to_string();
         self.hourly_buckets.retain(|k, _| *k >= cutoff_str);

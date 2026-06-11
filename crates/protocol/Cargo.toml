@@ -24,6 +24,21 @@ uuid.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+toml = "0.8"
+once_cell = "1.20"
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# Generator binary that scrapes minecraft-data JSON into the TOML files
+# under `data/`. Run with: `cargo run -p kojacoord-protocol --bin gen_flattening`.
+[[bin]]
+name = "gen_flattening"
+path = "src/bin/gen_flattening.rs"
+
+# Generator binary that scrapes minecraft-data dimension_codec.nbt files
+# into per-proto NBT files under `data/`. Run with:
+#   cargo run -p kojacoord-protocol --bin gen_dimension_codec
+[[bin]]
+name = "gen_dimension_codec"
+path = "src/bin/gen_dimension_codec.rs"

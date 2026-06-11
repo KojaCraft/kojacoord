@@ -1,3 +1,10 @@
+//! 32-bit variable-length integer.
+//!
+//! Minecraft's pervasive integer encoding: 7 bits per byte, MSB set
+//! when more bytes follow, two's-complement for negatives (so -1
+//! takes the maximum 5 bytes). Used as length prefixes, packet ids,
+//! entity ids, and most everything else integer-shaped on the wire.
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
@@ -5,6 +12,8 @@ use crate::{
     error::ProtocolError,
 };
 
+/// Maximum byte length of a serialized 32-bit VarInt. Used as a sanity
+/// cap by the decoder — anything longer is malformed and rejected.
 pub const VARINT_MAX_BYTES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

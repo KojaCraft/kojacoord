@@ -1,3 +1,10 @@
+//! Periodic per-modpack online-count reporter.
+//!
+//! Background loop that posts modpack identifier + current online
+//! count to the configured webhook every N seconds. Used by the
+//! upstream marketplace for the "live players right now" badge —
+//! the data is anonymous (modpack ID + count, nothing player-shaped).
+
 use crate::proxy::ProxyState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +20,7 @@ pub fn start_reporting(state: Arc<ProxyState>) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         loop {
-            // Check counts and send report every 30 seconds
+            // Report modpack player counts every 30 seconds.
             tokio::time::sleep(Duration::from_secs(30)).await;
 
             for s in &state.config.servers {

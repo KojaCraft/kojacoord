@@ -1,9 +1,18 @@
+//! Loaded-plugin registry and event/packet hook dispatcher.
+//!
+//! Owns one `Box<dyn Plugin>` per loaded plugin plus the supporting
+//! state (command receivers, packet-hook table, per-plugin permission
+//! grants). Held inside `std::sync::RwLock` at the proxy level so the
+//! relay can grab a read guard for every packet hook without crossing
+//! an await — see the field comment on `ProxyState::plugin_manager`.
+
 use crate::api::{
-    PacketData, PacketEvent, PacketHookResult, Plugin, PluginContext, PluginEvent, PluginMetadata,
-    PluginResponse,
+    PacketData, PacketEvent, PacketHookResult, Plugin, PluginCommand, PluginContext, PluginEvent,
+    PluginMetadata, PluginPermission, PluginResponse,
 };
-use crate::loader::PluginLoader;
 use crate::sandbox::{apply_sandbox, SandboxConfig};
+use crate::wasm_loader::{WasmLoader, WasmPluginAdapter};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,23 +23,65 @@ use std::sync::{Arc, Mutex, RwLock};
 pub type SharedPlugin = Arc<Mutex<Box<dyn Plugin>>>;
 
 pub struct PluginManager {
-    loader: PluginLoader,
+    wasm_loader: Arc<WasmLoader>,
     plugins: HashMap<String, (SharedPlugin, PluginMetadata)>,
     plugin_configs: HashMap<String, PluginContext>,
     packet_hooks: Arc<RwLock<Vec<PacketEvent>>>,
     sandbox_enabled: bool,
     sandbox_config: SandboxConfig,
+    /// Allowed permissions per plugin (from config)
+    allowed_permissions: HashMap<String, Vec<PluginPermission>>,
+    /// Receivers for plugin command channels. Each plugin gets its own
+    /// channel so the proxy can route responses per plugin if needed.
+    pub command_receivers:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedReceiver<PluginCommand>>>,
 }
 
 impl PluginManager {
-    pub fn new() -> Self {
-        Self {
-            loader: PluginLoader::new(),
+    pub fn new() -> Result<Self, anyhow::Error> {
+        let wasm_loader = Arc::new(WasmLoader::new()?);
+        Ok(Self {
+            wasm_loader,
             plugins: HashMap::new(),
             plugin_configs: HashMap::new(),
             packet_hooks: Arc::new(RwLock::new(Vec::new())),
             sandbox_enabled: true,
             sandbox_config: SandboxConfig::default(),
+            allowed_permissions: HashMap::new(),
+            command_receivers: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Create a new PluginManager with a custom WASM loader
+    pub fn with_wasm_loader(wasm_loader: WasmLoader) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            wasm_loader: Arc::new(wasm_loader),
+            plugins: HashMap::new(),
+            plugin_configs: HashMap::new(),
+            packet_hooks: Arc::new(RwLock::new(Vec::new())),
+            sandbox_enabled: true,
+            sandbox_config: SandboxConfig::default(),
+            allowed_permissions: HashMap::new(),
+            command_receivers: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Set the allowed permissions for a specific plugin from config
+    pub fn set_allowed_permissions(
+        &mut self,
+        plugin_name: String,
+        permissions: Vec<PluginPermission>,
+    ) {
+        self.allowed_permissions.insert(plugin_name, permissions);
+    }
+
+    /// Check if a plugin has a specific permission
+    pub fn has_permission(&self, plugin_name: &str, permission: PluginPermission) -> bool {
+        if let Some(allowed) = self.allowed_permissions.get(plugin_name) {
+            allowed.contains(&permission)
+        } else {
+            // If no permissions are configured, deny by default
+            false
         }
     }
 
@@ -52,7 +103,7 @@ impl PluginManager {
         }
     }
 
-    pub fn load_plugin<P: AsRef<Path>>(
+    pub async fn load_plugin<P: AsRef<Path>>(
         &mut self,
         path: P,
         config: HashMap<String, String>,
@@ -64,13 +115,35 @@ impl PluginManager {
             .unwrap_or("unknown")
             .to_string();
 
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PluginCommand>();
+
         let context = PluginContext {
             plugin_id: plugin_name.clone(),
             version: "1.0.0".to_string(),
             config,
+            command_tx: Some(cmd_tx),
         };
 
-        let (mut plugin, metadata) = self.loader.load_plugin(path, &context)?;
+        // Only load WASM plugins
+        let wasm_bytes = std::fs::read(path).context("Failed to read WASM file")?;
+
+        let wasm_instance = self
+            .wasm_loader
+            .load_plugin(
+                plugin_name.clone(),
+                "1.0.0".to_string(),
+                wasm_bytes,
+                &context,
+            )
+            .await
+            .context("Failed to load WASM plugin")?;
+
+        let adapter = WasmPluginAdapter::new(wasm_instance.clone(), self.wasm_loader.clone());
+        let metadata = {
+            let guard = wasm_instance.lock().unwrap();
+            guard.metadata.clone()
+        };
+        let mut plugin = Box::new(adapter) as Box<dyn Plugin>;
 
         if metadata.name != plugin_name {
             log::warn!(
@@ -78,6 +151,21 @@ impl PluginManager {
                 metadata.name,
                 plugin_name
             );
+        }
+
+        // Enforce permission sandboxing: check that requested permissions are allowed
+        for requested_perm in &metadata.permissions {
+            if !self.has_permission(&metadata.name, requested_perm.clone()) {
+                log::error!(
+                    "Plugin '{}' requested permission {:?} which is not allowed in config. Refusing to load.",
+                    metadata.name,
+                    requested_perm
+                );
+                return Err(anyhow::anyhow!(
+                    "Plugin requested permission {:?} which is not allowed",
+                    requested_perm
+                ));
+            }
         }
 
         // Activate the plugin and collect its packet hooks now, while we still
@@ -88,10 +176,11 @@ impl PluginManager {
         let hooks = plugin.register_packet_hooks();
         if !hooks.is_empty() {
             let count = hooks.len();
-            self.packet_hooks
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(hooks);
+            let mut hooks_lock = self.packet_hooks.write().unwrap_or_else(|e| e.into_inner());
+            hooks_lock.extend(hooks);
+            // Sort hooks by priority (descending) so higher priority hooks execute first
+            // Higher priority runs first — sort descending.
+            hooks_lock.sort_by_key(|h| std::cmp::Reverse(h.priority()));
             log::info!(
                 "Registered {} packet hook(s) from plugin '{}'",
                 count,
@@ -104,9 +193,16 @@ impl PluginManager {
             (Arc::new(Mutex::new(plugin)), metadata.clone()),
         );
         self.plugin_configs.insert(plugin_name.clone(), context);
+        {
+            let mut rx_lock = self
+                .command_receivers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            rx_lock.insert(plugin_name.clone(), cmd_rx);
+        }
 
         log::info!(
-            "Loaded plugin: {} v{} by {}",
+            "Loaded WASM plugin: {} v{} by {}",
             metadata.name,
             metadata.version,
             metadata.author
@@ -114,7 +210,7 @@ impl PluginManager {
         Ok(metadata)
     }
 
-    pub fn load_plugins_from_dir<P: AsRef<Path>>(
+    pub async fn load_plugins_from_dir<P: AsRef<Path>>(
         &mut self,
         dir: P,
         configs: HashMap<String, HashMap<String, String>>,
@@ -138,10 +234,8 @@ impl PluginManager {
             let entry = entry?;
             let path = entry.path();
 
-            if path
-                .extension()
-                .is_some_and(|ext| ext == "dll" || ext == "so" || ext == "dylib")
-            {
+            // Only load WASM plugins
+            if path.extension().is_some_and(|ext| ext == "wasm") {
                 let plugin_name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -150,8 +244,8 @@ impl PluginManager {
 
                 let config = configs.get(&plugin_name).cloned().unwrap_or_default();
 
-                if let Err(e) = self.load_plugin(&path, config) {
-                    log::error!("Failed to load plugin {:?}: {}", path, e);
+                if let Err(e) = self.load_plugin(&path, config).await {
+                    log::error!("Failed to load WASM plugin {:?}: {}", path, e);
                 }
             }
         }
@@ -179,28 +273,55 @@ impl PluginManager {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
 
-            log::info!("Unloaded plugin: {}", name);
+            log::info!("Unloaded WASM plugin: {}", name);
             return Ok(metadata);
         }
         Err(anyhow::anyhow!("Plugin not found: {}", name))
+    }
+
+    /// Atomically unload then reload a single plugin from the same path.
+    /// Used by the proxy's hot-reload watcher when it sees a plugin WASM file
+    /// change on disk. Idempotent — if the plugin isn't currently loaded
+    /// this is the same as calling [`Self::load_plugin`].
+    pub async fn reload_plugin<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        config: HashMap<String, String>,
+    ) -> anyhow::Result<PluginMetadata> {
+        let path_ref = path.as_ref();
+        let plugin_name = path_ref
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        // Best-effort unload — ignore "not found" so first-time loads work.
+        let _ = self.unload_plugin(&plugin_name);
+        self.load_plugin(path, config).await
     }
 
     pub fn unload_all(&mut self) {
         for name in self.plugins.keys().cloned().collect::<Vec<String>>() {
             let _ = self.unload_plugin(&name);
         }
-        self.loader.unload_all();
     }
 
     /// Deliver an event to every loaded plugin's `handle_event` and collect the
     /// non-`None` responses for the caller to act on. Each plugin is locked only
     /// for the duration of its handler.
+    ///
+    /// If any plugin returns `PluginResponse::Cancel`, event propagation stops
+    /// immediately and the Cancel response is returned. This allows plugins to
+    /// veto events (e.g., prevent a player from joining, block a chat message).
     pub fn broadcast_event(&self, event: &PluginEvent) -> Vec<PluginResponse> {
         let mut responses = Vec::new();
 
         for (name, (plugin, _)) in &self.plugins {
             let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
             match guard.handle_event(event) {
+                Ok(Some(PluginResponse::Cancel)) => {
+                    log::debug!("Plugin '{}' cancelled event propagation", name);
+                    return vec![PluginResponse::Cancel];
+                },
                 Ok(Some(response)) => responses.push(response),
                 Ok(None) => {},
                 Err(e) => log::error!("Plugin '{}' handle_event error: {}", name, e),
@@ -274,6 +395,6 @@ pub struct HookInfo {
 
 impl Default for PluginManager {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("Failed to create PluginManager")
     }
 }

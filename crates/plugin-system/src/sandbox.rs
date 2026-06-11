@@ -1,3 +1,12 @@
+//! WASM plugin sandbox configuration.
+//!
+//! Per-plugin policy that controls what host imports the wasmtime
+//! linker exposes — filesystem reads, network sockets, child
+//! processes. Defaults deny everything except the proxy's own
+//! per-plugin command channel. Operators relax permissions per plugin
+//! in the config; the host enforces them by simply not adding the
+//! corresponding host imports to the linker for that module.
+
 use anyhow::Result;
 use log::{info, warn};
 

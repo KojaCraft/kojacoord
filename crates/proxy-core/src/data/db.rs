@@ -1,3 +1,12 @@
+//! Optional SQL backing store (MySQL or SQLite).
+//!
+//! When `[database] url` is set, the proxy persists player profiles,
+//! purchases, role assignments, and ban records here. The SQLite
+//! fallback is the default when no URL is configured — `data/proxy.db`
+//! is created on the fly. The connection is optional throughout:
+//! every consumer treats `db: Option<Arc<Db>>` and degrades to
+//! in-memory-only behavior when it's `None`.
+
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -62,6 +71,63 @@ impl Db {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS players (
+                uuid VARCHAR(36) NOT NULL PRIMARY KEY,
+                username VARCHAR(16) NOT NULL,
+                role VARCHAR(32) NOT NULL DEFAULT 'PLAYER',
+                online TINYINT(1) NOT NULL DEFAULT 0,
+                server VARCHAR(64) NULL,
+                first_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_players_username (username)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS player_bans (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                player_uuid VARCHAR(36) NOT NULL,
+                reason TEXT NOT NULL,
+                banned_by VARCHAR(64) NOT NULL,
+                banned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NULL,
+                active TINYINT(1) DEFAULT 1,
+                INDEX idx_ban_uuid (player_uuid),
+                INDEX idx_ban_active (active)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name VARCHAR(32) NOT NULL PRIMARY KEY,
+                display_name VARCHAR(64) NOT NULL,
+                prefix VARCHAR(32) NOT NULL DEFAULT '',
+                color VARCHAR(16) NOT NULL DEFAULT 'WHITE',
+                weight INT NOT NULL DEFAULT 0,
+                permissions JSON
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // See SQLite section for the rationale on this table.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cached_profiles (
+                uuid VARCHAR(36) NOT NULL PRIMARY KEY,
+                username VARCHAR(32) NOT NULL,
+                properties_json LONGTEXT NOT NULL,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_cached_profiles_username (username)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
             mysql_pool: Some(pool),
             sqlite_pool: None,
@@ -99,11 +165,193 @@ impl Db {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS players (
+                uuid TEXT NOT NULL PRIMARY KEY,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'PLAYER',
+                online INTEGER NOT NULL DEFAULT 0,
+                server TEXT,
+                first_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_players_username ON players(username)")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS player_bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_uuid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                banned_by TEXT NOT NULL,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NULL,
+                active INTEGER DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ban_uuid ON player_bans(player_uuid)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ban_active ON player_bans(active)")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name TEXT NOT NULL PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                prefix TEXT NOT NULL DEFAULT '',
+                color TEXT NOT NULL DEFAULT 'WHITE',
+                weight INTEGER NOT NULL DEFAULT 0,
+                permissions TEXT
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Cached Mojang profile properties, keyed by online-mode UUID.
+        //
+        // Populated when a 1.7+ client completes Mojang `hasJoined`
+        // verification AND the signature on each property is
+        // successfully checked against the configured
+        // `mojang_public_key`. Loaded when a 1.6.x client connects in
+        // offline mode (1.6.x's session.minecraft.net endpoint has
+        // been dead since 2014) so the proxy can synthesise their
+        // skin from the cached signed property.
+        //
+        // `properties_json` is the serde-JSON serialisation of the
+        // `Vec<ProfileProperty>` straight from `kojacoord-auth` —
+        // includes `name`, base64 `value` and base64 `signature`. We
+        // intentionally keep the original base64 envelope so a
+        // re-verification at load time uses exactly the same bytes
+        // Mojang signed.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cached_profiles (
+                uuid TEXT NOT NULL PRIMARY KEY,
+                username TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_cached_profiles_username
+                ON cached_profiles(username)",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
             mysql_pool: None,
             sqlite_pool: Some(pool),
             db_type: DbType::Sqlite,
         })
+    }
+
+    /// Cache a Mojang-verified profile keyed by online-mode UUID.
+    /// Called by `finalise_login` after `verify_properties` succeeds
+    /// for a 1.7+ client in online mode.
+    ///
+    /// `properties` is serialised via `serde_json` — the on-disk
+    /// payload preserves the **exact base64 `value` and `signature`
+    /// bytes** Mojang signed, so a later `verify_property` call at
+    /// load time hashes the same source bytes.
+    pub async fn cache_player_profile(
+        &self,
+        uuid: uuid::Uuid,
+        username: &str,
+        properties: &[kojacoord_auth::ProfileProperty],
+    ) -> Result<(), sqlx::Error> {
+        let json = match serde_json::to_string(properties) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialise profile properties for cache");
+                return Ok(());
+            },
+        };
+        if let Some(pool) = &self.sqlite_pool {
+            sqlx::query(
+                "INSERT INTO cached_profiles (uuid, username, properties_json, cached_at)
+                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT(uuid) DO UPDATE SET
+                    username = excluded.username,
+                    properties_json = excluded.properties_json,
+                    cached_at = CURRENT_TIMESTAMP",
+            )
+            .bind(uuid.to_string())
+            .bind(username)
+            .bind(&json)
+            .execute(pool)
+            .await?;
+        } else if let Some(pool) = &self.mysql_pool {
+            sqlx::query(
+                "INSERT INTO cached_profiles (uuid, username, properties_json, cached_at)
+                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                 ON DUPLICATE KEY UPDATE
+                    username = VALUES(username),
+                    properties_json = VALUES(properties_json),
+                    cached_at = CURRENT_TIMESTAMP",
+            )
+            .bind(uuid.to_string())
+            .bind(username)
+            .bind(&json)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Look up a cached profile by **username** (1.6.x offline-mode
+    /// path — the only key we have at that point is the legacy
+    /// username, not the modern UUID). Returns the cached UUID +
+    /// properties so limbo/relay can synthesise the player's skin.
+    pub async fn load_cached_profile_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<(uuid::Uuid, Vec<kojacoord_auth::ProfileProperty>)>, sqlx::Error> {
+        let row: Option<(String, String)> = if let Some(pool) = &self.sqlite_pool {
+            sqlx::query_as(
+                "SELECT uuid, properties_json FROM cached_profiles
+                 WHERE username = ? COLLATE NOCASE
+                 ORDER BY cached_at DESC LIMIT 1",
+            )
+            .bind(username)
+            .fetch_optional(pool)
+            .await?
+        } else if let Some(pool) = &self.mysql_pool {
+            sqlx::query_as(
+                "SELECT uuid, properties_json FROM cached_profiles
+                 WHERE LOWER(username) = LOWER(?)
+                 ORDER BY cached_at DESC LIMIT 1",
+            )
+            .bind(username)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            return Ok(None);
+        };
+        let Some((uuid_str, json)) = row else {
+            return Ok(None);
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(&uuid_str) else {
+            tracing::warn!(uuid = %uuid_str, "cached_profiles row has malformed UUID; dropping");
+            return Ok(None);
+        };
+        let properties: Vec<kojacoord_auth::ProfileProperty> = match serde_json::from_str(&json) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "cached_profiles row has malformed properties_json");
+                return Ok(None);
+            },
+        };
+        Ok(Some((uuid, properties)))
     }
 
     pub fn mysql_pool(&self) -> Option<&MySqlPool> {
@@ -508,6 +756,42 @@ impl Db {
                         .bind(id)
                         .execute(pool)
                         .await?;
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub async fn update_player_status(
+        &self,
+        uuid: Uuid,
+        server: &str,
+        online: bool,
+    ) -> Result<(), sqlx::Error> {
+        let uuid_str = uuid.hyphenated().to_string();
+        match self.db_type {
+            DbType::MySql => {
+                if let Some(pool) = &self.mysql_pool {
+                    sqlx::query(
+                        "UPDATE players SET online = ?, last_seen = NOW(), server = ? WHERE uuid = ?"
+                    )
+                    .bind(online)
+                    .bind(server)
+                    .bind(&uuid_str)
+                    .execute(pool)
+                    .await?;
+                }
+            },
+            DbType::Sqlite => {
+                if let Some(pool) = &self.sqlite_pool {
+                    sqlx::query(
+                        "UPDATE players SET online = ?, last_seen = CURRENT_TIMESTAMP, server = ? WHERE uuid = ?"
+                    )
+                    .bind(online)
+                    .bind(server)
+                    .bind(&uuid_str)
+                    .execute(pool)
+                    .await?;
                 }
             },
         }

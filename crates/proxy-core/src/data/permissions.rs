@@ -1,3 +1,11 @@
+//! Roles, permission nodes, and pattern matching.
+//!
+//! Roles carry display metadata (name, prefix, colour) plus a list
+//! of permission nodes ("group.servers.manage", "command.tps", …).
+//! Patterns support `*` wildcards à la Bukkit/Vault. Roles are
+//! loaded from the database at startup; falls back to a built-in
+//! `default` role with no permissions when no DB is configured.
+
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]

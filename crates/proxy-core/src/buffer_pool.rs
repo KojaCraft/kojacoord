@@ -1,3 +1,11 @@
+//! Lock-free `BytesMut` recycler.
+//!
+//! Per-packet allocations show up high in flame graphs; this pool
+//! smooths them out. Fixed capacity, drops overflow on return,
+//! tolerates leaks (callers that forget to return just allocate the
+//! next time). Backed by `crossbeam_queue::ArrayQueue` so the
+//! relay's three tokio tasks per connection don't fight a mutex.
+
 use bytes::BytesMut;
 use crossbeam_queue::ArrayQueue;
 use lazy_static::lazy_static;
@@ -58,7 +66,7 @@ impl BufferPool {
         } else if cap <= LARGE_MAX {
             let _ = self.large.push(buffer);
         }
-        // If cap > LARGE_MAX, buffer is dropped (not cached)
+        // Anything bigger than our large tier isn't worth keeping around — just let it go.
     }
 
     pub fn depths(&self) -> (usize, usize, usize) {

@@ -125,7 +125,6 @@ temp/
 
 # Build directories
 build/
-bin/
 obj/
 
 # Release artifacts
@@ -162,3 +161,4 @@ kubeconfig
 
 # Docker
 .dockerignore.local
+AUDIT_FINDINGS.json

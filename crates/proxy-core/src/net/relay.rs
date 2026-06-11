@@ -1,3 +1,25 @@
+//! Play-phase packet pump.
+//!
+//! Once `ClientConnection` finishes the login dance, [`PacketRelay::run`]
+//! takes over: three tokio tasks share the same underlying sockets,
+//! one per direction (client→server, server→client, and a writer
+//! that drains an mpsc of injected packets back to the client).
+//! Tasks coordinate shutdown via a single `Notify`; the client
+//! socket writer is a `tokio::sync::Mutex` shared between all three.
+//!
+//! On the hot path every S→C packet runs through:
+//!   1. TPS tracker (lock-free atomic ring buffer)
+//!   2. Per-player metrics atomic counters (handle cached at session
+//!      start, no map lookup per packet)
+//!   3. Optional cross-version packet converter
+//!   4. Plugin packet hooks (`Forward` / `Drop` / `Modify`)
+//!   5. Write to client
+//!
+//! The reverse direction adds a per-connection exploit guard
+//! (`ExploitGuard`) on the way in. The `out_task` exists so plugins
+//! and converters can inject packets toward the client without owning
+//! the writer mutex themselves.
+
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -7,8 +29,11 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 
 use crate::{
+    chat_signing::{determine_signing_mode, strip_chat_signature},
     commands,
+    config_synthesis::{build_cfg_finish_packet, determine_synthesis_mode, SynthesisMode},
     converter::{ConversionDirection, ConversionResult, PacketConverter},
+    cookies_transfers::supports_cookies_transfers,
     error::ConnectionError,
     exploit_guard::{build_kick_message, check_chat_message, ExploitGuard, KickReason},
     modloader,
@@ -16,14 +41,21 @@ use crate::{
         build_brand_packet, build_disconnect_packet, build_plugin_message_packet,
         build_serverbound_plugin_message_packet, build_system_message_packet,
     },
-    packet_ids::{cb_play, cb_plugin_message_id, chat_packet_ids_for, sb_plugin_message_id},
+    packet_ids::{
+        cb_play, cb_plugin_message_id, chat_packet_ids_for, sb_play, sb_plugin_message_id,
+    },
     packet_io::{read_packet, write_packet},
     plugin_decoder,
+    protocol::dimension_codec::{
+        build_minimal_dimension_codec, determine_injection_mode, CodecInjectionMode,
+    },
     proxy::ProxyState,
     server_selector,
     session::SharedSession,
     transfer,
 };
+
+use kojacoord_protocol::{Epoch, ProtocolVersion};
 
 use kojacoord_plugin_system::{PacketData, PacketDirection, PacketHookResult};
 
@@ -47,6 +79,16 @@ pub enum RelayExit {
     Switch {
         client_stream: crate::connection::McStream,
         target: String,
+    },
+
+    /// Backend sent us a play-state Disconnect. We hand the client
+    /// stream back to the outer pipeline so it can drop the player
+    /// into limbo (or a fallback server) instead of closing the
+    /// socket. `reason` is the JSON the backend gave us — surfaced
+    /// to the player as a "you were kicked: …" message.
+    BackendKicked {
+        client_stream: crate::connection::McStream,
+        reason: String,
     },
 }
 
@@ -76,7 +118,12 @@ impl PacketRelay {
             player_uuid: Some(player_uuid),
         };
 
-        match state.plugin_manager.process_packet(&packet_data) {
+        let hook_result = state
+            .plugin_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .process_packet(&packet_data);
+        match hook_result {
             PacketHookResult::Forward => Ok(data),
             PacketHookResult::Drop => Err(data),
             PacketHookResult::Modify(new_data) => Ok(new_data),
@@ -113,6 +160,11 @@ impl PacketRelay {
         let stop = Arc::new(Notify::new());
         let stopped = Arc::new(AtomicBool::new(false));
         let switch_target: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // Set when the backend sends us a play-state Disconnect — we
+        // stash the reason and let the outer loop drop the player into
+        // limbo instead of closing the client socket.
+        let kick_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let kick_reason_s2c = Arc::clone(&kick_reason);
 
         let stop_s2c_wait = Arc::clone(&stop);
         let stop_s2c_sig = Arc::clone(&stop);
@@ -127,6 +179,10 @@ impl PacketRelay {
 
         let player_uuid = self.session.read().await.uuid;
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        // Keep a clone in-scope for converter-driven s2c injection from the c2s
+        // task (e.g. synthesizing FinishConfiguration after we swallow a
+        // LoginAcknowledged from a 1.20.2+ client).
+        let inject_s2c_tx = out_tx.clone();
         self.state.outbound.insert(player_uuid, out_tx);
 
         let (backend_out_tx, mut backend_out_rx) =
@@ -175,30 +231,67 @@ impl PacketRelay {
         let conv_enabled = self.conversion_enabled;
         let backend_proto = self.backend_protocol;
 
+        // ViaVersion detection.
+        //
+        // ViaVersion-instrumented backends announce themselves to proxies
+        // via a clientbound plugin message on the `vv:proxy_details` (or
+        // `viaversion:proxy_details`) channel. When we see one we flip
+        // this flag and skip our own per-packet converter for the rest of
+        // the session — ViaVersion on the backend has already translated
+        // every packet into the client's exact protocol, so any further
+        // conversion on our side would corrupt the wire.
+        //
+        // Both directions check the same atomic, so detection in the
+        // s2c loop flows immediately to the c2s loop's converter gate
+        // without a lock.
+        let via_version_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let via_version_detected_s2c = via_version_detected.clone();
+        let via_version_detected_c2s = via_version_detected.clone();
+
+        // Determine chat signing mode if enabled
+        let chat_signing_mode = if self.state.config.proxy.chat_signing_translation {
+            Some(determine_signing_mode(proto, backend_proto))
+        } else {
+            None
+        };
+
+        // Determine config synthesis mode
+        let synthesis_mode = determine_synthesis_mode(proto, backend_proto);
+
+        // Determine dimension codec injection mode
+        let codec_injection_mode = determine_injection_mode(proto, backend_proto);
+
+        // Check if cookies/transfers are supported
+        let supports_cookies = supports_cookies_transfers(proto);
+
         let cb_pm_id = cb_plugin_message_id(proto);
         let cb_disc_id = cb_play(proto, "ClientboundDisconnect");
         let sb_pm_id = sb_plugin_message_id(proto);
         let sb_chat_ids = chat_packet_ids_for(proto);
 
         let cb_chunk_id = cb_play(proto, "ClientboundLevelChunkWithLight");
-        let (sb_move_pos_rot_id, sb_move_pos_id): (u8, u8) = {
-            use kojacoord_protocol::{ProtocolVersion, VersionRegistry};
-            match VersionRegistry::nearest(proto) {
-                ProtocolVersion::V1_7_10 | ProtocolVersion::V1_8 => (0x06, 0x04),
-                ProtocolVersion::V1_12_2 => (0x0E, 0x0C),
-                ProtocolVersion::V1_16_5 => (0x12, 0x10),
-                ProtocolVersion::V1_19_4
-                | ProtocolVersion::V1_20_4
-                | ProtocolVersion::Unknown(_) => (0x14, 0x12),
-                ProtocolVersion::V1_21 => (0x15, 0x13),
-                _ => (0xFF, 0xFF),
-            }
-        };
+        // Look these up via the central registry so adding a new
+        // protocol version (1.21.6+, …) doesn't require editing this
+        // hot path.
+        let sb_move_pos_id = sb_play(proto, "ServerboundMovePlayerPos");
+        let sb_move_pos_rot_id = sb_play(proto, "ServerboundMovePlayerPosRot");
 
         let state_s2c = Arc::clone(&self.state);
         let state_c2s = Arc::clone(&self.state);
         let session_s2c = self.session.clone();
         let session_c2s = self.session.clone();
+
+        // Lock-free per-player metrics handles. Grabbed once here; the
+        // loops below just do `fetch_add` per packet, no locks taken on
+        // the hot path. `None` means the player wasn't pre-registered
+        // (shouldn't happen, but we skip silently if so).
+        let metrics_handle = self.state.player_metrics.get(&player_uuid);
+        let metrics_s2c = metrics_handle.clone();
+        let metrics_c2s = metrics_handle.clone();
+        // Microsecond clock shared by both directions; cheaper than
+        // re-reading `Instant::now()` for every packet — we recompute
+        // it once per loop iteration.
+        let metrics_epoch = std::time::Instant::now();
 
         let s2c = async move {
             let result: Result<(), ConnectionError> = async move {
@@ -215,6 +308,15 @@ impl PacketRelay {
                 state_s2c.metrics.record_packet(payload.len());
 
                 state_s2c.tps_tracker.record_packet();
+
+                if let Some(m) = &metrics_s2c {
+                    let now_micros = metrics_epoch.elapsed().as_micros() as u64;
+                    crate::metrics_player::PlayerMetricsRegistry::record_sent(
+                        m,
+                        payload.len(),
+                        now_micros,
+                    );
+                }
 
                 let mut cur = payload.clone();
 
@@ -270,22 +372,58 @@ impl PacketRelay {
                 }
 
                 if pkt_id == cb_disc_id {
-                    tracing::info!("backend sent Disconnect — sending custom message and closing relay");
-                    let mut cw = cw_s2c.lock().await;
-
-                    let limbo_message = "The server has shutdown, you are now in limbo until the server is back online.";
-                    let pkt = build_disconnect_packet(limbo_message, proto);
-                    write_packet(&mut *cw, &pkt, client_thresh).await?;
-
-                    return Err(ConnectionError::Closed);
+                    // Backend kicked the player. Don't forward the
+                    // disconnect — stash the reason, signal the relay
+                    // to wind down cleanly, and let the outer pipeline
+                    // hand the client off to limbo so they don't get
+                    // dropped from the proxy.
+                    let mut reason_cursor = payload.clone();
+                    let _ = VarInt::decode(&mut reason_cursor); // skip the packet id
+                    let reason = String::decode(&mut reason_cursor)
+                        .unwrap_or_else(|_| "Backend disconnected".to_string());
+                    tracing::info!(
+                        reason = %reason,
+                        "backend sent Disconnect — handing player to limbo"
+                    );
+                    *kick_reason_s2c.lock().await = Some(reason);
+                    // Mirror what the outer post-block does — the
+                    // outer scope still owns its own clones, so this
+                    // just speeds up the stop signal.
+                    return Ok(());
                 }
 
-                if conv_enabled && proto != backend_proto {
+                // ViaVersion detection: sniff clientbound plugin messages
+                // for the `vv:proxy_details` channel. ViaVersion sends one
+                // shortly after configuration to announce itself.
+                if pkt_id == cb_pm_id {
+                    if let Some(channel) = try_decode_plugin_channel(payload.clone()) {
+                        if (channel == "vv:proxy_details"
+                            || channel == "viaversion:proxy_details")
+                            && !via_version_detected_s2c
+                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            tracing::info!(
+                                target: "relay",
+                                channel = %channel,
+                                proto,
+                                backend_proto,
+                                "ViaVersion detected on backend — disabling proxy-side converter for this session"
+                            );
+                        }
+                    }
+                }
+
+                let convert_active = conv_enabled
+                    && proto != backend_proto
+                    && !via_version_detected_s2c
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if convert_active {
                     let direction = ConversionDirection::ServerToClient {
                         server_proto: backend_proto,
                         client_proto: proto,
                     };
-                    match PacketConverter::convert(payload.clone(), direction) {
+                    let repacker = Some(state_s2c.chunk_repacker.clone());
+                    match PacketConverter::convert_with_repacker(payload.clone(), direction, repacker) {
                         ConversionResult::Passthrough => {
                             match Self::process_packet_hooks(
                                 &state_s2c,
@@ -328,6 +466,9 @@ impl PacketRelay {
                         }
                         ConversionResult::Drop => {
                             tracing::trace!(pkt_id, "S→C dropped by converter");
+                        }
+                        ConversionResult::InjectS2C(_) => {
+                            tracing::warn!(pkt_id, "S→C converter returned InjectS2C — only valid in C→S direction; dropping");
                         }
                     }
                 } else {
@@ -389,6 +530,15 @@ impl PacketRelay {
                         kick!(cw_c2s, reason, proto, client_thresh);
                     }
 
+                    if let Some(m) = &metrics_c2s {
+                        let now_micros = metrics_epoch.elapsed().as_micros() as u64;
+                        crate::metrics_player::PlayerMetricsRegistry::record_received(
+                            m,
+                            payload.len(),
+                            now_micros,
+                        );
+                    }
+
                     let mut cur = payload.clone();
 
                     let pkt_id = match VarInt::decode(&mut cur) {
@@ -431,7 +581,11 @@ impl PacketRelay {
                                 let _ = f32::decode(&mut body);
                             }
                             let on_ground = bool::decode(&mut body).unwrap_or(false);
-                            let responses = state_c2s.plugin_manager.broadcast_event(
+                            let responses = state_c2s
+                                .plugin_manager
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .broadcast_event(
                                 &kojacoord_plugin_system::PluginEvent::PlayerMove {
                                     uuid,
                                     x,
@@ -467,6 +621,18 @@ impl PacketRelay {
                             if modloader::is_fml1_play_channel(&msg.channel) {
                                 modloader::log_fml1_packet(&msg.channel, &msg.data, "C→S", proto);
                             }
+
+                            // Cookies & Transfers passthrough handling
+                            if supports_cookies && state_c2s.config.proxy.cookies_transfers_passthrough
+                                && (msg.channel == "minecraft:cookie_response" || msg.channel == "minecraft:transfer") {
+                                    tracing::trace!(channel = %msg.channel, "Passthrough: relaying cookie/transfer packet");
+                                    // Store cookie data in session if needed
+                                    let mut session = session_c2s.write().await;
+                                    if msg.channel == "minecraft:cookie_response" {
+                                        session.cookies.store("default".to_string(), msg.data.clone());
+                                    }
+                                    drop(session);
+                                }
 
                             if server_selector::is_serverlist_channel(&msg.channel) {
                                 let payload =
@@ -546,6 +712,8 @@ impl PacketRelay {
                         }
                     }
 
+                    // Chat signing translation: strip signatures if needed
+                    let mut modified_payload = payload.clone();
                     if sb_chat_ids.contains(&pkt_id) {
                         let mut body = payload.clone();
                         let _ = VarInt::decode(&mut body);
@@ -557,6 +725,21 @@ impl PacketRelay {
                                     "exploit_guard: illegal chat — kicking"
                                 );
                                 kick!(cw_c2s, reason, proto, client_thresh);
+                            }
+
+                            if let Some(mode) = chat_signing_mode {
+                                use crate::chat_signing::ChatSigningMode;
+                                if mode == ChatSigningMode::Unsigned {
+                                    match strip_chat_signature(&payload, proto) {
+                                        Ok(stripped) => {
+                                            modified_payload = stripped.into();
+                                            tracing::trace!("Stripped chat signature for unsigned mode");
+                                        },
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "Failed to strip chat signature, using original");
+                                        },
+                                    }
+                                }
                             }
 
                             // Deliver chat to plugins (handle_event). A plugin may
@@ -612,14 +795,28 @@ impl PacketRelay {
                         }
                     }
 
-                    if conv_enabled && proto != backend_proto {
+                    // Same ViaVersion gate as the s2c loop above. Once
+                    // the backend has identified itself as ViaVersion-
+                    // backed, we leave c2s packets alone too — the
+                    // backend will translate them itself.
+                    let convert_active_c2s = conv_enabled
+                        && proto != backend_proto
+                        && !via_version_detected_c2s
+                            .load(std::sync::atomic::Ordering::Acquire);
+                    if convert_active_c2s {
                         let direction = ConversionDirection::ClientToServer {
                             client_proto: proto,
                             server_proto: backend_proto,
                         };
-                        match PacketConverter::convert(payload.clone(), direction) {
+                        let payload_to_convert = if modified_payload != payload {
+                            modified_payload.clone()
+                        } else {
+                            payload.clone()
+                        };
+                        let repacker = Some(state_c2s.chunk_repacker.clone());
+                        match PacketConverter::convert_with_repacker(payload_to_convert.clone(), direction, repacker) {
                             ConversionResult::Passthrough => {
-                                write_packet(&mut *bw_mut, &payload, backend_thresh).await?;
+                                write_packet(&mut *bw_mut, &payload_to_convert, backend_thresh).await?;
                             },
                             ConversionResult::Converted(packets) => {
                                 for pkt in packets {
@@ -629,9 +826,75 @@ impl PacketRelay {
                             ConversionResult::Drop => {
                                 tracing::trace!(pkt_id, "C→S dropped by converter");
                             },
+                            ConversionResult::InjectS2C(packets) => {
+                                tracing::trace!(pkt_id, count = packets.len(), "C→S swallowed; injecting s2c packets back to client");
+                                for pkt in packets {
+                                    let _ = inject_s2c_tx.send(pkt);
+                                }
+                            },
                         }
                     } else {
-                        write_packet(&mut *bw_mut, &payload, backend_thresh).await?;
+                        // Config synthesis: inject FinishConfiguration if needed
+                        if synthesis_mode == SynthesisMode::ClientSide {
+                            // Check if this is a LoginAcknowledged packet (varies by protocol)
+                            // For 1.20.2+, LoginAcknowledged is packet 0x03
+                            let canonical = ProtocolVersion::from_id(proto);
+                            if pkt_id == 0x03 && canonical.has_configuration_phase() {
+                                tracing::trace!("Injecting synthetic FinishConfiguration packet");
+                                if let Ok(cfg_finish) = build_cfg_finish_packet(proto) {
+                                    let _ = inject_s2c_tx.send(cfg_finish.into());
+                                }
+                            }
+                        }
+
+                        // Dimension codec injection: inject codec data if needed
+                        if codec_injection_mode == CodecInjectionMode::ClientSide {
+                            // Check if this is a JoinGame packet
+                            // JoinGame packet ID varies by protocol
+                            let canonical = ProtocolVersion::from_id(proto);
+                            let join_game_id = match canonical.epoch() {
+                                Epoch::V1_19 => 0x26,
+                                Epoch::V1_16 => 0x25,
+                                Epoch::V1_17_To_1_18 => 0x25,
+                                Epoch::V1_20 => 0x2B,
+                                Epoch::V1_21Plus => 0x2E,
+                                _ => 0x25, // fallback for older versions
+                            };
+                            if pkt_id == join_game_id {
+                                tracing::trace!("Dimension codec injection needed for JoinGame");
+                                // Build and inject minimal dimension codec
+                                match build_minimal_dimension_codec() {
+                                    Ok(codec_bytes) => {
+                                        tracing::debug!("Injecting dimension codec NBT ({} bytes)", codec_bytes.len());
+                                        // For 1.16-1.20.1, codec is embedded in JoinGame
+                                        // For 1.20.2+, codec is sent separately via RegistryData packet
+                                        // We'll inject it as a separate RegistryData packet for simplicity
+                                        let registry_packet_id = match canonical.epoch() {
+                                            Epoch::V1_21Plus => 0x05, // RegistryData in 1.21+
+                                            _ => 0x04, // RegistryData in 1.20.2-1.20.5
+                                        };
+
+                                        let mut registry_packet = BytesMut::new();
+                                        let _ = VarInt(registry_packet_id).encode(&mut registry_packet);
+                                        registry_packet.extend_from_slice(&codec_bytes);
+
+                                        // Inject the registry packet before JoinGame
+                                        let _ = inject_s2c_tx.send(registry_packet.freeze());
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to build dimension codec NBT");
+                                    },
+                                }
+                            }
+                        }
+
+                        // Use modified payload if signature was stripped
+                        let payload_to_send = if modified_payload != payload {
+                            modified_payload.clone()
+                        } else {
+                            payload.clone()
+                        };
+                        write_packet(&mut *bw_mut, &payload_to_send, backend_thresh).await?;
                     }
                 }
 
@@ -693,6 +956,28 @@ impl PacketRelay {
                 },
                 Err(_) => {
                     tracing::error!("relay: could not reunite client stream for switch");
+                    return Err(ConnectionError::Closed);
+                },
+            }
+        }
+
+        // Did the backend kick us mid-play? Hand the stream back to
+        // the outer pipeline so it can drop the player into limbo.
+        // The s2c task that detected the kick also set the stop
+        // signal, so by here c2s has wound down naturally.
+        let kick = kick_reason.lock().await.take();
+        if let Some(reason) = kick {
+            match Arc::try_unwrap(cw_master) {
+                Ok(mutex) => {
+                    let cw = mutex.into_inner();
+                    let client_stream = cr.into_inner().unsplit(cw);
+                    return Ok(RelayExit::BackendKicked {
+                        client_stream,
+                        reason,
+                    });
+                },
+                Err(_) => {
+                    tracing::error!("relay: could not reunite client stream after backend kick");
                     return Err(ConnectionError::Closed);
                 },
             }
@@ -796,4 +1081,26 @@ async fn handle_transfer_command(
             .ok()
         },
     }
+}
+
+/// Best-effort decode of a clientbound PluginMessage payload's channel
+/// name. Returns `None` if the payload doesn't decode as a VarInt-id +
+/// VarInt-prefixed UTF-8 channel — which is the case for almost every
+/// non-plugin-message packet, so the caller passes a packet body and
+/// this function safely returns `None` for bodies that aren't actually
+/// plugin messages.
+///
+/// The shape we look for matches modern (1.13+) plugin messages:
+/// `[VarInt id][VarInt channel_len][channel UTF-8 bytes][...payload]`.
+/// Pre-1.13 plugin messages used a UCS-2 BE channel; those aren't
+/// detected here, which is correct because ViaVersion's
+/// `vv:proxy_details` channel only appears on modern (post-1.13)
+/// connections where the proxy actually needs to translate.
+fn try_decode_plugin_channel(payload: bytes::Bytes) -> Option<String> {
+    use kojacoord_protocol::codec::Decode;
+    let mut cur = payload;
+    // Drop the leading packet id (VarInt).
+    let _ = kojacoord_protocol::types::VarInt::decode(&mut cur).ok()?;
+    // Channel name is the first VarInt-string field.
+    String::decode(&mut cur).ok()
 }

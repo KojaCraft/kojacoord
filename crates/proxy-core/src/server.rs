@@ -1,5 +1,17 @@
+//! Backend server registry.
+//!
+//! [`BackendServer`] is the runtime view of one entry in
+//! `[[servers]]` — address, current player count, health state, pool
+//! handles. [`ServerRegistry`] is a `DashMap` keyed by server name so
+//! the routing layer can resolve names to `Arc<BackendServer>`
+//! without taking a lock.
+//!
+//! Atomic counters (`player_count`, `health_fail_count`, …) live
+//! inside `Arc` so the health probe and the relay can mutate them
+//! from different tasks without coordination.
+
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kojacoord_config::{BackendType, ForwardingMode};
@@ -15,6 +27,22 @@ pub struct BackendServer {
     pub online: Arc<AtomicBool>,
     pub connection_pool: Option<Arc<BackendConnectionPool>>,
     pub backend_type: BackendType,
+    /// Per-server compression threshold. -1 disables compression, 0 uses global default.
+    pub compression_threshold: i32,
+    /// Cipher suite pinning for TLS connections (if using TLS).
+    pub cipher_suites: String,
+    /// Health probe interval in seconds (0 = disabled)
+    pub health_probe_interval_secs: u64,
+    /// Health probe timeout in seconds
+    pub health_probe_timeout_secs: u64,
+    /// Consecutive failures before marking unhealthy
+    pub health_probe_fail_threshold: u32,
+    /// Current consecutive failure count
+    pub health_fail_count: Arc<AtomicU32>,
+    /// Whether the server is marked as unhealthy by health probes
+    pub health_unhealthy: Arc<AtomicBool>,
+    /// Region for this server (e.g., "us-east", "eu-west", "asia")
+    pub region: String,
 }
 
 impl BackendServer {

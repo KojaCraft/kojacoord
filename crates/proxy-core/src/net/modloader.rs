@@ -1,3 +1,20 @@
+//! Modloader detection + handshake plumbing.
+//!
+//! Sniffs Forge/NeoForge/Fabric/Quilt clients by the plugin-message
+//! channels they advertise during the handshake or configuration
+//! phase. Once detected, the proxy advertises the matching brand on
+//! its own side so the modded client recognises the proxy as a
+//! compatible server. Brand strings, channel names, and FML
+//! discriminators are kept as `const` here so the per-version code
+//! paths can pattern-match cleanly.
+//!
+//! References:
+//! - FML1 (1.7–1.12): old `FML|HS` plugin-message handshake.
+//! - FML2/FML3 (1.13+): `fml:loginwrapper` and `fml:handshake` channels.
+//! - NeoForge: `neoforge:*` channels (1.20.2+).
+//! - Fabric: `fabric-networking-api-v1:*`.
+//! - Quilt: a Fabric fork; advertises both Fabric and Quilt channels.
+
 use bytes::{BufMut, Bytes, BytesMut};
 use kojacoord_protocol::codec::Encode;
 use kojacoord_protocol::types::VarInt;
@@ -37,6 +54,14 @@ pub const NEO_SETUP_FAILED: &str = "neoforge:modded_network_setup_failed";
 pub const FABRIC_REGISTER: &str = "fabric-networking-api-v1:register_channel";
 pub const FABRIC_UNREGISTER: &str = "fabric-networking-api-v1:unregister_channel";
 
+// Quilt is a Fabric fork. The runtime ships its own networking lib (QSL) on
+// top of Fabric's, and clients sometimes advertise both. We sniff any of these
+// to flag a connection as Quilt rather than plain Fabric.
+pub const QUILT_INIT_CHANNEL: &str = "quilt:init";
+pub const QUILT_REGISTER: &str = "quilt:register";
+pub const QUILT_QSL_NETWORKING: &str = "qsl:networking";
+pub const QUILTED_FABRIC_API_REGISTER: &str = "quilted_fabric_networking_api_v1:register_channel";
+
 pub const CONFIG_PING_ID: u8 = 0x01;
 pub const CONFIG_PONG_ID: u8 = 0x00;
 
@@ -74,6 +99,7 @@ pub enum ModloaderKind {
     Fml3,
     NeoForge,
     Fabric,
+    Quilt,
     Vanilla,
 }
 
@@ -132,12 +158,54 @@ pub fn parse_fml1_discriminator(body: &[u8]) -> Option<FmlDiscriminator> {
     body.first().copied().map(FmlDiscriminator::from)
 }
 
+/// Build the FML1 handshake-reset plugin message in modern (1.7+) wire
+/// format. The packet id is varint-encoded and the channel string is
+/// length-prefixed. For 1.6.x clients use
+/// [`build_fml1_handshake_reset_legacy`] — pre-netty has no varint length
+/// prefix.
 pub fn build_fml1_handshake_reset(plugin_msg_id: u8) -> Bytes {
     let mut payload = BytesMut::new();
     VarInt(plugin_msg_id as i32).encode(&mut payload).unwrap();
     FML1_HS.to_owned().encode(&mut payload).unwrap();
     payload.put_u8(0xFE);
     frame_bytes(payload.freeze())
+}
+
+/// Pick the right FML1 handshake-reset bytes for the negotiated
+/// protocol. Routes 1.6.x clients through the pre-netty variant and
+/// 1.7+ through the modern (varint-framed) one. Saves callers from
+/// having to know about the wire-format split.
+///
+/// The `plugin_msg_id` argument is ignored for pre-netty (its plugin
+/// message id is a hardcoded `0xFA`).
+pub fn build_fml1_handshake_reset_for_proto(proto: u32, plugin_msg_id: u8) -> Bytes {
+    if crate::packet_io::is_pre_netty_proto(proto) {
+        build_fml1_handshake_reset_legacy()
+    } else {
+        build_fml1_handshake_reset(plugin_msg_id)
+    }
+}
+
+/// Build the FML1 handshake-reset plugin message in pre-netty (1.6.x)
+/// wire format. The 1.6.4 plugin message packet (0xFA) uses two raw
+/// UCS-2 strings (length-prefixed in big-endian u16) instead of
+/// varint-prefixed UTF-8. The 1.6 Forge handshake uses the same
+/// `FML|HS` channel but the framing layer is entirely different.
+///
+/// See <https://wiki.vg/Protocol_History/1.6.4#Plugin_Message_.280xFA.29>.
+pub fn build_fml1_handshake_reset_legacy() -> Bytes {
+    // Pre-netty plugin message: 0xFA, then UCS-2 channel name with u16
+    // length prefix, then u16 payload length, then payload bytes.
+    let mut out = BytesMut::new();
+    out.put_u8(0xFA);
+    out.put_u16(FML1_HS.encode_utf16().count() as u16);
+    for unit in FML1_HS.encode_utf16() {
+        out.put_u16(unit);
+    }
+    // One byte payload — the handshake-reset discriminator.
+    out.put_u16(1);
+    out.put_u8(0xFE);
+    out.freeze()
 }
 
 #[inline]
@@ -163,9 +231,30 @@ pub fn is_neo_config_channel(channel: &str) -> bool {
             | NEO_SETUP_FAILED
             | FABRIC_REGISTER
             | FABRIC_UNREGISTER
+            | QUILT_INIT_CHANNEL
+            | QUILT_REGISTER
+            | QUILT_QSL_NETWORKING
+            | QUILTED_FABRIC_API_REGISTER
     ) || channel.starts_with("neoforge:")
         || channel.starts_with("fml:")
         || channel.starts_with("forge:")
+        || channel.starts_with("quilt:")
+        || channel.starts_with("qsl:")
+        || channel.starts_with("quilted_fabric_")
+}
+
+/// Returns true if the channel name unambiguously identifies a Quilt client.
+/// Used by the config-phase sniffer to promote a connection from
+/// `Fabric`/`Unknown` to `Quilt`.
+#[inline]
+pub fn is_quilt_channel(channel: &str) -> bool {
+    channel == QUILT_INIT_CHANNEL
+        || channel == QUILT_REGISTER
+        || channel == QUILT_QSL_NETWORKING
+        || channel == QUILTED_FABRIC_API_REGISTER
+        || channel.starts_with("quilt:")
+        || channel.starts_with("qsl:")
+        || channel.starts_with("quilted_fabric_")
 }
 
 fn frame_bytes(payload: Bytes) -> Bytes {
@@ -213,7 +302,7 @@ pub fn log_fml3_login_packet(channel: &str, body: &[u8], direction: &str, proto:
 
 pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto: u32) {
     match channel {
-        NEO_REGISTER | MC_REGISTER | FABRIC_REGISTER => {
+        NEO_REGISTER | MC_REGISTER | FABRIC_REGISTER | QUILTED_FABRIC_API_REGISTER => {
             let channels = parse_nul_list(body);
             info!(proto, direction, channel, registered_channels = ?channels, "Modloader config-phase channel registration");
         },
@@ -222,6 +311,9 @@ pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto:
         },
         COMMON_REGISTER => {
             debug!(proto, direction, "Modloader c:register negotiation");
+        },
+        QUILT_INIT_CHANNEL | QUILT_REGISTER | QUILT_QSL_NETWORKING => {
+            info!(proto, direction, channel, "Quilt modloader plugin channel");
         },
         _ => {
             debug!(
@@ -233,6 +325,30 @@ pub fn log_neo_config_packet(channel: &str, body: &[u8], direction: &str, proto:
             );
         },
     }
+}
+
+/// Inspect a config-phase REGISTER body's NUL-separated channel list and
+/// return the strongest modloader signal it contains. Used during the
+/// configuration-phase relay to upgrade `Fabric` → `Quilt` when the client
+/// advertises Quilt-specific channels.
+pub fn detect_kind_from_channel_list(body: &[u8]) -> Option<ModloaderKind> {
+    let channels = parse_nul_list(body);
+    if channels.iter().any(|c| is_quilt_channel(c)) {
+        return Some(ModloaderKind::Quilt);
+    }
+    if channels
+        .iter()
+        .any(|c| c.starts_with("neoforge:") || c == NEO_REGISTER || c == NEO_TIER_SORTING)
+    {
+        return Some(ModloaderKind::NeoForge);
+    }
+    if channels
+        .iter()
+        .any(|c| c.starts_with("fabric-") || c == FABRIC_REGISTER)
+    {
+        return Some(ModloaderKind::Fabric);
+    }
+    None
 }
 
 pub fn parse_nul_list(data: &[u8]) -> Vec<String> {
@@ -247,4 +363,64 @@ pub fn parse_nul_list(data: &[u8]) -> Vec<String> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quilt_channels_are_recognized() {
+        assert!(is_quilt_channel(QUILT_INIT_CHANNEL));
+        assert!(is_quilt_channel("qsl:networking"));
+        assert!(is_quilt_channel("quilt:something_custom"));
+        assert!(is_quilt_channel("quilted_fabric_api_v1:event"));
+        assert!(!is_quilt_channel(
+            "fabric-networking-api-v1:register_channel"
+        ));
+        assert!(!is_quilt_channel("neoforge:register"));
+    }
+
+    #[test]
+    fn quilt_channels_also_count_as_neo_config_channels() {
+        // Quilt channels need to flow through the same config-phase relay
+        // code path that Fabric/NeoForge channels use.
+        assert!(is_neo_config_channel(QUILT_INIT_CHANNEL));
+        assert!(is_neo_config_channel("quilt:foo"));
+        assert!(is_neo_config_channel("qsl:networking"));
+    }
+
+    #[test]
+    fn register_list_with_quilt_channel_is_detected() {
+        // A REGISTER body is a NUL-separated list of channel names.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fabric-networking-api-v1:event");
+        body.push(0);
+        body.extend_from_slice(b"qsl:networking");
+        body.push(0);
+        body.extend_from_slice(b"minecraft:brand");
+        assert_eq!(
+            detect_kind_from_channel_list(&body),
+            Some(ModloaderKind::Quilt)
+        );
+    }
+
+    #[test]
+    fn register_list_with_only_fabric_is_fabric() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fabric-networking-api-v1:event");
+        body.push(0);
+        body.extend_from_slice(b"minecraft:brand");
+        assert_eq!(
+            detect_kind_from_channel_list(&body),
+            Some(ModloaderKind::Fabric)
+        );
+    }
+
+    #[test]
+    fn quilt_kind_does_not_get_fml_marker_appended() {
+        let result = apply_fml_marker("server.example.com", ModloaderKind::Quilt);
+        assert_eq!(result, "server.example.com");
+        assert!(!result.contains('\0'));
+    }
 }

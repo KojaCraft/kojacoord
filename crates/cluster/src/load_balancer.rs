@@ -1,3 +1,11 @@
+//! Routing decisions across the cluster.
+//!
+//! Reads a snapshot of [`ServiceDiscovery`] and picks the best
+//! [`ClusterNode`] to send a new player to. Currently does
+//! least-connections; the algorithm is intentionally simple — the
+//! per-node backend pool inside each proxy does the finer-grained
+//! load shedding.
+
 use crate::discovery::ServiceDiscovery;
 use crate::node::ClusterNode;
 use std::sync::Arc;

@@ -1,9 +1,26 @@
+//! Wire-level encoding primitives.
+//!
+//! Three traits make up the vocabulary every typed packet uses:
+//!   - [`Encode`] / [`Decode`] — serialise a value to/from the
+//!     Minecraft wire format
+//!   - [`PacketId`] — resolve a packet's id at compile time given a
+//!     protocol version; backs `connection.write_typed` and
+//!     `limbo.send_play_typed`
+//!
+//! Bounds: [`MAX_PACKET_SIZE`] is the 32 MiB ceiling vanilla enforces
+//! on framed packets; [`MAX_STRING_LENGTH`] is the 32k-character cap
+//! the protocol places on `String` fields.
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::ProtocolError;
 
+/// Hard cap on a single framed packet — 32 MiB. Matches Notchian.
 pub const MAX_PACKET_SIZE: usize = 1 << 25;
 
+/// Hard cap on any `String` field, per the protocol spec. Used by the
+/// `String::decode` impl to reject oversized payloads from
+/// misbehaving clients.
 pub const MAX_STRING_LENGTH: usize = 32767;
 
 pub trait Encode {
@@ -16,6 +33,54 @@ pub trait Decode: Sized {
 
 pub trait PacketId {
     fn packet_id(protocol_version: u32) -> u8;
+}
+
+/// Version-aware sibling of [`Encode`] for packets whose body shape
+/// changes across protocol versions.
+///
+/// Every type that implements [`Encode`] gets a free [`EncodeVer`] via
+/// the blanket impl below — the `ver` parameter is simply ignored. For
+/// the small set of structs whose wire shape depends on the protocol
+/// (`ClientboundLogin`, `ClientboundRespawn`, `ClientboundPlayerPosition`
+/// in 1.21.4+, etc.) we drop the plain `Encode` impl and provide a
+/// hand-written `EncodeVer` that branches on `ver`.
+pub trait EncodeVer {
+    fn encode_ver(&self, ver: u32, dst: &mut BytesMut) -> Result<(), ProtocolError>;
+}
+
+/// Version-aware sibling of [`Decode`]. See [`EncodeVer`] for the
+/// rationale.
+pub trait DecodeVer: Sized {
+    fn decode_ver(ver: u32, src: &mut Bytes) -> Result<Self, ProtocolError>;
+}
+
+impl<T: Encode> EncodeVer for T {
+    fn encode_ver(&self, _ver: u32, dst: &mut BytesMut) -> Result<(), ProtocolError> {
+        self.encode(dst)
+    }
+}
+
+impl<T: Decode> DecodeVer for T {
+    fn decode_ver(_ver: u32, src: &mut Bytes) -> Result<Self, ProtocolError> {
+        T::decode(src)
+    }
+}
+
+/// Write `packet_id(ver) || body(ver)` into `dst`. Pair with `read_packet`.
+pub fn write_packet<P: PacketId + EncodeVer>(
+    ver: u32,
+    pkt: &P,
+    dst: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    use crate::types::VarInt;
+    let id = P::packet_id(ver);
+    VarInt(id as i32).encode(dst)?;
+    pkt.encode_ver(ver, dst)
+}
+
+/// Read the body of a packet whose id has already been consumed.
+pub fn read_packet<P: PacketId + DecodeVer>(ver: u32, src: &mut Bytes) -> Result<P, ProtocolError> {
+    P::decode_ver(ver, src)
 }
 
 impl Encode for bool {

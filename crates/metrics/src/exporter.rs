@@ -1,3 +1,10 @@
+//! Prometheus exposition endpoint.
+//!
+//! Tiny axum app that exposes `/metrics` in Prometheus text format
+//! from the shared [`MetricsCollector`] registry. Lifetime tied to
+//! the `[metrics] enabled = true` config flag; bound to
+//! `[metrics] bind` (default `0.0.0.0:9090`).
+
 use super::collector::MetricsCollector;
 use axum::{
     extract::State,

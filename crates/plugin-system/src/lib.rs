@@ -1,16 +1,29 @@
+//! Plugin host.
+//!
+//! Two loaders share one public API ([`api::Plugin`]):
+//!   - `wasm_loader` — sandboxed wasmtime, slower but safe to run
+//!     unaudited modules
+//!   - native `.dll`/`.so`/`.dylib` plugins, fast but unsandboxed and
+//!     gated on the SHA-256 allowlist in [`integrity`]
+//!
+//! [`manager::PluginManager`] is the single owner of all loaded
+//! plugins; the proxy holds it inside a `std::sync::RwLock` because
+//! every relayed packet takes a read guard for the packet-hook
+//! pipeline.
+
 #![deny(clippy::all)]
 
 pub mod api;
 pub mod integrity;
-pub mod loader;
 pub mod manager;
 pub mod sandbox;
+pub mod wasm_loader;
 
 pub use api::{
-    PacketData, PacketDirection, PacketEvent, PacketFilter, PacketHookResult, Plugin,
-    PluginContext, PluginEvent, PluginMetadata, PluginResponse,
+    PacketData, PacketDirection, PacketEvent, PacketFilter, PacketHookFn, PacketHookResult, Plugin,
+    PluginCommand, PluginContext, PluginEvent, PluginMetadata, PluginResponse,
 };
 pub use integrity::PluginVerifier;
-pub use loader::PluginLoader;
 pub use manager::PluginManager;
 pub use sandbox::{apply_sandbox, validate_plugin_permissions, SandboxConfig};
+pub use wasm_loader::{WasmLoader, WasmPluginAdapter, WasmPluginInstance};

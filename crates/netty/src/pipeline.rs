@@ -1,3 +1,11 @@
+//! Ordered list of handlers wrapping a single channel.
+//!
+//! Pipeline ordering matters: inbound bytes flow head-to-tail through
+//! the handler list, outbound bytes flow tail-to-head. Each stage
+//! decides whether to forward, transform, or swallow what came
+//! before. The whole structure is owned per-channel so handlers can
+//! keep per-connection state without coordination.
+
 use bytes::Bytes;
 
 use super::{

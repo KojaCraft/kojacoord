@@ -1,3 +1,9 @@
+//! Process-wide atomic counters: connection lifetimes, packet and
+//! byte volumes. Separate from `kojacoord_metrics` (which is the
+//! Prometheus-shaped registry) — these are the raw `AtomicU64`s the
+//! hot path increments without going through Prometheus's
+//! per-label-lookup path.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct ProxyMetrics {
@@ -34,6 +40,11 @@ impl ProxyMetrics {
             .fetch_add(size as u64, Ordering::Relaxed);
     }
 
+    /// Bump the failure counter. The caller is responsible for also
+    /// calling [`Self::record_disconnection`] — every failed
+    /// connection is also a disconnected one, but separating the
+    /// concerns lets callers in accounting-light paths skip one or
+    /// the other.
     pub fn record_failed_connection(&self) {
         self.failed_connections.fetch_add(1, Ordering::Relaxed);
     }

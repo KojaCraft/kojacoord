@@ -1,3 +1,9 @@
+//! Thin wrappers over `PacketRegistry::get_id_for_version` keyed by
+//! state / direction. Prefer the compile-time `PacketId` trait at
+//! new call sites; this string-keyed surface is mostly used for
+//! packet-id comparisons in the relay where the typed struct isn't
+//! in scope.
+
 use kojacoord_protocol::{
     registry::{Direction, PacketRegistry, ProtocolState},
     ProtocolVersion,

@@ -1,3 +1,11 @@
+//! Built-in slash-command handlers.
+//!
+//! Intercepts chat messages starting with `/` before they're
+//! forwarded to the backend. Includes the user-facing operator
+//! commands (`/tps`, `/list`, `/find`, `/alert`, ban management,
+//! etc.). Permission gates check against the player's role from
+//! `data::permissions` — backends never see the command.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -281,7 +289,11 @@ async fn handle_plugins(
     state: Arc<ProxyState>,
     send_message: &mut impl FnMut(String),
 ) -> CommandResult {
-    let plugins = state.plugin_manager.loaded_plugins();
+    let plugins = state
+        .plugin_manager
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .loaded_plugins();
     send_message(format!("§6§lPlugins §7(§f{}§7)", plugins.len()));
     if plugins.is_empty() {
         send_message("§7No plugins loaded.".to_owned());

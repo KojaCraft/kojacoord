@@ -1,3 +1,11 @@
+//! AES-128 / CFB8 cipher pair as a pipeline handler.
+//!
+//! Mirrors the cipher pair `proxy_core::net::connection::Cfb8State`
+//! manages, but exposed as a `ChannelHandler` so the netty-style
+//! pipeline can carry it. Used by plugins that want to assemble
+//! their own protocol experiments without rebuilding the cipher
+//! plumbing.
+
 use aes::Aes128;
 use cfb_mode::{BufDecryptor, BufEncryptor};
 use cipher::KeyIvInit;

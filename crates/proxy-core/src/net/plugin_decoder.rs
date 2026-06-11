@@ -1,3 +1,14 @@
+//! Generic `ClientboundPluginMessage` / `ServerboundPluginMessage`
+//! decoder.
+//!
+//! Plugin messages are the channel-routed key/value pairs Minecraft
+//! uses for mods and proxy integrations. The two relevant variants
+//! split at 1.13: pre-1.13 used a `String channel + remaining bytes`,
+//! 1.13+ uses the same `String channel` but the body is varint
+//! length-prefixed. This module pulls both into a single
+//! [`PluginMessage`] shape so the relay's channel router doesn't
+//! care which side of 1.13 it's on.
+
 use bytes::{Buf, Bytes};
 use kojacoord_protocol::{codec::Decode, ProtocolVersion};
 
