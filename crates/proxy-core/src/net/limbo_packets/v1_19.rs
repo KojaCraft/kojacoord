@@ -345,10 +345,10 @@ impl LimboPackets for V1_19 {
         // client discards it and stays on "Loading terrain".
         let id: u8 = match proto {
             755..=758 => 0x49, // 1.17 / 1.17.1 / 1.18 / 1.18.2
-            759 => 0x48,                   // 1.19
-            760 => 0x4b,                   // 1.19.1 / 1.19.2
-            761 => 0x4a,                   // 1.19.3
-            762 => 0x4e,                   // 1.19.4
+            759 => 0x48,       // 1.19
+            760 => 0x4b,       // 1.19.1 / 1.19.2
+            761 => 0x4a,       // 1.19.3
+            762 => 0x4e,       // 1.19.4
             _ => return None,
         };
         let mut body = BytesMut::new();
