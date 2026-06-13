@@ -743,6 +743,7 @@ mod tests {
             version: "1.0.0".to_string(),
             config: HashMap::new(),
             command_tx: None,
+            runtime_handle: None,
         };
 
         // Invalid WASM (no magic number)
