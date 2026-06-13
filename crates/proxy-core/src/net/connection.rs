@@ -1810,6 +1810,29 @@ impl ClientConnection {
         }
     }
 
+    /// Parses the client's Encryption Response packet from the current stream and returns the
+    /// extracted shared secret and verify token bytes.
+    ///
+    /// The returned tuple is `(shared_secret, verify_token)`. For modern protocols this is the
+    /// raw shared-secret bytes followed by the verify-token bytes. For Java protocol versions
+    /// 759–760 (1.19 / 1.19.1 / 1.19.2) the client may send a signed form (salt + signature)
+    /// instead of a verify token; in that case the signature is consumed and an empty verify
+    /// token (`Vec::new()`) is returned so the caller can proceed using the signed flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConnectionError::Protocol(ProtocolError::UnexpectedEof)` when the packet is
+    /// truncated or otherwise does not contain the expected number of bytes; other protocol
+    /// decoding errors are propagated as appropriate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Pseudocode example: `conn` is a connected ClientConnection in an async context.
+    /// // let mut conn: ClientConnection = ...;
+    /// // let (shared_secret, verify_token) = conn.recv_encryption_response().await?;
+    /// // assert!(!shared_secret.is_empty());
+    /// ```
     async fn recv_encryption_response(&mut self) -> Result<(Vec<u8>, Vec<u8>), ConnectionError> {
         use bytes::Buf;
         let mut bytes =

@@ -118,6 +118,20 @@ impl LimboPackets for V1_19 {
         encode(proto, p::ClientboundSetCarriedItem { slot: 0 })
     }
 
+    /// Builds a ClientboundPlayerPosition packet tailored to the specified protocol version.
+    ///
+    /// For protocol versions 755..=761 the encoded body includes a trailing `dismount_vehicle` boolean
+    /// byte immediately after the `teleport_id`. For other supported protocol versions the encoded
+    /// body uses the 1.19.4+ shape that omits the `dismount_vehicle` byte.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = V1_19;
+    /// let pos = PlayerPos { x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0 };
+    /// let pkt = v.player_position(761, pos, 1).unwrap();
+    /// assert!(!pkt.body.is_empty());
+    /// ```
     fn player_position(
         &self,
         proto: u32,
@@ -198,6 +212,30 @@ impl LimboPackets for V1_19 {
         )
     }
 
+    /// Encodes a clientbound music-disc sound packet shaped for the specified protocol version.
+    ///
+    /// Builds the wire-format for the `minecraft:music_disc.cat` sound event using the packet shape
+    /// expected by the given `proto`. Behavior by proto range:
+    /// - 755–758: legacy NamedSoundEffect shape (Identifier name, VarInt category, scaled i32 positions,
+    ///   f32 volume, f32 pitch).
+    /// - 759–760: prefix-less 1.19/1.19.1/1.19.2 custom-sound shape (name length + name, VarInt category,
+    ///   scaled i32 positions, f32 volume, f32 pitch, i64 seed).
+    /// - 761+: Holder<SoundEvent> inline form (VarInt 0, name length + name, a `fixed_range` option byte,
+    ///   VarInt category, scaled i32 positions, f32 volume, f32 pitch, i64 seed).
+    ///
+    /// Returns `Some(EncodedPacket)` containing the correctly encoded packet body and packet id for the
+    /// target proto, or `None` if the packet id is unsupported for that proto or required encodings fail.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use uuid::Uuid;
+    /// // Construct params with the same public fields used by the codebase.
+    /// let params = crate::net::limbo_packets::SoundParams { x: 0.0, y: 64.0, z: 0.0, volume: 1.0, pitch: 1.0 };
+    /// let v = crate::net::limbo_packets::v1_19::V1_19;
+    /// let pkt = v.note_sound(759, params);
+    /// assert!(pkt.is_some());
+    /// ```
     fn note_sound(&self, proto: u32, pos: SoundParams) -> Option<EncodedPacket> {
         // Sound packet wire shape across this canonical bucket:
         //   proto 755 - 758 (1.17 / 1.18.x): legacy NamedSoundEffect
@@ -294,6 +332,26 @@ impl LimboPackets for V1_19 {
         Some(EncodedPacket { id: pid, body })
     }
 
+    /// Add a boss bar for the given UUID with the provided title.
+    ///
+    /// The resulting packet uses the BossBar `Add` action (health = 1.0, color = 1, division = 0, flags = 0).
+    ///
+    /// # Parameters
+    ///
+    /// - `proto`: protocol version used to select the packet id and wire format; may cause `None` if unsupported.
+    ///
+    /// # Returns
+    ///
+    /// `Some(EncodedPacket)` containing a BossBar `Add` action for the given UUID and title, or `None` if the packet id/wire shape is unsupported for `proto`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = V1_19;
+    /// let id = uuid::Uuid::new_v4();
+    /// let pkt = v.bossbar_add(762, id, "Hello world");
+    /// assert!(pkt.is_some());
+    /// ```
     fn bossbar_add(&self, proto: u32, uuid: Uuid, title: &str) -> Option<EncodedPacket> {
         encode(
             proto,
@@ -324,6 +382,18 @@ impl LimboPackets for V1_19 {
         encode(proto, p::ClientboundKeepAlive { id })
     }
 
+    /// Constructs a `minecraft:brand` plugin-message packet containing the given brand string.
+    ///
+    /// The payload is the brand length encoded as a VarInt followed by the raw brand bytes.
+    /// Returns `Some(EncodedPacket)` containing the plugin message for the specified protocol, or `None` if encoding fails for that protocol.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = V1_19;
+    /// let pkt = v.brand(762, "my-proxy").expect("should encode");
+    /// // `pkt` is an EncodedPacket ready to be sent to a client
+    /// ```
     fn brand(&self, proto: u32, brand: &str) -> Option<EncodedPacket> {
         let mut data = BytesMut::new();
         VarInt(brand.len() as i32).encode(&mut data).ok()?;
@@ -337,6 +407,23 @@ impl LimboPackets for V1_19 {
         )
     }
 
+    /// Constructs the per-protocol "SetChunkCacheCenter" / Update View Position packet with chunk coordinates set to (0, 0).
+    ///
+    /// The chosen packet id depends on `proto`:
+    /// - 755..=758 → 0x49
+    /// - 759 → 0x48
+    /// - 760 → 0x4b
+    /// - 761 → 0x4a
+    /// - 762 → 0x4e
+    /// Returns `None` for unsupported protocol versions. The packet body contains two VarInts (chunk x and chunk z), both zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = V1_19;
+    /// let pkt = v.set_center_chunk(759).unwrap();
+    /// assert_eq!(pkt.id, 0x48);
+    /// ```
     fn set_center_chunk(&self, proto: u32) -> Option<EncodedPacket> {
         // `SetChunkCacheCenter` / Update View Position = `[VarInt x][VarInt z]`.
         // Not in the central registry, so the per-proto id is pinned here
@@ -357,6 +444,18 @@ impl LimboPackets for V1_19 {
         Some(EncodedPacket { id, body })
     }
 
+    /// Builds a "void" ClientboundLevelChunkWithLight packet body for the given protocol version.
+    ///
+    /// Chooses the section count based on the protocol: 16 sections when `proto <= 756`, 24 sections otherwise,
+    /// and uses the named-NBT heightmap / trust_edges era layout. Returns `None` if the protocol registry does not
+    /// define an id for `ClientboundLevelChunkWithLight`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = V1_19;
+    /// assert!(v.chunk_data(759).is_some());
+    /// ```
     fn chunk_data(&self, proto: u32) -> Option<EncodedPacket> {
         // `ClientboundLevelChunkWithLight` (1.18 combined chunk+light).
         // 755-762 are the named-NBT-heightmap, `trust_edges`-present era.
@@ -374,21 +473,23 @@ impl LimboPackets for V1_19 {
     }
 }
 
-/// Hand-encode the 1.17 / 1.18 JoinGame.
+/// Hand-encodes a JoinGame (ClientboundLogin) packet for Minecraft 1.17–1.18 protos.
 ///
-/// Wire shape (BungeeCord `Login.java::read` 1.17 / 1.18 branches +
-/// minecraft.wiki Java_Edition_protocol §Join_Game):
+/// Builds the exact wire-format used by 1.17/1.18 clients, including:
+/// - entity id, hardcore flag, game mode and previous game mode
+/// - a dimensions list containing `world_name`
+/// - the registry codec (NBT-framed) and the inline dimension NBT for `minecraft:overworld`
+/// - the repeated world name string, hashed seed, player limits, view/simulation distances,
+///   and the protocol-specific trailing booleans.
 ///
-/// ```text
-/// [i32 entity_id] [bool is_hardcore] [u8 game_mode] [i8 previous_game_mode]
-/// [VarInt dim_count + N × String world_name]
-/// [NBT registry_codec]
-/// [NBT dimension_type]                  ; ← NBT compound, NOT Identifier
-/// [String world_name]
-/// [i64 hashed_seed] [VarInt max_players] [VarInt view_distance]
-/// [VarInt simulation_distance ← 1.18 only, 757/758]
-/// [bool reduced_debug_info] [bool enable_respawn_screen]
-/// [bool is_debug] [bool is_flat]
+/// Returns `None` if the packet id for `ClientboundLogin` is unavailable for `proto`
+/// or if necessary codec/NBT builders fail.
+///
+/// # Examples
+///
+/// ```
+/// let pkt = build_join_game_1_17_or_1_18(757, "minecraft:overworld");
+/// assert!(pkt.is_some());
 /// ```
 fn build_join_game_1_17_or_1_18(proto: u32, world_name: &str) -> Option<EncodedPacket> {
     let pid = p::ClientboundLogin::packet_id(proto);
@@ -439,15 +540,23 @@ fn build_join_game_1_17_or_1_18(proto: u32, world_name: &str) -> Option<EncodedP
     Some(EncodedPacket { id: pid, body })
 }
 
-/// Hand-encode the 1.17 / 1.18 Respawn.
+/// Build a hand-encoded Clientbound Respawn packet matching the 1.17/1.18 wire shape.
 ///
-/// Wire shape:
-/// ```text
-/// [NBT dimension_type] [String world_name]
-/// [i64 hashed_seed] [u8 game_mode] [i8 previous_game_mode]
-/// [bool is_debug] [bool is_flat] [bool copy_metadata]
+/// Encodes the respawn packet fields in the order required by protocols in the 1.17–1.18 range:
+/// an inline dimension NBT for the overworld, the world name string, hashed seed, game mode,
+/// previous game mode, and the three trailing boolean bytes (is_debug, is_flat, copy_metadata).
+///
+/// Returns `Some(EncodedPacket)` containing the encoded ClientboundRespawn for the given `proto` and
+/// `world_name`, or `None` if the packet id for `proto` is unavailable or constructing the
+/// inline dimension NBT fails.
+///
+/// # Examples
+///
 /// ```
-/// The 1.19+ `data_kept` byte and `death_location` optional are absent.
+/// // Ensure a packet can be constructed for a 1.17-era protocol.
+/// let pkt = build_respawn_1_17_or_1_18(755, "minecraft:overworld");
+/// assert!(pkt.is_some());
+/// ```
 fn build_respawn_1_17_or_1_18(proto: u32, world_name: &str) -> Option<EncodedPacket> {
     let pid = p::ClientboundRespawn::packet_id(proto);
     if pid == 0xFF {

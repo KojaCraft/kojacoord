@@ -4,6 +4,13 @@ TAGID = {'end':0,'byte':1,'short':2,'int':3,'long':4,'float':5,'double':6,
          'byteArray':7,'string':8,'list':9,'compound':10,'intArray':11,'longArray':12}
 
 def w_varint(out, v):
+    """
+    Encode an integer as a 32-bit masked varint and append its bytes to the given output.
+    
+    Parameters:
+        out (bytearray | list): Mutable byte container to which the varint-encoded bytes will be appended.
+        v (int): Integer value to encode; masked to 32 bits before encoding.
+    """
     v &= 0xFFFFFFFF
     while True:
         b = v & 0x7F
@@ -12,13 +19,47 @@ def w_varint(out, v):
         else: out.append(b); break
 
 def w_mc_string(out, s):
+    """
+    Encode a Python string as UTF-8 with a Minecraft-style varint length prefix and append the bytes to `out`.
+    
+    Parameters:
+        out (bytearray or list): Mutable byte buffer to which the length prefix and UTF-8 bytes will be appended.
+        s (str): The string to encode.
+    """
     b = s.encode('utf-8'); w_varint(out, len(b)); out += b
 
 def long_i64(v):
+    """
+    Normalize a "long" input into a 64-bit integer suitable for packing.
+    
+    Parameters:
+        v (int | list): Either an integer already representing the 64-bit value, or a two-element list [high, low] where `high` is the high 32 bits and `low` is the low 32 bits.
+    
+    Returns:
+        int: The resulting 64-bit integer. If `v` is a two-element list, returns (high << 32) | (low & 0xFFFFFFFF); otherwise returns `v` unchanged.
+    """
     if isinstance(v, list): return (v[0] << 32) | (v[1] & 0xFFFFFFFF)
     return v
 
 def w_payload(out, ttype, val):
+    """
+    Serialize an NBT payload (unnamed) for the given tag type into the provided bytearray.
+    
+    Parameters:
+        out (bytearray or list): Mutable byte buffer to append the encoded payload bytes.
+        ttype (str): NBT tag type name (one of: 'byte', 'short', 'int', 'long', 'float', 'double',
+            'string', 'byteArray', 'intArray', 'longArray', 'list', 'compound').
+        val: Value to serialize for the given tag type. Expected shapes:
+            - Primitives ('byte','short','int','long','float','double'): numeric value.
+            - 'string': Python str (UTF-8 encoded with 16-bit big-endian length prefix).
+            - 'byteArray' / 'intArray' / 'longArray': iterable of numbers (arrays are length-prefixed with 32-bit big-endian count).
+            - 'long' and 'longArray' elements may be integers or 2-element [high, low] lists (normalized by long_i64).
+            - 'list': dict with keys 'type' (element tag name) and 'value' (iterable of element values).
+            - 'compound': dict mapping string keys to tag descriptors of the form {'type': <tag>, 'value': <val>}.
+    
+    Raises:
+        SystemExit: if `ttype` is not a recognized NBT tag type.
+    """
     if ttype=='byte': out += struct.pack('>b', val)
     elif ttype=='short': out += struct.pack('>h', val)
     elif ttype=='int': out += struct.pack('>i', val)
@@ -50,6 +91,15 @@ def w_payload(out, ttype, val):
 
 def w_nameless(out, tag):
     # network NBT (1.20.2+): tag_id byte + payload, NO name
+    """
+    Append a nameless NBT tag (type ID byte followed by payload) to a mutable byte buffer.
+    
+    Parameters:
+        out (bytearray or list): Mutable buffer to which the tag bytes are appended.
+        tag (dict): Tag object with keys:
+            - 'type' (str): NBT tag type name (must be a key in TAGID).
+            - 'value': The tag payload to be serialized according to its type.
+    """
     out += struct.pack('>B', TAGID[tag['type']])
     w_payload(out, tag['type'], tag['value'])
 

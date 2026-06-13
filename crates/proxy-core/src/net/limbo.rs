@@ -151,6 +151,33 @@ impl<'a> LimboHandler<'a> {
         result
     }
 
+    /// Runs the limbo session: sends the synthetic JoinGame/play-state packets, maintains the client connection
+    /// while polling for an available backend, and transitions to the backend stream when one becomes available.
+    ///
+    /// This function:
+    /// - Performs the proto-764+ configuration handshake when required.
+    /// - Sends limbo-specific join/play packets (join, chunk/center, position, chat, sounds, bossbar, etc.)
+    /// - Periodically polls for an available backend and, on success, sends a Respawn and returns the backend `TcpStream`.
+    /// - Sends periodic keepalives and continuously reads & discards client packets to keep the connection alive.
+    /// - On proxy shutdown, sends a configured Disconnect reason and returns `ConnectionError::Closed`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(TcpStream)` with the connected backend stream when a backend becomes available and the handler leaves limbo;
+    /// `Err(ConnectionError)` if the client connection or packet processing fails or if shutdown/other error occurs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # // pseudo-usage; actual construction of `LimboHandler` requires significant setup.
+    /// # async fn example_usage(mut handler: LimboHandler<'_>) {
+    /// let result = handler.run_inner().await;
+    /// match result {
+    ///     Ok(backend_stream) => { /* handed off to backend */ }
+    ///     Err(e) => { /* handle connection error */ }
+    /// }
+    /// # }
+    /// ```
     async fn run_inner(&mut self) -> Result<TcpStream, ConnectionError> {
         let username = self.session.read().await.username.clone();
         tracing::info!(
@@ -359,13 +386,21 @@ impl<'a> LimboHandler<'a> {
             .as_protocol_version()
     }
 
-    /// Drive the proto-764+ Login → Configuration → Play handshake.
+    /// Perform the protocol 764+ Login → Configuration → Play handshake with the connected client.
     ///
-    /// See the comment block above the call site for the wire-level
-    /// step list. Errors out (so the outer `run_inner` can surface a
-    /// disconnect) if any of the expected packet IDs come back wrong —
-    /// silently continuing would just delay the disconnect until the
-    /// first JoinGame frame hit the still-in-Login-state client.
+    /// This completes the configuration exchange required by newer protocol versions, conditionally
+    /// sends registry data when applicable, and verifies the client's acknowledgement before
+    /// proceeding to Play. Returns `Ok(())` on success or a `ConnectionError` if the handshake fails
+    /// (I/O, protocol decoding, or unexpected/mismatched packet conditions).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(mut handler: LimboHandler<'_>) -> Result<(), ConnectionError> {
+    /// handler.run_configuration_phase().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn run_configuration_phase(&mut self) -> Result<(), ConnectionError> {
         use bytes::BytesMut;
         use kojacoord_protocol::codec::{Decode, Encode};

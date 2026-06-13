@@ -211,14 +211,23 @@ pub fn dimension_type_nbt_1_20_4(key: &str) -> Result<Vec<u8>, ProtocolError> {
     dimension_type_nbt_with_version(key, DimSchema::V1_20_4)
 }
 
-/// Proto-aware inline dimension NBT.
+/// Selects a dimension-schema based on a protocol version and returns the encoded inline dimension-type NBT for the given registry key.
 ///
-/// Per minecraft.wiki §JoinGame + ViaVersion `EntityPacketRewriter1_17`:
-///   * 751 - 754 (1.16.2 - 1.16.5)  →  13-field element, no `min_y`/`height`
-///   * 755 - 763 (1.17  - 1.19.4)   →  + `min_y`/`height` (1.17 additions)
-///   * 764+      (1.20.2+)          →  + `monster_spawn_light_level`,
-///                                      `monster_spawn_block_light_limit`,
-///                                      `fixed_time` int placeholder
+/// The function maps `proto` to an internal `DimSchema`:
+/// - proto >= 764 => V1_20_4
+/// - 759 ..= 763   => V1_19
+/// - 758           => V1_18_2
+/// - 755 ..= 757   => V1_17
+/// - otherwise     => V1_16_2
+///
+/// The produced NBT matches the field layout expected by the selected schema (e.g., presence or absence of `min_y`/`height`, spawn-light fields, and the 1.20.4 placeholders).
+///
+/// # Examples
+///
+/// ```
+/// let bytes = dimension_type_nbt_for_proto("minecraft:overworld", 758).unwrap();
+/// assert!(bytes.len() > 0);
+/// ```
 pub fn dimension_type_nbt_for_proto(key: &str, proto: u32) -> Result<Vec<u8>, ProtocolError> {
     let schema = match proto {
         p if p >= 764 => DimSchema::V1_20_4,
@@ -302,9 +311,31 @@ fn dimension_type_nbt_with_version(key: &str, schema: DimSchema) -> Result<Vec<u
     Ok(buf.to_vec())
 }
 
-/// Augment a base element compound with the per-era extras. Called
-/// after `dimension_type_element` so the base 13-field set is shared
-/// across all eras and only the per-era additions live here.
+/// Insert era-specific integer fields into a dimension-type compound.
+///
+/// For compound `element` values this adds or overrides integer keys required by
+/// the given `schema`:
+/// - V1_16_2: no additions.
+/// - V1_17 and V1_18_2: `min_y = 0`, `height = 256`.
+/// - V1_19: `min_y = 0`, `height = 256`, `monster_spawn_block_light_limit = 0`,
+///   `monster_spawn_light_level = 11`.
+/// - V1_20_4: `min_y = 0`, `height = 256` (other 1.20.4 fields are added by
+///   the base element constructor when applicable).
+///
+/// If `element` is not a compound it is returned unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// // build an empty compound element
+/// let base = NbtTag::Compound(HashMap::new());
+/// let augmented = augment_for_schema(base, DimSchema::V1_17);
+/// match augmented {
+///     NbtTag::Compound(m) => assert!(m.contains_key("min_y") && m.contains_key("height")),
+///     _ => panic!("expected a compound"),
+/// }
+/// ```
 fn augment_for_schema(element: NbtTag, schema: DimSchema) -> NbtTag {
     let NbtTag::Compound(mut m) = element else {
         return element;

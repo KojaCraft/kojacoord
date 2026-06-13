@@ -62,18 +62,21 @@ pub fn determine_injection_mode(client_protocol: u32, backend_protocol: u32) -> 
     }
 }
 
-/// Build a dimension codec NBT for the given protocol.
+/// Selects and returns an authoritative dimension codec NBT blob appropriate for the given protocol version.
 ///
-/// Per BungeeCord `protocol/Login.java`, the codec field exists from
-/// proto 735 (1.16) onward and was removed when the Configuration
-/// phase split out the registry data at proto 764 (1.20.2).
+/// Prefers precomputed per-protocol binary NBT blobs when available; otherwise delegates to the library builders and maps any builder error to a `String` error. The returned `Vec<u8>` is a single self-framing binary NBT blob representing the JoinGame codec registries for that protocol.
 ///
-/// Strategy: prefer the byte-for-byte PrismarineJS codec for this
-/// proto if `crates/protocol/data/dimension_codec_<proto>.nbt.bin`
-/// was populated by `gen_dimension_codec`. Otherwise fall back to the
-/// synthesised minimal codec which is enough to pass the client's
-/// "did the server send a codec?" check but doesn't enumerate the
-/// nether/end dimensions or the full biome registry.
+/// # Errors
+///
+/// Returns `Err(String)` when a delegated codec builder fails.
+///
+/// # Examples
+///
+/// ```
+/// let codec = build_dimension_codec_for_proto(759).expect("should build 1.19 codec");
+/// // codec contains the full binary NBT codec for proto 759
+/// assert!(!codec.is_empty());
+/// ```
 pub fn build_dimension_codec_for_proto(proto: u32) -> Result<Vec<u8>, String> {
     // Per-era codec schema. Mojang restructured the dimension_codec
     // TWICE inside the 1.16-1.20 window:
@@ -157,18 +160,22 @@ pub fn build_dimension_codec_for_proto(proto: u32) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Extract a single dimension's `element` compound from the proto's
-/// registry codec and return it as a named (empty-name) network NBT —
-/// the wire shape of the *inline* `dimension` field in the 1.16.2-1.18.2
-/// JoinGame / Respawn packets.
+/// Extracts the inline `dimension` element for `dim_key` from the proto's
+/// dimension registry NBT and returns it as a network-shaped NBT blob with
+/// an empty root name (the wire form used as the inline `dimension` in
+/// JoinGame/Respawn packets).
 ///
-/// The inline dimension MUST be byte-consistent with the dimension this
-/// proto's registry actually defines (same `#`-tag `infiniburn`, same
-/// `min_y`/`height`, etc.) or the client's strict `DimensionType` codec
-/// rejects it — surfacing as a `Failed to decode` / dumped-element
-/// disconnect. Deriving it from the same authoritative blob the registry
-/// ships guarantees that consistency, instead of hand-synthesising a
-/// second copy that drifts from the registry.
+/// Returns an error if the registry NBT cannot be decoded, required fields are
+/// missing or have the wrong NBT tags, the named dimension is not present, or
+/// encoding the resulting inline element fails.
+///
+/// # Examples
+///
+/// ```
+/// let inline = inline_dimension_nbt_for_proto("minecraft:overworld", 754)?;
+/// assert!(!inline.is_empty());
+/// # Ok::<(), String>(())
+/// ```
 pub fn inline_dimension_nbt_for_proto(dim_key: &str, proto: u32) -> Result<Vec<u8>, String> {
     use kojacoord_protocol::codec::{Decode, Encode};
     use kojacoord_protocol::types::nbt::{Nbt, NbtTag};
@@ -883,13 +890,18 @@ mod ship_check {
         );
     }
 
-    /// The embedded 1.19 codec (from minecraft-data) must be the REAL
-    /// 1.19 registry: biome elements carry none of the obsolete
-    /// `depth`/`scale`/`category` fields, the biome SET is the modern
-    /// one (contains `minecraft:the_void`, absent from the old 1.16
-    /// blob), and the overworld dimension's `infiniburn` uses the
-    /// 1.18+ block-tag form `#minecraft:...`. Any of these wrong made
-    /// the 1.19 client reject the registry and dump it in a disconnect.
+    /// Validates that the embedded 1.19 dimension codec is authoritative and wire-compatible.
+    ///
+    /// Ensures the 1.19 codec's biome registry omits the obsolete `depth`/`scale`/`category` fields,
+    /// includes `minecraft:the_void`, preserves `effects`, that dimension `infiniburn` values use
+    /// the `#`-prefixed block-tag form, and that `minecraft:chat_type` is present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // This test performs deep validation; calling the codec builder must succeed.
+    /// let _ = build_dimension_codec_for_proto(759).expect("build 759");
+    /// ```
     #[test]
     fn proto_759_codec_is_authoritative_1_19() {
         use kojacoord_protocol::codec::Decode;
@@ -971,14 +983,22 @@ mod ship_check {
         );
     }
 
-    /// The inline dimension NBT (used in the 1.17-1.18.2 JoinGame /
-    /// Respawn) must be byte-consistent with its registry: a valid named
-    /// NBT carrying min_y/height, and — crucially — the *version's own*
-    /// `infiniburn` form. 1.17 still uses the bare `minecraft:...`
-    /// identifier; 1.18 switched to the `#`-block-tag form. The old
-    /// synthesiser emitted the bare form for ALL of 755-758, which the
-    /// strict 1.18.x DimensionType codec rejected ("Failed to decode").
-    /// Extracting from each proto's real blob fixes it automatically.
+    /// Verifies that the inline per-dimension NBT extracted for protos 755, 757, and 758 matches the registry's expectations.
+    ///
+    /// Asserts that the extracted inline NBT decodes cleanly with no trailing bytes, contains the `min_y` and `height` fields (required for 1.17+), and that the `infiniburn` string uses the `#`-block-tag form only for proto 758 (1.18.2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bytes = inline_dimension_nbt_for_proto("minecraft:overworld", 758).unwrap();
+    /// let mut src = bytes::Bytes::copy_from_slice(&bytes);
+    /// let nbt = kojacoord_protocol::codec::Decode::decode(&mut src).unwrap();
+    /// assert!(src.is_empty());
+    /// if let kojacoord_protocol::types::nbt::NbtTag::String(inf) = nbt.root.get("infiniburn").unwrap() {
+    ///     assert!(inf.starts_with('#'));
+    /// }
+    /// assert!(nbt.root.contains_key("min_y") && nbt.root.contains_key("height"));
+    /// ```
     #[test]
     fn inline_dimension_matches_registry_for_1_17_1_18() {
         use kojacoord_protocol::codec::Decode;

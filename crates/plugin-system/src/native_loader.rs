@@ -29,6 +29,13 @@ pub struct PluginLoader {
 }
 
 impl PluginLoader {
+    /// Constructs a new PluginLoader with an empty library list and a default PluginVerifier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let _loader = plugin_system::native_loader::PluginLoader::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             libraries: Vec::new(),
@@ -44,16 +51,46 @@ impl PluginLoader {
         }
     }
 
-    /// Access the integrity verifier to configure trusted hashes at runtime.
+    /// Access the internal `PluginVerifier` for runtime configuration of trusted hashes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut loader = PluginLoader::new();
+    /// let _verifier: &mut PluginVerifier = loader.verifier_mut();
+    /// ```
     pub fn verifier_mut(&mut self) -> &mut PluginVerifier {
         &mut self.verifier
     }
 
-    /// Verify, map and instantiate a native plugin, running its `on_load` hook.
+    /// Verify, map, and instantiate a native plugin, then run its `on_load` hook.
     ///
-    /// Returns the owned plugin instance plus the metadata it declared. The
-    /// backing library is retained internally and kept mapped until
-    /// [`Self::unload`] or [`Self::unload_all`].
+    /// This verifies the plugin binary using the loader's `PluginVerifier`, loads the
+    /// dynamic library, invokes the plugin's C-ABI entry points to obtain metadata
+    /// and an owned `Box<dyn Plugin>`, and retains the underlying library handle
+    /// internally so the plugin's vtable remains valid.
+    ///
+    /// The caller must drop the returned `Box<dyn Plugin>` before calling
+    /// `PluginLoader::unload` or `PluginLoader::unload_all` for the same plugin;
+    /// unloading while plugin instances still exist will leave dangling vtable
+    /// pointers.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the owned plugin instance and the plugin's declared metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use plugin_system::{PluginLoader, PluginContext};
+    /// # use std::path::Path;
+    /// let mut loader = PluginLoader::new();
+    /// let ctx = PluginContext::default();
+    /// let (plugin, metadata) = loader.load_plugin(Path::new("path/to/plugin.so"), &ctx).unwrap();
+    /// // Use `plugin`...
+    /// drop(plugin); // Drop before unloading
+    /// loader.unload(&metadata.name);
+    /// ```
     pub fn load_plugin<P: AsRef<Path>>(
         &mut self,
         path: P,
@@ -112,19 +149,53 @@ impl PluginLoader {
         }
     }
 
-    /// Unmap a single plugin's library by its metadata name.
+    /// Unload the retained native library associated with a plugin metadata name.
     ///
-    /// The caller MUST have already dropped the corresponding `Box<dyn Plugin>`
-    /// — its vtable points into this library's code. Safe to call for a name
-    /// that isn't loaded (e.g. a WASM plugin): it's a no-op.
+    /// Calling this removes the stored `libloading::Library` handle for `name`, allowing the library to be
+    /// unmapped when no other handles remain. The caller must drop the corresponding `Box<dyn Plugin>`
+    /// before calling this method because the plugin's vtable points into the library's code.
+    /// Calling with a name that is not present is a safe no-op.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut loader = PluginLoader::new();
+    /// // Safe to call for names not loaded; does nothing in that case.
+    /// loader.unload("example_plugin");
+    /// ```
     pub fn unload(&mut self, name: &str) {
         self.libraries.retain(|(n, _)| n != name);
     }
 
+    /// Unloads all retained native plugin libraries.
+    ///
+    /// Clears the loader's internal list of mapped libraries, causing their native handles
+    /// to be dropped and the libraries to be unmapped. Callers must drop any plugin
+    /// instances that reference those libraries before calling this method; otherwise
+    /// those instances' vtables may reference unmapped code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut loader = PluginLoader::new();
+    /// // safe to call even if no plugins are loaded
+    /// loader.unload_all();
+    /// ```
     pub fn unload_all(&mut self) {
         self.libraries.clear();
     }
 
+    /// Checks whether the current crate version meets or exceeds a minimum required version.
+    ///
+    /// Compares the package version of the current crate to `required` using string comparison and
+    /// returns whether the current version is greater than or equal to `required`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // This should be true for any real crate version (>= "0.0.0").
+    /// assert!(check_version_compatibility("0.0.0"));
+    /// ```
     fn check_version_compatibility(required: &str) -> bool {
         let current = env!("CARGO_PKG_VERSION");
         current >= required
@@ -132,6 +203,14 @@ impl PluginLoader {
 }
 
 impl Default for PluginLoader {
+    /// Creates a default PluginLoader backed by a new PluginVerifier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::native_loader::PluginLoader;
+    /// let _loader = PluginLoader::default();
+    /// ```
     fn default() -> Self {
         Self::new()
     }

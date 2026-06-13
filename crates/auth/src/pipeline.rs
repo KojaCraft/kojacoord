@@ -173,6 +173,38 @@ impl AuthPipeline {
         }
     }
 
+    /// Advance the login state machine by handling a single authentication event for the given client IP.
+    ///
+    /// This method processes `AuthEvent`s according to the current `AuthState`, performing the offline
+    /// login flow, initiating encryption, validating encryption responses (including the 1.19
+    /// "signed-nonce" form where the verify-token can be empty), performing session verification
+    /// (hasJoined), and producing the corresponding outbound actions such as `EncryptionRequest`,
+    /// `EnableEncryption`, `SetCompression`, and `LoginSuccess`. On failure it returns an `AuthError`.
+    ///
+    /// # Parameters
+    ///
+    /// - `event`: the incoming authentication event to process (e.g. `LoginStart` or
+    ///   `EncryptionResponse`).
+    /// - `client_ip`: the peer IP address; may be sent to the session server when proxy-prevention is
+    ///   enabled.
+    ///
+    /// # Returns
+    ///
+    /// `Ok((AuthState, Vec<AuthOutbound>))` on success containing the pipeline's new state and any
+    /// outbound messages to send to the client; `Err(AuthError)` on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::net::IpAddr;
+    /// # async fn example(mut pipeline: crate::auth::AuthPipeline) -> Result<(), crate::auth::AuthError> {
+    /// use crate::auth::{AuthEvent, AuthPipeline};
+    /// let event = AuthEvent::LoginStart { username: "Player".into(), client_uuid: None };
+    /// let ip: IpAddr = "127.0.0.1".parse().unwrap();
+    /// let (new_state, outbounds) = pipeline.step(event, ip).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn step(
         &mut self,
         event: AuthEvent,
