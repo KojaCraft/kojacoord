@@ -106,20 +106,28 @@ impl LimboPackets for V1_21 {
     }
 
     fn note_sound(&self, proto: u32, pos: SoundParams) -> Option<EncodedPacket> {
-        encode(
-            proto,
-            p::ClientboundSound {
-                sound_name: "minecraft:music_disc.cat".to_owned(),
-                sound_category: VarInt(2),
-                sound_type: VarInt(0),
-                effect_pos_x: (pos.x * 8.0) as i32,
-                effect_pos_y: (pos.y * 8.0) as i32,
-                effect_pos_z: (pos.z * 8.0) as i32,
-                volume: pos.volume,
-                pitch: pos.pitch,
-                seed: 0,
-            },
-        )
+        // `Holder<SoundEvent>`: VarInt sound_id (0 = inline) + Identifier
+        // name + `option<f32> fixed_range` (leading bool) + category +
+        // pos + vol + pitch + seed. The typed `ClientboundSound` encoder
+        // omits `fixed_range`, over-running `seed`. Hand-encode it.
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundSound");
+        if id == 0xFF {
+            return None;
+        }
+        let mut body = BytesMut::new();
+        VarInt(0).encode(&mut body).ok()?; // sound_id 0 = inline event
+        let name = b"minecraft:music_disc.cat";
+        VarInt(name.len() as i32).encode(&mut body).ok()?;
+        body.put_slice(name);
+        body.put_u8(0); // fixed_range option: absent
+        VarInt(2).encode(&mut body).ok()?; // sound_category
+        body.put_i32((pos.x * 8.0) as i32);
+        body.put_i32((pos.y * 8.0) as i32);
+        body.put_i32((pos.z * 8.0) as i32);
+        body.put_f32(pos.volume);
+        body.put_f32(pos.pitch);
+        body.put_i64(0); // seed
+        Some(EncodedPacket { id, body })
     }
 
     fn bossbar_add(&self, proto: u32, uuid: Uuid, title: &str) -> Option<EncodedPacket> {
@@ -163,5 +171,74 @@ impl LimboPackets for V1_21 {
                 data: data.to_vec(),
             },
         )
+    }
+
+    fn set_center_chunk(&self, proto: u32) -> Option<EncodedPacket> {
+        // Ids per ViaVersion `ClientboundPackets1_21*` ordinals.
+        let id: u8 = match proto {
+            767 => 0x54,        // 1.21 / 1.21.1
+            768 | 769 => 0x58,  // 1.21.2 / 1.21.3 / 1.21.4
+            770 | 771 | 772 => 0x57, // 1.21.5 / 1.21.6 / 1.21.7 / 1.21.8
+            773 | 774 => 0x5c,  // 1.21.9 / 1.21.10 / 1.21.11
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        VarInt(0).encode(&mut body).ok()?;
+        VarInt(0).encode(&mut body).ok()?;
+        Some(EncodedPacket { id, body })
+    }
+
+    fn chunk_data(&self, proto: u32) -> Option<EncodedPacket> {
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundLevelChunkWithLight");
+        if id == 0xFF {
+            return None;
+        }
+        // 24 sections (384 high), no trust_edges. Heightmaps: nameless
+        // NBT through 1.21.4 (769), then a typed array from 1.21.5 (770).
+        let hm = if proto >= 770 {
+            super::HeightmapFmt::Array
+        } else {
+            super::HeightmapFmt::AnonNbt
+        };
+        let body = super::void_chunk_body(24, false, hm);
+        Some(EncodedPacket { id, body })
+    }
+
+    fn chunk_batch_start(&self, proto: u32) -> Option<EncodedPacket> {
+        let id: u8 = match proto {
+            767 | 768 | 769 => 0x0d,
+            770..=774 => 0x0c,
+            _ => return None,
+        };
+        Some(EncodedPacket {
+            id,
+            body: BytesMut::new(),
+        })
+    }
+
+    fn chunk_batch_finished(&self, proto: u32, batch_size: i32) -> Option<EncodedPacket> {
+        let id: u8 = match proto {
+            767 | 768 | 769 => 0x0c,
+            770..=774 => 0x0b,
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        VarInt(batch_size).encode(&mut body).ok()?;
+        Some(EncodedPacket { id, body })
+    }
+
+    fn start_wait_chunks_event(&self, proto: u32) -> Option<EncodedPacket> {
+        // GameEvent 13 — `[u8 event][f32 value]`.
+        let id: u8 = match proto {
+            767 => 0x22,             // 1.21 / 1.21.1
+            768 | 769 => 0x23,       // 1.21.2 / 1.21.3 / 1.21.4
+            770 | 771 | 772 => 0x22, // 1.21.5 / 1.21.6 / 1.21.7 / 1.21.8
+            773 | 774 => 0x26,       // 1.21.9 / 1.21.10 / 1.21.11
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        body.put_u8(13);
+        body.put_f32(0.0);
+        Some(EncodedPacket { id, body })
     }
 }

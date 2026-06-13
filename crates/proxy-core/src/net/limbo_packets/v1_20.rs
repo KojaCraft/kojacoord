@@ -12,6 +12,46 @@ pub struct V1_20;
 
 impl LimboPackets for V1_20 {
     fn join_game(&self, proto: u32, world_name: &str) -> Option<EncodedPacket> {
+        // 1.20 / 1.20.1 (proto 763) predate the configuration phase, so
+        // they still carry the registry codec INLINE in JoinGame — the
+        // 1.19.4 shape plus a trailing `portal_cooldown` VarInt. The
+        // typed `ClientboundLogin` below models only the 1.20.2+ compact
+        // form (codec moved to config), so hand-encode 763 here. Field
+        // order from minecraft-data `pc/1.20` loginPacket.
+        if proto == 763 {
+            use kojacoord_protocol::codec::PacketId;
+            let pid = p::ClientboundLogin::packet_id(proto);
+            if pid == 0xFF {
+                return None;
+            }
+            let codec = crate::protocol::build_dimension_codec_for_proto(proto).ok()?;
+            let mut body = BytesMut::new();
+            body.put_i32(0); // entity_id
+            body.put_u8(0); // is_hardcore
+            body.put_u8(3); // game_mode = spectator
+            body.put_i8(-1); // previous_game_mode
+            VarInt(1).encode(&mut body).ok()?; // dimension count
+            let name = world_name.as_bytes();
+            VarInt(name.len() as i32).encode(&mut body).ok()?;
+            body.put_slice(name);
+            body.put_slice(&codec); // registry codec (self-framing NBT)
+            let dt = b"minecraft:overworld";
+            VarInt(dt.len() as i32).encode(&mut body).ok()?; // dimension_type
+            body.put_slice(dt);
+            VarInt(name.len() as i32).encode(&mut body).ok()?; // dimension_name
+            body.put_slice(name);
+            body.put_i64(0); // hashed_seed
+            VarInt(20).encode(&mut body).ok()?; // max_players
+            VarInt(8).encode(&mut body).ok()?; // view_distance
+            VarInt(8).encode(&mut body).ok()?; // simulation_distance
+            body.put_u8(0); // reduced_debug_info
+            body.put_u8(1); // enable_respawn_screen
+            body.put_u8(0); // is_debug
+            body.put_u8(1); // is_flat
+            body.put_u8(0); // has_death_location = false
+            VarInt(0).encode(&mut body).ok()?; // portal_cooldown
+            return Some(EncodedPacket { id: pid, body });
+        }
         encode(
             proto,
             p::ClientboundLogin {
@@ -118,20 +158,33 @@ impl LimboPackets for V1_20 {
     }
 
     fn note_sound(&self, proto: u32, pos: SoundParams) -> Option<EncodedPacket> {
-        encode(
-            proto,
-            kojacoord_protocol::versions::v1_21_x::play::ClientboundSound {
-                sound_name: "minecraft:music_disc.cat".to_owned(),
-                sound_category: VarInt(2),
-                sound_type: VarInt(0),
-                effect_pos_x: (pos.x * 8.0) as i32,
-                effect_pos_y: (pos.y * 8.0) as i32,
-                effect_pos_z: (pos.z * 8.0) as i32,
-                volume: pos.volume,
-                pitch: pos.pitch,
-                seed: 0,
-            },
-        )
+        // 1.20+ Sound Effect is a `Holder<SoundEvent>`: `VarInt sound_id`
+        // (0 = inline) + `Identifier name` + `option<f32> fixed_range`
+        // (a leading bool) + category + pos + vol + pitch + seed. The
+        // shared `ClientboundSound` encoder omits the `fixed_range`
+        // option byte, which shifts every later field and over-runs
+        // `seed` (`readerIndex(53)+length(8) exceeds writerIndex(56)`) —
+        // the same bug fixed in the v1_19 bucket for 1.19.3+. Hand-encode
+        // with the option byte present. minecraft-data `pc/1.20`
+        // `ItemSoundHolder`/`ItemSoundEvent`.
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundSound");
+        if id == 0xFF {
+            return None;
+        }
+        let mut body = BytesMut::new();
+        VarInt(0).encode(&mut body).ok()?; // sound_id 0 = inline event
+        let name = b"minecraft:music_disc.cat";
+        VarInt(name.len() as i32).encode(&mut body).ok()?;
+        body.put_slice(name);
+        body.put_u8(0); // fixed_range option: absent
+        VarInt(2).encode(&mut body).ok()?; // sound_category
+        body.put_i32((pos.x * 8.0) as i32);
+        body.put_i32((pos.y * 8.0) as i32);
+        body.put_i32((pos.z * 8.0) as i32);
+        body.put_f32(pos.volume);
+        body.put_f32(pos.pitch);
+        body.put_i64(0); // seed
+        Some(EncodedPacket { id, body })
     }
 
     fn bossbar_add(&self, proto: u32, uuid: Uuid, title: &str) -> Option<EncodedPacket> {
@@ -175,5 +228,74 @@ impl LimboPackets for V1_20 {
                 data: data.to_vec(),
             },
         )
+    }
+
+    fn set_center_chunk(&self, proto: u32) -> Option<EncodedPacket> {
+        // `[VarInt x][VarInt z]`. Ids per minecraft-data / ViaVersion
+        // `ClientboundPackets1_20_*`.
+        let id: u8 = match proto {
+            763 => 0x4e, // 1.20 / 1.20.1
+            764 => 0x50, // 1.20.2
+            765 => 0x52, // 1.20.3 / 1.20.4
+            766 => 0x54, // 1.20.5 / 1.20.6
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        VarInt(0).encode(&mut body).ok()?;
+        VarInt(0).encode(&mut body).ok()?;
+        Some(EncodedPacket { id, body })
+    }
+
+    fn chunk_data(&self, proto: u32) -> Option<EncodedPacket> {
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundLevelChunkWithLight");
+        if id == 0xFF {
+            return None;
+        }
+        // 1.20+ overworld is 384 high (24 sections) and DROPPED the
+        // `trust_edges` bool. Heightmaps: named NBT at 1.20/1.20.1,
+        // nameless (network) NBT from 1.20.2.
+        let hm = if proto <= 763 {
+            super::HeightmapFmt::NamedNbt
+        } else {
+            super::HeightmapFmt::AnonNbt
+        };
+        let body = super::void_chunk_body(24, false, hm);
+        Some(EncodedPacket { id, body })
+    }
+
+    fn chunk_batch_start(&self, proto: u32) -> Option<EncodedPacket> {
+        // 1.20.2+ only; empty body.
+        let id: u8 = match proto {
+            764 | 765 | 766 => 0x0d,
+            _ => return None,
+        };
+        Some(EncodedPacket {
+            id,
+            body: BytesMut::new(),
+        })
+    }
+
+    fn chunk_batch_finished(&self, proto: u32, batch_size: i32) -> Option<EncodedPacket> {
+        let id: u8 = match proto {
+            764 | 765 | 766 => 0x0c,
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        VarInt(batch_size).encode(&mut body).ok()?;
+        Some(EncodedPacket { id, body })
+    }
+
+    fn start_wait_chunks_event(&self, proto: u32) -> Option<EncodedPacket> {
+        // GameEvent 13 "start waiting for level chunks" — 1.20.3+ only.
+        // Body = `[u8 event][f32 value]`.
+        let id: u8 = match proto {
+            765 => 0x20, // 1.20.3 / 1.20.4
+            766 => 0x22, // 1.20.5 / 1.20.6
+            _ => return None,
+        };
+        let mut body = BytesMut::new();
+        body.put_u8(13);
+        body.put_f32(0.0);
+        Some(EncodedPacket { id, body })
     }
 }

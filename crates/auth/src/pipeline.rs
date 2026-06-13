@@ -252,15 +252,34 @@ impl AuthPipeline {
                         .await
                         .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
 
-                let rsa_key_2 = self.rsa_key.clone();
-                let vt_enc = verify_token_enc.clone();
-                let decrypted_token =
-                    tokio::task::spawn_blocking(move || rsa_decrypt(&rsa_key_2, &vt_enc))
-                        .await
-                        .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
+                // 1.19 / 1.19.1 / 1.19.2 (proto 759-760) clients with a
+                // Mojang profile key send the SIGNED form of the
+                // Encryption Response: instead of an RSA-encrypted verify
+                // token they send `salt + signature`, which the
+                // connection layer cannot turn into an encrypted token —
+                // it surfaces here as an empty `verify_token_enc`. The
+                // nonce in that mode is bound by the profile signature
+                // (not re-verified here); session integrity still comes
+                // from the `hasJoined` server-hash check below, so skip
+                // the token comparison rather than fail auth. Non-empty
+                // tokens (all other versions, and 1.19 clients without a
+                // profile key) are validated as before.
+                if verify_token_enc.is_empty() {
+                    tracing::debug!(
+                        "encryption response used 1.19 signed-nonce form; \
+                         skipping verify-token comparison (session validated via hasJoined)"
+                    );
+                } else {
+                    let rsa_key_2 = self.rsa_key.clone();
+                    let vt_enc = verify_token_enc.clone();
+                    let decrypted_token =
+                        tokio::task::spawn_blocking(move || rsa_decrypt(&rsa_key_2, &vt_enc))
+                            .await
+                            .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
 
-                if decrypted_token.as_slice() != stored_token.as_slice() {
-                    return Err(AuthError::VerifyTokenMismatch);
+                    if decrypted_token.as_slice() != stored_token.as_slice() {
+                        return Err(AuthError::VerifyTokenMismatch);
+                    }
                 }
 
                 let ss_arr: [u8; 16] = shared_secret.as_slice().try_into().map_err(|_| {

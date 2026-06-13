@@ -238,6 +238,29 @@ impl<'a> LimboHandler<'a> {
         tracing::debug!(player = %username, "Sending HeldItemChange packet");
         self.send_held_item_change().await?;
 
+        // Vanilla join order (minecraft.wiki §Play, packet captures):
+        // Set Center Chunk → Chunk Data → … → Synchronize Player Position
+        // — i.e. CHUNKS BEFORE the position. The 1.18+ "Loading terrain"
+        // screen (`ReceivingLevelScreen`) only clears when the chunk at
+        // the player's position is already loaded when the position
+        // teleport arrives; sending the chunk AFTER the position left the
+        // client in WAITING_FOR_CHUNKS forever even though the chunk
+        // loaded (sounds/HUD work). So: center → [batch_start 764+] →
+        // chunk → [batch_finished 764+] → [GameEvent-13 765+] → position.
+        // Each helper returns None where the packet doesn't apply.
+        tracing::debug!(player = %username, "Sending Set Center Chunk + void chunk");
+        let proto = self.protocol_version;
+        let center = self.packets.set_center_chunk(proto);
+        self.send_built(center).await?;
+        let batch_start = self.packets.chunk_batch_start(proto);
+        self.send_built(batch_start).await?;
+        let chunk = self.packets.chunk_data(proto);
+        self.send_built(chunk).await?;
+        let batch_finished = self.packets.chunk_batch_finished(proto, 1);
+        self.send_built(batch_finished).await?;
+        let wait_chunks = self.packets.start_wait_chunks_event(proto);
+        self.send_built(wait_chunks).await?;
+
         tracing::debug!(player = %username, "Sending PlayerPosition packet");
         self.send_player_position(teleport_id).await?;
 
@@ -369,6 +392,54 @@ impl<'a> LimboHandler<'a> {
             // continuing into FinishConfiguration usually resyncs the
             // client. If it doesn't, the next read will time out and
             // the limbo's keepalive loop catches it.
+        }
+
+        // 1b. Proxy → client: ClientboundRegistryData (1.20.5+ / proto
+        // 766+). These clients clear their registries entering config and
+        // need the dimension_type / biome / damage_type / … sets sent
+        // explicitly or the JoinGame dimension reference fails to resolve
+        // and they disconnect. 1.20.2-1.20.4 (764/765) keep built-in
+        // defaults, so `bundle_for_proto` returns None for them and this
+        // block no-ops.
+        if let Some(bundle) = crate::net::registry_data::bundle_for_proto(proto) {
+            let id_registry = crate::packet_ids::cb_config(proto, "ClientboundRegistryData");
+            if id_registry == 0xFF {
+                tracing::warn!(
+                    proto,
+                    "limbo config phase: no ClientboundRegistryData id in registry — \
+                     client will likely reject JoinGame"
+                );
+            } else {
+                if crate::net::registry_data::bundle_is_fallback(proto) {
+                    tracing::warn!(
+                        proto,
+                        "limbo config phase: using best-effort 1.21.3 registry set for a \
+                         newer protocol — capture exact data if the client rejects it"
+                    );
+                }
+                match crate::net::registry_data::parse_bundle(bundle) {
+                    Ok(bodies) => {
+                        tracing::debug!(
+                            proto,
+                            registries = bodies.len(),
+                            "limbo config phase: sending RegistryData"
+                        );
+                        for body in bodies {
+                            crate::packet_io::write_typed_packet(
+                                &mut *self.stream,
+                                id_registry,
+                                body,
+                                proto,
+                                threshold,
+                            )
+                            .await?;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(proto, error = %e, "registry bundle parse failed");
+                    },
+                }
+            }
         }
 
         // 2. Proxy → client: ClientboundFinishConfiguration.
