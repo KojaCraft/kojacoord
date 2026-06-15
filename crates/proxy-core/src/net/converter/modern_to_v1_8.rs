@@ -276,12 +276,12 @@ pub fn convert_s2c(payload: Bytes, server_proto: u32) -> ConversionResult {
 
 fn dispatch_1_12(id: u8, body: Bytes) -> ConversionResult {
     match id {
-        V112_S2C_SPAWN_OBJECT => rewrap(body, V18_S2C_SPAWN_OBJECT),
-        V112_S2C_SPAWN_EXP_ORB => rewrap(body, V18_S2C_SPAWN_EXP_ORB),
-        V112_S2C_SPAWN_GLOBAL => rewrap(body, V18_S2C_SPAWN_GLOBAL),
-        V112_S2C_SPAWN_MOB => rewrap(body, V18_S2C_SPAWN_MOB),
+        V112_S2C_SPAWN_OBJECT => s2c_spawn_object(body),
+        V112_S2C_SPAWN_EXP_ORB => s2c_spawn_exp_orb(body),
+        V112_S2C_SPAWN_GLOBAL => s2c_spawn_global(body),
+        V112_S2C_SPAWN_MOB => s2c_spawn_mob(body),
         V112_S2C_SPAWN_PAINTING => rewrap(body, V18_S2C_SPAWN_PAINTING),
-        V112_S2C_SPAWN_PLAYER => rewrap(body, V18_S2C_SPAWN_PLAYER),
+        V112_S2C_SPAWN_PLAYER => s2c_spawn_player(body),
         V112_S2C_ANIMATION => rewrap(body, V18_S2C_ANIMATION),
         V112_S2C_STATISTICS => rewrap(body, V18_S2C_STATISTICS),
         V112_S2C_BLOCK_BREAK_ANIM => rewrap(body, V18_S2C_BLOCK_BREAK_ANIM),
@@ -299,15 +299,15 @@ fn dispatch_1_12(id: u8, body: Bytes) -> ConversionResult {
         V112_S2C_CONFIRM_TRANSACTION => rewrap(body, V18_S2C_CONFIRM_TRANSACTION),
         V112_S2C_CLOSE_WINDOW => rewrap(body, V18_S2C_CLOSE_WINDOW),
         V112_S2C_OPEN_WINDOW => rewrap(body, V18_S2C_OPEN_WINDOW),
-        V112_S2C_WINDOW_ITEMS => rewrap(body, V18_S2C_WINDOW_ITEMS),
+        V112_S2C_WINDOW_ITEMS => s2c_window_items(body),
         V112_S2C_WINDOW_PROPERTY => rewrap(body, V18_S2C_WINDOW_PROPERTY),
-        V112_S2C_SET_SLOT => rewrap(body, V18_S2C_SET_SLOT),
+        V112_S2C_SET_SLOT => s2c_set_slot(body),
         V112_S2C_SET_COOLDOWN => {
             tracing::debug!(target: "converter", "dropping SetCooldown (no 1.8 equivalent)");
             ConversionResult::Drop
         },
         V112_S2C_PLUGIN_MESSAGE => rewrap(body, V18_S2C_PLUGIN_MESSAGE),
-        V112_S2C_NAMED_SOUND => rewrap(body, V18_S2C_SOUND_EFFECT),
+        V112_S2C_NAMED_SOUND => s2c_named_sound(body),
         V112_S2C_DISCONNECT => rewrap(body, V18_S2C_DISCONNECT),
         V112_S2C_ENTITY_STATUS => rewrap(body, V18_S2C_ENTITY_STATUS),
         V112_S2C_EXPLOSION => rewrap(body, V18_S2C_EXPLOSION),
@@ -360,7 +360,7 @@ fn dispatch_1_12(id: u8, body: Bytes) -> ConversionResult {
         V112_S2C_ENTITY_METADATA => rewrap(body, V18_S2C_ENTITY_METADATA),
         V112_S2C_ATTACH_ENTITY => rewrap(body, V18_S2C_ATTACH_ENTITY),
         V112_S2C_ENTITY_VELOCITY => rewrap(body, V18_S2C_ENTITY_VELOCITY),
-        V112_S2C_ENTITY_EQUIPMENT => rewrap(body, V18_S2C_ENTITY_EQUIPMENT),
+        V112_S2C_ENTITY_EQUIPMENT => s2c_entity_equipment(body),
         V112_S2C_SET_EXPERIENCE => rewrap(body, V18_S2C_SET_EXPERIENCE),
         V112_S2C_UPDATE_HEALTH => rewrap(body, V18_S2C_UPDATE_HEALTH),
         V112_S2C_SCOREBOARD_OBJ => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
@@ -393,53 +393,474 @@ const V18_S2C_MAP_UNMAPPED: u8 = 0x34;
 // ── 1.16+ dispatchers (retained from previous implementation) ─────────────
 
 fn dispatch_1_16(id: u8, body: Bytes) -> ConversionResult {
-    // Not the focus of this rewrite; retained best-effort coverage.
     match id {
-        0x24 => s2c_join_game(body),
-        0x34 => s2c_player_pos_look(body),
-        0x0E => rewrap(body, V18_S2C_CHAT),
-        0x49 => rewrap(body, V18_S2C_UPDATE_HEALTH),
-        0x3A => s2c_respawn(body),
         0x1F => s2c_keep_alive_long_to_varint(body),
+        0x24 => s2c_join_game(body),
+        0x0E => s2c_1_16_chat(body),
+        0x39 => s2c_respawn(body),
+        0x34 => s2c_player_pos_look(body),
+
+        0x28 => s2c_entity_rel_move(body, false),
+        0x29 => s2c_entity_rel_move(body, true),
+        0x2A => rewrap(body, V18_S2C_ENTITY_LOOK),
+        0x56 => s2c_entity_teleport(body),
+        0x36 => rewrap(body, V18_S2C_DESTROY_ENTITIES),
+        0x3A => rewrap(body, V18_S2C_ENTITY_HEAD_LOOK),
+
+        0x0B => s2c_block_change(body),
+
+        0x15 => s2c_1_16_set_slot(body),
+        0x13 => s2c_1_16_window_items(body),
+        0x47 => s2c_1_16_entity_equipment(body),
+
+        0x49 => rewrap(body, V18_S2C_UPDATE_HEALTH),
         0x4E => rewrap(body, V18_S2C_TIME_UPDATE),
         0x53 => rewrap(body, V18_S2C_PLAYER_LIST_HEADER_FOOTER),
         0x46 => rewrap(body, V18_S2C_ENTITY_VELOCITY),
+        0x48 => rewrap(body, V18_S2C_SET_EXPERIENCE),
+        0x4A => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
+        0x4D => rewrap(body, V18_S2C_UPDATE_SCORE),
+        0x3F => rewrap(body, V18_S2C_HELD_ITEM_CHANGE),
+        0x30 => rewrap(body, V18_S2C_PLAYER_ABILITIES),
+        0x42 => rewrap(body, V18_S2C_SPAWN_POSITION),
+        0x0D => rewrap(body, V18_S2C_TAB_COMPLETE),
+        0x19 => rewrap(body, V18_S2C_DISCONNECT),
+        0x17 => rewrap(body, V18_S2C_PLUGIN_MESSAGE),
+        0x12 => rewrap(body, V18_S2C_CLOSE_WINDOW),
+        0x10 => rewrap(body, V18_S2C_CONFIRM_TRANSACTION),
+        0x14 => rewrap(body, V18_S2C_WINDOW_PROPERTY),
+        0x32 => rewrap(body, V18_S2C_PLAYER_LIST_ITEM),
+        0x1D => rewrap(body, V18_S2C_CHANGE_GAME_STATE),
+        0x05 => rewrap(body, V18_S2C_ANIMATION),
+        0x1A => rewrap(body, V18_S2C_ENTITY_STATUS),
+        0x44 => rewrap(body, V18_S2C_ENTITY_METADATA),
+        0x3D => rewrap(body, V18_S2C_WORLD_BORDER),
+        0x45 => rewrap(body, V18_S2C_ATTACH_ENTITY),
+        0x3E => rewrap(body, V18_S2C_CAMERA),
+        0x25 => rewrap(body, V18_S2C_MAP_UNMAPPED),
+        0x2C => rewrap(body, V18_S2C_PLAYER_ABILITIES),
+        0x41 => rewrap(body, V18_S2C_SERVER_DIFFICULTY),
+        0x4F => rewrap(body, V18_S2C_TITLE),
+        0x0A => rewrap(body, V18_S2C_BLOCK_ACTION),
+        0x09 => rewrap(body, V18_S2C_UPDATE_BLOCK_ENTITY),
+        0x08 => rewrap(body, V18_S2C_BLOCK_BREAK_ANIM),
+        0x07 => rewrap(body, V18_S2C_STATISTICS),
+        0x31 => rewrap(body, V18_S2C_COMBAT_EVENT),
+        0x21 => rewrap(body, V18_S2C_EFFECT),
+        0x22 => rewrap(body, V18_S2C_PARTICLE),
+        0x2E => rewrap(body, V18_S2C_OPEN_SIGN_EDITOR),
+        0x43 => rewrap(body, V18_S2C_DISPLAY_SCOREBOARD),
+        0x4C => rewrap(body, V18_S2C_TEAMS),
+        0x26 => rewrap(body, V18_S2C_RESOURCE_PACK),
+        0x59 => rewrap(body, V18_S2C_ENTITY_EFFECT),
+        0x37 => rewrap(body, V18_S2C_REMOVE_ENTITY_EFFECT),
+        0x55 => rewrap(body, V18_S2C_COLLECT_ITEM),
+        0x58 => rewrap(body, V18_S2C_ENTITY_PROPERTIES),
+        0x02 => rewrap(body, V18_S2C_SPAWN_GLOBAL),
+        0x04 => rewrap(body, V18_S2C_SPAWN_PAINTING),
+        0x2D => rewrap(body, V18_S2C_OPEN_WINDOW),
+
+        0x18 => s2c_1_16_named_sound(body),
+
+        0x0C => {
+            tracing::debug!(target: "converter", "dropping BossBar (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
         0x1C => {
             tracing::debug!(target: "converter", "dropping UnloadChunk (1.16, no 1.8 equivalent)");
             ConversionResult::Drop
         },
-        0x56 => s2c_entity_teleport(body),
-        0x27 => s2c_entity_rel_move(body, false),
-        0x28 => s2c_entity_rel_move(body, true),
-        0x36 => rewrap(body, V18_S2C_DESTROY_ENTITIES),
-        0x0B => s2c_block_change(body),
-        0x15 => rewrap(body, V18_S2C_SET_SLOT),
-        0x14 => rewrap(body, V18_S2C_WINDOW_ITEMS),
-        0x44 => rewrap(body, V18_S2C_ENTITY_METADATA),
-        0x47 => rewrap(body, V18_S2C_ENTITY_EQUIPMENT),
-        0x48 => rewrap(body, V18_S2C_SET_EXPERIENCE),
-        0x4B => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
-        0x4D => rewrap(body, V18_S2C_UPDATE_SCORE),
-        0x3F => rewrap(body, V18_S2C_HELD_ITEM_CHANGE),
+        0x16 => {
+            tracing::debug!(target: "converter", "dropping SetCooldown (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x35 => {
+            tracing::debug!(target: "converter", "dropping UnlockRecipes (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x2B => {
+            tracing::debug!(target: "converter", "dropping VehicleMove (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x23 => {
+            tracing::debug!(target: "converter", "dropping UpdateLight (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x4B => {
+            tracing::debug!(target: "converter", "dropping SetPassengers (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x57 => {
+            tracing::debug!(target: "converter", "dropping Advancements (1.16, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+
         _ => ConversionResult::Passthrough,
     }
 }
 
-fn dispatch_modern(id: u8, body: Bytes, _server_proto: u32) -> ConversionResult {
-    // Best-effort fall-through for 1.19+. The proxy's reference target is
-    // 1.12.2; this branch exists only to avoid breaking other paths.
+fn dispatch_modern(id: u8, body: Bytes, server_proto: u32) -> ConversionResult {
+    if server_proto >= 767 {
+        dispatch_1_21(id, body)
+    } else if server_proto >= 763 {
+        dispatch_1_20(id, body)
+    } else {
+        dispatch_1_19(id, body)
+    }
+}
+
+fn dispatch_1_19(id: u8, body: Bytes) -> ConversionResult {
     match id {
-        0x28 => s2c_join_game(body),
-        0x3E => s2c_player_pos_look(body),
-        0x23 => s2c_keep_alive_long_to_varint(body),
+        0x1E => s2c_keep_alive_long_to_varint(body),
+        0x23 => s2c_join_game(body),
+        0x36 => s2c_player_pos_look(body),
+        0x3B => s2c_respawn(body),
+        0x30 | 0x5F => s2c_modern_chat(body),
+        0x26 => s2c_entity_rel_move(body, false),
+        0x27 => s2c_entity_rel_move(body, true),
+        0x28 => rewrap(body, V18_S2C_ENTITY_LOOK),
+        0x63 => s2c_entity_teleport(body),
+        0x38 => rewrap(body, V18_S2C_DESTROY_ENTITIES),
+        0x3C => rewrap(body, V18_S2C_ENTITY_HEAD_LOOK),
+        0x09 => s2c_block_change(body),
+        0x13 => s2c_set_slot(body),
+        0x11 => s2c_window_items(body),
+        0x50 => s2c_entity_equipment(body),
+        0x52 => rewrap(body, V18_S2C_UPDATE_HEALTH),
+        0x59 => rewrap(body, V18_S2C_TIME_UPDATE),
+        0x60 => rewrap(body, V18_S2C_PLAYER_LIST_HEADER_FOOTER),
+        0x4F => rewrap(body, V18_S2C_ENTITY_VELOCITY),
+        0x51 => rewrap(body, V18_S2C_SET_EXPERIENCE),
+        0x53 => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
+        0x56 => rewrap(body, V18_S2C_UPDATE_SCORE),
+        0x47 => rewrap(body, V18_S2C_HELD_ITEM_CHANGE),
+        0x2F => rewrap(body, V18_S2C_PLAYER_ABILITIES),
+        0x4A => rewrap(body, V18_S2C_SPAWN_POSITION),
+        0x0E => rewrap(body, V18_S2C_TAB_COMPLETE),
+        0x17 => rewrap(body, V18_S2C_DISCONNECT),
+        0x15 => rewrap(body, V18_S2C_PLUGIN_MESSAGE),
+        0x10 => rewrap(body, V18_S2C_CLOSE_WINDOW),
+        0x12 => rewrap(body, V18_S2C_WINDOW_PROPERTY),
+        0x34 => rewrap(body, V18_S2C_PLAYER_LIST_ITEM),
+        0x1B => rewrap(body, V18_S2C_CHANGE_GAME_STATE),
+        0x03 => rewrap(body, V18_S2C_ANIMATION),
+        0x18 => rewrap(body, V18_S2C_ENTITY_STATUS),
+        0x4D => rewrap(body, V18_S2C_ENTITY_METADATA),
+        0x1D => rewrap(body, V18_S2C_WORLD_BORDER),
+        0x4E => rewrap(body, V18_S2C_ATTACH_ENTITY),
+        0x46 => rewrap(body, V18_S2C_CAMERA),
+        0x24 => rewrap(body, V18_S2C_MAP_UNMAPPED),
+        0x0B => rewrap(body, V18_S2C_SERVER_DIFFICULTY),
+        0x5A | 0x5B => rewrap(body, V18_S2C_TITLE),
+        0x08 => rewrap(body, V18_S2C_BLOCK_ACTION),
+        0x07 => rewrap(body, V18_S2C_UPDATE_BLOCK_ENTITY),
+        0x06 => rewrap(body, V18_S2C_BLOCK_BREAK_ANIM),
+        0x04 => rewrap(body, V18_S2C_STATISTICS),
+        0x31..=0x33 => rewrap(body, V18_S2C_COMBAT_EVENT),
+        0x20 => rewrap(body, V18_S2C_EFFECT),
+        0x21 => rewrap(body, V18_S2C_PARTICLE),
+        0x2C => rewrap(body, V18_S2C_OPEN_SIGN_EDITOR),
+        0x4C => rewrap(body, V18_S2C_DISPLAY_SCOREBOARD),
+        0x55 => rewrap(body, V18_S2C_TEAMS),
+        0x3A => rewrap(body, V18_S2C_RESOURCE_PACK),
+        0x66 => rewrap(body, V18_S2C_ENTITY_EFFECT),
+        0x39 => rewrap(body, V18_S2C_REMOVE_ENTITY_EFFECT),
+        0x62 => s2c_collect_item(body),
+        0x65 => rewrap(body, V18_S2C_ENTITY_PROPERTIES),
+        0x00 => s2c_spawn_object(body),
+        0x02 => s2c_spawn_player(body),
+        0x01 => s2c_spawn_exp_orb(body),
+        0x2B => rewrap(body, V18_S2C_OPEN_WINDOW),
+        0x3D => rewrap(body, V18_S2C_MULTI_BLOCK_CHANGE),
+        0x19 => rewrap(body, V18_S2C_EXPLOSION),
+        0x5D => rewrap(body, V18_S2C_SOUND_EFFECT),
+        0x0A => {
+            tracing::debug!(target: "converter", "dropping BossBar (1.19, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x1A => {
+            tracing::debug!(target: "converter", "dropping UnloadChunk (1.19)");
+            ConversionResult::Drop
+        },
+        0x14 => {
+            tracing::debug!(target: "converter", "dropping SetCooldown (1.19)");
+            ConversionResult::Drop
+        },
+        0x37 => {
+            tracing::debug!(target: "converter", "dropping UnlockRecipes (1.19)");
+            ConversionResult::Drop
+        },
+        0x29 => {
+            tracing::debug!(target: "converter", "dropping MoveVehicle (1.19)");
+            ConversionResult::Drop
+        },
+        0x22 => {
+            tracing::debug!(target: "converter", "dropping UpdateLight (1.19)");
+            ConversionResult::Drop
+        },
+        0x54 => {
+            tracing::debug!(target: "converter", "dropping SetPassengers (1.19)");
+            ConversionResult::Drop
+        },
+        0x64 => {
+            tracing::debug!(target: "converter", "dropping Advancements (1.19)");
+            ConversionResult::Drop
+        },
+        0x0F | 0x67 => {
+            tracing::debug!(target: "converter", "dropping Commands/Recipes (1.19)");
+            ConversionResult::Drop
+        },
+        0x0C | 0x0D | 0x2A | 0x2D | 0x2E | 0x3E | 0x3F | 0x40 | 0x43 | 0x44 | 0x45 | 0x48
+        | 0x49 | 0x4B | 0x57 | 0x58 | 0x5C | 0x5E | 0x61 => ConversionResult::Drop,
         _ => ConversionResult::Passthrough,
     }
+}
+
+fn dispatch_1_20(id: u8, body: Bytes) -> ConversionResult {
+    match id {
+        0x23 => s2c_keep_alive_long_to_varint(body),
+        0x28 => s2c_join_game(body),
+        0x3C => s2c_player_pos_look(body),
+        0x41 => s2c_respawn(body),
+        0x35 | 0x64 => s2c_modern_chat(body),
+        0x2B => s2c_entity_rel_move(body, false),
+        0x2C => s2c_entity_rel_move(body, true),
+        0x2D => rewrap(body, V18_S2C_ENTITY_LOOK),
+        0x68 => s2c_entity_teleport(body),
+        0x3E => rewrap(body, V18_S2C_DESTROY_ENTITIES),
+        0x42 => rewrap(body, V18_S2C_ENTITY_HEAD_LOOK),
+        0x0A => s2c_block_change(body),
+        0x14 => s2c_set_slot(body),
+        0x12 => s2c_window_items(body),
+        0x55 => s2c_entity_equipment(body),
+        0x57 => rewrap(body, V18_S2C_UPDATE_HEALTH),
+        0x5E => rewrap(body, V18_S2C_TIME_UPDATE),
+        0x65 => rewrap(body, V18_S2C_PLAYER_LIST_HEADER_FOOTER),
+        0x54 => rewrap(body, V18_S2C_ENTITY_VELOCITY),
+        0x56 => rewrap(body, V18_S2C_SET_EXPERIENCE),
+        0x58 => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
+        0x5B => rewrap(body, V18_S2C_UPDATE_SCORE),
+        0x4D => rewrap(body, V18_S2C_HELD_ITEM_CHANGE),
+        0x34 => rewrap(body, V18_S2C_PLAYER_ABILITIES),
+        0x50 => rewrap(body, V18_S2C_SPAWN_POSITION),
+        0x0F => rewrap(body, V18_S2C_TAB_COMPLETE),
+        0x1A => rewrap(body, V18_S2C_DISCONNECT),
+        0x17 => rewrap(body, V18_S2C_PLUGIN_MESSAGE),
+        0x11 => rewrap(body, V18_S2C_CLOSE_WINDOW),
+        0x13 => rewrap(body, V18_S2C_WINDOW_PROPERTY),
+        0x39 | 0x3A => rewrap(body, V18_S2C_PLAYER_LIST_ITEM),
+        0x1F => rewrap(body, V18_S2C_CHANGE_GAME_STATE),
+        0x04 => rewrap(body, V18_S2C_ANIMATION),
+        0x1C => rewrap(body, V18_S2C_ENTITY_STATUS),
+        0x52 => rewrap(body, V18_S2C_ENTITY_METADATA),
+        0x22 => rewrap(body, V18_S2C_WORLD_BORDER),
+        0x53 => rewrap(body, V18_S2C_ATTACH_ENTITY),
+        0x4C => rewrap(body, V18_S2C_CAMERA),
+        0x29 => rewrap(body, V18_S2C_MAP_UNMAPPED),
+        0x0C => rewrap(body, V18_S2C_SERVER_DIFFICULTY),
+        0x5F | 0x60 => rewrap(body, V18_S2C_TITLE),
+        0x09 => rewrap(body, V18_S2C_BLOCK_ACTION),
+        0x08 => rewrap(body, V18_S2C_UPDATE_BLOCK_ENTITY),
+        0x07 => rewrap(body, V18_S2C_BLOCK_BREAK_ANIM),
+        0x05 => rewrap(body, V18_S2C_STATISTICS),
+        0x36..=0x38 => rewrap(body, V18_S2C_COMBAT_EVENT),
+        0x25 => rewrap(body, V18_S2C_EFFECT),
+        0x26 => rewrap(body, V18_S2C_PARTICLE),
+        0x31 => rewrap(body, V18_S2C_OPEN_SIGN_EDITOR),
+        0x51 => rewrap(body, V18_S2C_DISPLAY_SCOREBOARD),
+        0x5A => rewrap(body, V18_S2C_TEAMS),
+        0x40 => rewrap(body, V18_S2C_RESOURCE_PACK),
+        0x6C => rewrap(body, V18_S2C_ENTITY_EFFECT),
+        0x3F => rewrap(body, V18_S2C_REMOVE_ENTITY_EFFECT),
+        0x67 => s2c_collect_item(body),
+        0x6A => rewrap(body, V18_S2C_ENTITY_PROPERTIES),
+        0x01 => s2c_spawn_object(body),
+        0x03 => s2c_spawn_player(body),
+        0x02 => s2c_spawn_exp_orb(body),
+        0x30 => rewrap(body, V18_S2C_OPEN_WINDOW),
+        0x43 => rewrap(body, V18_S2C_MULTI_BLOCK_CHANGE),
+        0x1D => rewrap(body, V18_S2C_EXPLOSION),
+        0x62 => rewrap(body, V18_S2C_SOUND_EFFECT),
+        0x0B => {
+            tracing::debug!(target: "converter", "dropping BossBar (1.20, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x1E => {
+            tracing::debug!(target: "converter", "dropping UnloadChunk (1.20)");
+            ConversionResult::Drop
+        },
+        0x15 => {
+            tracing::debug!(target: "converter", "dropping SetCooldown (1.20)");
+            ConversionResult::Drop
+        },
+        0x3D => {
+            tracing::debug!(target: "converter", "dropping UnlockRecipes (1.20)");
+            ConversionResult::Drop
+        },
+        0x2E => {
+            tracing::debug!(target: "converter", "dropping MoveVehicle (1.20)");
+            ConversionResult::Drop
+        },
+        0x27 => {
+            tracing::debug!(target: "converter", "dropping UpdateLight (1.20)");
+            ConversionResult::Drop
+        },
+        0x59 => {
+            tracing::debug!(target: "converter", "dropping SetPassengers (1.20)");
+            ConversionResult::Drop
+        },
+        0x69 => {
+            tracing::debug!(target: "converter", "dropping Advancements (1.20)");
+            ConversionResult::Drop
+        },
+        0x10 | 0x6D => {
+            tracing::debug!(target: "converter", "dropping Commands/Recipes (1.20)");
+            ConversionResult::Drop
+        },
+        0x00 | 0x0D | 0x0E | 0x16 | 0x18 | 0x19 | 0x1B | 0x20 | 0x21 | 0x2A | 0x2F | 0x32
+        | 0x33 | 0x44 | 0x45 | 0x46 | 0x47 | 0x48 | 0x49 | 0x4A | 0x4B | 0x4E | 0x4F | 0x5C
+        | 0x5D | 0x61 | 0x63 | 0x66 | 0x6B | 0x6E => ConversionResult::Drop,
+        _ => ConversionResult::Passthrough,
+    }
+}
+
+fn dispatch_1_21(id: u8, body: Bytes) -> ConversionResult {
+    match id {
+        0x26 => s2c_keep_alive_long_to_varint(body),
+        0x2B => s2c_join_game(body),
+        0x40 => s2c_player_pos_look(body),
+        0x47 => s2c_respawn(body),
+        0x39 | 0x6C => s2c_modern_chat(body),
+        0x2E => s2c_entity_rel_move(body, false),
+        0x2F => s2c_entity_rel_move(body, true),
+        0x30 => rewrap(body, V18_S2C_ENTITY_LOOK),
+        0x70 => s2c_entity_teleport(body),
+        0x42 => rewrap(body, V18_S2C_DESTROY_ENTITIES),
+        0x48 => rewrap(body, V18_S2C_ENTITY_HEAD_LOOK),
+        0x09 => s2c_block_change(body),
+        0x15 => s2c_set_slot(body),
+        0x13 => s2c_window_items(body),
+        0x5B => s2c_entity_equipment(body),
+        0x5D => rewrap(body, V18_S2C_UPDATE_HEALTH),
+        0x64 => rewrap(body, V18_S2C_TIME_UPDATE),
+        0x6D => rewrap(body, V18_S2C_PLAYER_LIST_HEADER_FOOTER),
+        0x5A => rewrap(body, V18_S2C_ENTITY_VELOCITY),
+        0x5C => rewrap(body, V18_S2C_SET_EXPERIENCE),
+        0x5E => rewrap(body, V18_S2C_SCOREBOARD_OBJ),
+        0x61 => rewrap(body, V18_S2C_UPDATE_SCORE),
+        0x53 => rewrap(body, V18_S2C_HELD_ITEM_CHANGE),
+        0x38 => rewrap(body, V18_S2C_PLAYER_ABILITIES),
+        0x56 => rewrap(body, V18_S2C_SPAWN_POSITION),
+        0x10 => rewrap(body, V18_S2C_TAB_COMPLETE),
+        0x1D => rewrap(body, V18_S2C_DISCONNECT),
+        0x19 => rewrap(body, V18_S2C_PLUGIN_MESSAGE),
+        0x12 => rewrap(body, V18_S2C_CLOSE_WINDOW),
+        0x14 => rewrap(body, V18_S2C_WINDOW_PROPERTY),
+        0x3D | 0x3E => rewrap(body, V18_S2C_PLAYER_LIST_ITEM),
+        0x22 => rewrap(body, V18_S2C_CHANGE_GAME_STATE),
+        0x03 => rewrap(body, V18_S2C_ANIMATION),
+        0x1F => rewrap(body, V18_S2C_ENTITY_STATUS),
+        0x58 => rewrap(body, V18_S2C_ENTITY_METADATA),
+        0x25 => rewrap(body, V18_S2C_WORLD_BORDER),
+        0x59 => rewrap(body, V18_S2C_ATTACH_ENTITY),
+        0x52 => rewrap(body, V18_S2C_CAMERA),
+        0x2C => rewrap(body, V18_S2C_MAP_UNMAPPED),
+        0x0B => rewrap(body, V18_S2C_SERVER_DIFFICULTY),
+        0x65 | 0x66 => rewrap(body, V18_S2C_TITLE),
+        0x08 => rewrap(body, V18_S2C_BLOCK_ACTION),
+        0x07 => rewrap(body, V18_S2C_UPDATE_BLOCK_ENTITY),
+        0x06 => rewrap(body, V18_S2C_BLOCK_BREAK_ANIM),
+        0x04 => rewrap(body, V18_S2C_STATISTICS),
+        0x3A..=0x3C => rewrap(body, V18_S2C_COMBAT_EVENT),
+        0x28 => rewrap(body, V18_S2C_EFFECT),
+        0x29 => rewrap(body, V18_S2C_PARTICLE),
+        0x34 => rewrap(body, V18_S2C_OPEN_SIGN_EDITOR),
+        0x57 => rewrap(body, V18_S2C_DISPLAY_SCOREBOARD),
+        0x60 => rewrap(body, V18_S2C_TEAMS),
+        0x46 => rewrap(body, V18_S2C_RESOURCE_PACK),
+        0x76 => rewrap(body, V18_S2C_ENTITY_EFFECT),
+        0x43 => rewrap(body, V18_S2C_REMOVE_ENTITY_EFFECT),
+        0x6F => s2c_collect_item(body),
+        0x75 => rewrap(body, V18_S2C_ENTITY_PROPERTIES),
+        0x01 => s2c_spawn_object(body),
+        0x02 => s2c_spawn_exp_orb(body),
+        0x33 => rewrap(body, V18_S2C_OPEN_WINDOW),
+        0x49 => rewrap(body, V18_S2C_MULTI_BLOCK_CHANGE),
+        0x20 => rewrap(body, V18_S2C_EXPLOSION),
+        0x68 => rewrap(body, V18_S2C_SOUND_EFFECT),
+        0x0A => {
+            tracing::debug!(target: "converter", "dropping BossBar (1.21, no 1.8 equivalent)");
+            ConversionResult::Drop
+        },
+        0x21 => {
+            tracing::debug!(target: "converter", "dropping UnloadChunk (1.21)");
+            ConversionResult::Drop
+        },
+        0x17 => {
+            tracing::debug!(target: "converter", "dropping SetCooldown (1.21)");
+            ConversionResult::Drop
+        },
+        0x41 => {
+            tracing::debug!(target: "converter", "dropping UnlockRecipes (1.21)");
+            ConversionResult::Drop
+        },
+        0x31 => {
+            tracing::debug!(target: "converter", "dropping MoveVehicle (1.21)");
+            ConversionResult::Drop
+        },
+        0x2A => {
+            tracing::debug!(target: "converter", "dropping UpdateLight (1.21)");
+            ConversionResult::Drop
+        },
+        0x5F => {
+            tracing::debug!(target: "converter", "dropping SetPassengers (1.21)");
+            ConversionResult::Drop
+        },
+        0x74 => {
+            tracing::debug!(target: "converter", "dropping Advancements (1.21)");
+            ConversionResult::Drop
+        },
+        0x11 | 0x77 => {
+            tracing::debug!(target: "converter", "dropping Commands/Recipes (1.21)");
+            ConversionResult::Drop
+        },
+        0x00 | 0x0C | 0x0D | 0x0E | 0x0F | 0x16 | 0x18 | 0x1A | 0x1B | 0x1E | 0x23 | 0x24
+        | 0x2D | 0x32 | 0x35 | 0x36 | 0x37 | 0x3F | 0x44 | 0x45 | 0x4A | 0x4B | 0x4C | 0x4D
+        | 0x4E | 0x4F | 0x50 | 0x51 | 0x54 | 0x55 | 0x62 | 0x63 | 0x67 | 0x69 | 0x6A | 0x6B
+        | 0x6E | 0x71 | 0x72 | 0x73 | 0x78 | 0x79 | 0x7A | 0x7B => ConversionResult::Drop,
+        _ => ConversionResult::Passthrough,
+    }
+}
+
+/// 1.19+ System Chat / Player Chat → 1.8 Chat
+/// System Chat (1.19.3+): String content, bool overlay
+/// Player Chat: complex signed format — we extract the decorated message only
+fn s2c_modern_chat(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(content) = r.string() else {
+        return ConversionResult::Passthrough;
+    };
+    let _overlay = r.u8();
+    let mut out = BytesMut::new();
+    content.encode(&mut out).unwrap();
+    out.put_u8(0);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_CHAT, &out)])
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn rewrap(body: Bytes, new_id: u8) -> ConversionResult {
     ConversionResult::Converted(vec![build_payload(new_id, &body)])
+}
+
+fn fixed_point_32(v: f64) -> i32 {
+    if v.is_nan() {
+        return 0;
+    }
+    let lo = i32::MIN as f64 / 32.0;
+    let hi = i32::MAX as f64 / 32.0;
+    let clamped = v.clamp(lo, hi);
+    (clamped * 32.0).round() as i32
 }
 
 /// 1.12.2 JoinGame: i32 eid, u8 gamemode, i32 dimension, u8 difficulty,
@@ -529,8 +950,9 @@ fn s2c_keep_alive_long_to_varint(body: Bytes) -> ConversionResult {
     let Some(id) = r.i64() else {
         return ConversionResult::Passthrough;
     };
+    let mixed = (id ^ (id >> 32)) as i32;
     let mut out = BytesMut::new();
-    VarInt(id as i32).encode(&mut out).unwrap();
+    VarInt(mixed).encode(&mut out).unwrap();
     ConversionResult::Converted(vec![build_payload(V18_S2C_KEEP_ALIVE, &out)])
 }
 
@@ -627,9 +1049,9 @@ fn s2c_entity_teleport(body: Bytes) -> ConversionResult {
 
     let mut out = BytesMut::new();
     VarInt(eid).encode(&mut out).unwrap();
-    out.put_i32((x * 32.0).round() as i32);
-    out.put_i32((y * 32.0).round() as i32);
-    out.put_i32((z * 32.0).round() as i32);
+    out.put_i32(fixed_point_32(x));
+    out.put_i32(fixed_point_32(y));
+    out.put_i32(fixed_point_32(z));
     out.put_u8(yaw);
     out.put_u8(pitch);
     out.put_u8(on_ground);
@@ -668,6 +1090,549 @@ fn unpack_position(packed: i64) -> (i32, i32, i32) {
     }
     let z = ((packed << 38) >> 38) as i32;
     (x, y, z)
+}
+
+fn pack_position_legacy(x: i32, y: i32, z: i32) -> i64 {
+    (((x as i64) & 0x3FF_FFFF) << 38) | (((y as i64) & 0xFFF) << 26) | ((z as i64) & 0x3FF_FFFF)
+}
+
+/// 1.12.2 SpawnObject: VarInt eid, UUID, i32 type, f64 x/y/z, i8 yaw/pitch, i32 data, i16 vX/vY/vZ
+/// 1.8 SpawnObject: VarInt eid, UUID, i8 type, f64 x/y/z, i8 yaw/pitch, i32 data, i16 vX/vY/vZ
+/// Only the type field changes: VarInt → i8 (truncate).
+fn s2c_spawn_object(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_hi) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_lo) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(obj_type) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let yaw = r.u8().unwrap_or(0);
+    let pitch = r.u8().unwrap_or(0);
+    let Some(data) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let vx = r.i16().unwrap_or(0);
+    let vy = r.i16().unwrap_or(0);
+    let vz = r.i16().unwrap_or(0);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i64(uuid_hi);
+    out.put_i64(uuid_lo);
+    out.put_i8(obj_type as i8);
+    out.put_f64(x);
+    out.put_f64(y);
+    out.put_f64(z);
+    out.put_u8(yaw);
+    out.put_u8(pitch);
+    out.put_i32(data);
+    out.put_i16(vx);
+    out.put_i16(vy);
+    out.put_i16(vz);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_OBJECT, &out)])
+}
+
+/// 1.12.2 SpawnExpOrb: VarInt eid, f64 x/y/z, i16 count
+/// 1.8 SpawnExpOrb: VarInt eid, i32 x/y/z (fixed-point *32), i16 count
+fn s2c_spawn_exp_orb(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let count = r.i16().unwrap_or(1);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i32(fixed_point_32(x));
+    out.put_i32(fixed_point_32(y));
+    out.put_i32(fixed_point_32(z));
+    out.put_i16(count);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_EXP_ORB, &out)])
+}
+
+/// 1.12.2 SpawnGlobalEntity: VarInt eid, u8 type, f64 x/y/z
+/// 1.8 SpawnGlobalEntity: VarInt eid, u8 type, i32 x/y/z (fixed-point *32)
+fn s2c_spawn_global(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let typ = r.u8().unwrap_or(1);
+    let Some(x) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_u8(typ);
+    out.put_i32(fixed_point_32(x));
+    out.put_i32(fixed_point_32(y));
+    out.put_i32(fixed_point_32(z));
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_GLOBAL, &out)])
+}
+
+/// 1.12.2 SpawnMob: VarInt eid, UUID, VarInt type, f64 x/y/z, i8 yaw/pitch/headPitch, i16 vX/vY/vZ, Metadata
+/// 1.8 SpawnMob: VarInt eid, UUID, u8 type, i32 x/y/z (fixed-point), i8 yaw/pitch/headPitch, i16 vX/vY/vZ, Metadata
+fn s2c_spawn_mob(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_hi) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_lo) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(mob_type) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let yaw = r.u8().unwrap_or(0);
+    let pitch = r.u8().unwrap_or(0);
+    let head_pitch = r.u8().unwrap_or(0);
+    let vx = r.i16().unwrap_or(0);
+    let vy = r.i16().unwrap_or(0);
+    let vz = r.i16().unwrap_or(0);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i64(uuid_hi);
+    out.put_i64(uuid_lo);
+    out.put_u8(mob_type as u8);
+    out.put_i32(fixed_point_32(x));
+    out.put_i32(fixed_point_32(y));
+    out.put_i32(fixed_point_32(z));
+    out.put_u8(yaw);
+    out.put_u8(pitch);
+    out.put_u8(head_pitch);
+    out.put_i16(vx);
+    out.put_i16(vy);
+    out.put_i16(vz);
+    out.put_u8(0x7F);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_MOB, &out)])
+}
+
+/// 1.12.2 SpawnPlayer: VarInt eid, UUID, f64 x/y/z, i8 yaw/pitch, Metadata
+/// 1.8 SpawnPlayer: VarInt eid, UUID, i32 x/y/z (fixed-point), i8 yaw/pitch, i16 currentItem, Metadata
+fn s2c_spawn_player(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_hi) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(uuid_lo) = r.i64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.f64() else {
+        return ConversionResult::Passthrough;
+    };
+    let yaw = r.u8().unwrap_or(0);
+    let pitch = r.u8().unwrap_or(0);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i64(uuid_hi);
+    out.put_i64(uuid_lo);
+    out.put_i32(fixed_point_32(x));
+    out.put_i32(fixed_point_32(y));
+    out.put_i32(fixed_point_32(z));
+    out.put_u8(yaw);
+    out.put_u8(pitch);
+    out.put_i16(0);
+    out.put_u8(0x7F);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SPAWN_PLAYER, &out)])
+}
+
+/// 1.12.2 EntityEquipment: VarInt eid, VarInt slot, Slot
+/// 1.8 EntityEquipment: VarInt eid, i16 slot, legacy_slot
+fn s2c_entity_equipment(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_data) = r.slot() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let legacy_slot = super::items::modern_slot_to_legacy(&slot_data);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i16(slot as i16);
+    match legacy_slot.0 {
+        None => {
+            out.put_i16(-1);
+        },
+        Some(d) => {
+            out.put_i16(d.item_id);
+            out.put_i8(d.count);
+            out.put_i16(d.damage);
+            match &d.nbt {
+                Some(nbt) => {
+                    nbt.encode(&mut out).unwrap();
+                },
+                None => {
+                    VarInt(0).encode(&mut out).unwrap();
+                },
+            }
+        },
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_ENTITY_EQUIPMENT, &out)])
+}
+
+/// 1.12.2 WindowItems: u8 windowId, VarInt count, [Slot]
+/// 1.8 WindowItems: u8 windowId, i16 count, [legacy_slot]
+fn s2c_window_items(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(window_id) = r.u8() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(count) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let mut slots = Vec::new();
+    for _ in 0..count {
+        let Some(slot) = r.slot() else {
+            return ConversionResult::Passthrough;
+        };
+        slots.push(slot);
+    }
+
+    let mut out = BytesMut::new();
+    out.put_u8(window_id);
+    out.put_i16(count as i16);
+    for slot in &slots {
+        let legacy = super::items::modern_slot_to_legacy(slot);
+        match legacy.0 {
+            None => {
+                out.put_i16(-1);
+            },
+            Some(d) => {
+                out.put_i16(d.item_id);
+                out.put_i8(d.count);
+                out.put_i16(d.damage);
+                match &d.nbt {
+                    Some(nbt) => {
+                        nbt.encode(&mut out).unwrap();
+                    },
+                    None => {
+                        VarInt(0).encode(&mut out).unwrap();
+                    },
+                }
+            },
+        }
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_WINDOW_ITEMS, &out)])
+}
+
+/// 1.12.2 SetSlot: u8 windowId, VarInt slot, Slot
+/// 1.8 SetSlot: u8 windowId, i16 slot, legacy_slot
+fn s2c_set_slot(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(window_id) = r.u8() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_idx) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_data) = r.slot() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let legacy = super::items::modern_slot_to_legacy(&slot_data);
+
+    let mut out = BytesMut::new();
+    out.put_u8(window_id);
+    out.put_i16(slot_idx as i16);
+    match legacy.0 {
+        None => {
+            out.put_i16(-1);
+        },
+        Some(d) => {
+            out.put_i16(d.item_id);
+            out.put_i8(d.count);
+            out.put_i16(d.damage);
+            match &d.nbt {
+                Some(nbt) => {
+                    nbt.encode(&mut out).unwrap();
+                },
+                None => {
+                    VarInt(0).encode(&mut out).unwrap();
+                },
+            }
+        },
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SET_SLOT, &out)])
+}
+
+/// 1.12.2 NamedSoundEffect: String name, VarInt category, i32 x/y/z (fixed*8), f32 volume, u8 pitch
+/// 1.8 NamedSoundEffect: String name, u8 category, i32 x/y/z (fixed*8), u8 volume, u8 pitch
+fn s2c_named_sound(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(name) = r.string() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(category) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(volume_f) = r.f32() else {
+        return ConversionResult::Passthrough;
+    };
+    let pitch = r.u8().unwrap_or(63);
+
+    let volume_u8 = (volume_f * 63.0).round().clamp(0.0, 255.0) as u8;
+
+    let mut out = BytesMut::new();
+    name.encode(&mut out).unwrap();
+    out.put_u8(category as u8);
+    out.put_i32(x);
+    out.put_i32(y);
+    out.put_i32(z);
+    out.put_u8(volume_u8);
+    out.put_u8(pitch);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SOUND_EFFECT, &out)])
+}
+
+// ── 1.16.5-specific S2C converters (used by dispatch_1_16) ──────────────────
+
+/// 1.16.5 Chat: String json + u8 position + UUID sender (16 bytes)
+/// 1.8 Chat: String json + u8 position
+fn s2c_1_16_chat(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(json) = r.string() else {
+        return ConversionResult::Passthrough;
+    };
+    let position = r.u8().unwrap_or(0);
+    // Discard the 16-byte sender UUID
+
+    let mut out = BytesMut::new();
+    json.encode(&mut out).unwrap();
+    out.put_u8(position);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_CHAT, &out)])
+}
+
+/// 1.16.5 SetSlot: u8 windowId, VarInt slot, Slot (modern format)
+/// 1.8 SetSlot: u8 windowId, i16 slot, legacy_slot
+fn s2c_1_16_set_slot(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(window_id) = r.u8() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_idx) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_data) = r.slot() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let legacy = super::items::modern_slot_to_legacy(&slot_data);
+
+    let mut out = BytesMut::new();
+    out.put_u8(window_id);
+    out.put_i16(slot_idx as i16);
+    match legacy.0 {
+        None => {
+            out.put_i16(-1);
+        },
+        Some(d) => {
+            out.put_i16(d.item_id);
+            out.put_i8(d.count);
+            out.put_i16(d.damage);
+            match &d.nbt {
+                Some(nbt) => {
+                    nbt.encode(&mut out).unwrap();
+                },
+                None => {
+                    VarInt(0).encode(&mut out).unwrap();
+                },
+            }
+        },
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SET_SLOT, &out)])
+}
+
+/// 1.16.5 WindowItems: u8 windowId, VarInt count, [Slot]
+/// 1.8 WindowItems: u8 windowId, i16 count, [legacy_slot]
+fn s2c_1_16_window_items(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(window_id) = r.u8() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(count) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let mut slots = Vec::new();
+    for _ in 0..count {
+        let Some(slot) = r.slot() else {
+            return ConversionResult::Passthrough;
+        };
+        slots.push(slot);
+    }
+
+    let mut out = BytesMut::new();
+    out.put_u8(window_id);
+    out.put_i16(count as i16);
+    for slot in &slots {
+        let legacy = super::items::modern_slot_to_legacy(slot);
+        match legacy.0 {
+            None => {
+                out.put_i16(-1);
+            },
+            Some(d) => {
+                out.put_i16(d.item_id);
+                out.put_i8(d.count);
+                out.put_i16(d.damage);
+                match &d.nbt {
+                    Some(nbt) => {
+                        nbt.encode(&mut out).unwrap();
+                    },
+                    None => {
+                        VarInt(0).encode(&mut out).unwrap();
+                    },
+                }
+            },
+        }
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_WINDOW_ITEMS, &out)])
+}
+
+/// 1.16.5 EntityEquipment: VarInt eid, VarInt slot, Slot
+/// 1.8 EntityEquipment: VarInt eid, i16 slot, legacy_slot
+fn s2c_1_16_entity_equipment(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(eid) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(slot_data) = r.slot() else {
+        return ConversionResult::Passthrough;
+    };
+
+    let legacy = super::items::modern_slot_to_legacy(&slot_data);
+
+    let mut out = BytesMut::new();
+    VarInt(eid).encode(&mut out).unwrap();
+    out.put_i16(slot as i16);
+    match legacy.0 {
+        None => {
+            out.put_i16(-1);
+        },
+        Some(d) => {
+            out.put_i16(d.item_id);
+            out.put_i8(d.count);
+            out.put_i16(d.damage);
+            match &d.nbt {
+                Some(nbt) => {
+                    nbt.encode(&mut out).unwrap();
+                },
+                None => {
+                    VarInt(0).encode(&mut out).unwrap();
+                },
+            }
+        },
+    }
+    ConversionResult::Converted(vec![build_payload(V18_S2C_ENTITY_EQUIPMENT, &out)])
+}
+
+/// 1.16.5 NamedSoundEffect: String name, VarInt category, i32 x/y/z (fixed*8), f32 volume, u8 pitch
+/// 1.8 NamedSoundEffect: String name, u8 category, i32 x/y/z (fixed*8), u8 volume, u8 pitch
+fn s2c_1_16_named_sound(body: Bytes) -> ConversionResult {
+    let mut r = super::safe::Reader::new(body);
+    let Some(name) = r.string() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(category) = r.varint() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(x) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(y) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(z) = r.i32() else {
+        return ConversionResult::Passthrough;
+    };
+    let Some(volume_f) = r.f32() else {
+        return ConversionResult::Passthrough;
+    };
+    let pitch = r.u8().unwrap_or(63);
+
+    let volume_u8 = (volume_f * 63.0).round().clamp(0.0, 255.0) as u8;
+
+    let mut out = BytesMut::new();
+    name.encode(&mut out).unwrap();
+    out.put_u8(category as u8);
+    out.put_i32(x);
+    out.put_i32(y);
+    out.put_i32(z);
+    out.put_u8(volume_u8);
+    out.put_u8(pitch);
+    ConversionResult::Converted(vec![build_payload(V18_S2C_SOUND_EFFECT, &out)])
 }
 
 // ── items.rs helper bridge ────────────────────────────────────────────────

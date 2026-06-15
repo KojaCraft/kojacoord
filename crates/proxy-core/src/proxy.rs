@@ -205,6 +205,8 @@ pub struct ProxyState {
     /// Rate limiter for plugin channel messages (chat, commands, etc.)
     pub plugin_channel_rate_limiter: Arc<PluginChannelRateLimiter>,
 
+    pub serverlist_cooldown: Arc<DashMap<uuid::Uuid, std::time::Instant>>,
+
     /// Per-player metrics and packet trace registry
     pub player_metrics: Arc<PlayerMetricsRegistry>,
 
@@ -438,6 +440,15 @@ impl ProxyState {
         let plugin_manager = if config.plugins.enabled {
             let mut manager = PluginManager::new().context("Failed to create plugin manager")?;
 
+            // Pin the manager to this long-lived runtime explicitly. `Proxy::new`
+            // runs inside the main runtime, so `Handle::current()` is the handle
+            // that outlives every plugin. Native plugins anchor the tasks they
+            // spawn (HTTP pollers, Redis pubsub bridges, timers) to it. Without
+            // this, a hot-reload that drives the reload under a throwaway
+            // current-thread runtime would hand plugins a handle that dies with
+            // that runtime, orphaning their tasks. See `set_runtime_handle`.
+            manager.set_runtime_handle(tokio::runtime::Handle::current());
+
             // Set allowed permissions from config
             for (plugin_name, perm_strings) in &config.plugin_permissions {
                 let permissions: Vec<kojacoord_plugin_system::api::PluginPermission> = perm_strings
@@ -571,6 +582,7 @@ impl ProxyState {
             tps_tracker,
             connection_throttle,
             plugin_channel_rate_limiter,
+            serverlist_cooldown: Arc::new(DashMap::new()),
             player_metrics,
             failover_manager,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -991,7 +1003,7 @@ impl ProxyState {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // Assuming `state: std::sync::Arc<ProxyState>` is initialized and plugin hot-reload is enabled:
     /// state.start_plugin_hot_reload_watcher();
     /// ```

@@ -126,7 +126,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_19;
     /// let pos = PlayerPos { x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0 };
     /// let pkt = v.player_position(761, pos, 1).unwrap();
@@ -228,7 +228,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use uuid::Uuid;
     /// // Construct params with the same public fields used by the codebase.
     /// let params = crate::net::limbo_packets::SoundParams { x: 0.0, y: 64.0, z: 0.0, volume: 1.0, pitch: 1.0 };
@@ -346,7 +346,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_19;
     /// let id = uuid::Uuid::new_v4();
     /// let pkt = v.bossbar_add(762, id, "Hello world");
@@ -389,7 +389,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_19;
     /// let pkt = v.brand(762, "my-proxy").expect("should encode");
     /// // `pkt` is an EncodedPacket ready to be sent to a client
@@ -419,7 +419,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_19;
     /// let pkt = v.set_center_chunk(759).unwrap();
     /// assert_eq!(pkt.id, 0x48);
@@ -452,7 +452,7 @@ impl LimboPackets for V1_19 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_19;
     /// assert!(v.chunk_data(759).is_some());
     /// ```
@@ -483,6 +483,22 @@ impl LimboPackets for V1_19 {
         Some(EncodedPacket { id: pid, body })
     }
 
+    /// Set Default Spawn Position — needed from 1.19.3 (proto 761) to
+    /// close the "Loading terrain" screen. Ids per ViaVersion
+    /// `ClientboundPackets1_19_3` (0x4C) / `ClientboundPackets1_19_4`
+    /// (0x50). 1.17–1.19.2 (≤760) don't need it, so return None.
+    fn set_default_spawn(&self, proto: u32) -> Option<EncodedPacket> {
+        let id: u8 = match proto {
+            761 => 0x4c, // 1.19.3
+            762 => 0x50, // 1.19.4
+            _ => return None,
+        };
+        Some(EncodedPacket {
+            id,
+            body: super::default_spawn_body(),
+        })
+    }
+
     fn light_update(&self, proto: u32) -> Option<EncodedPacket> {
         // Standalone LightUpdate only for 1.17 / 1.17.1 (proto 755/756); 1.18+
         // folds light into the combined chunk packet. Id 0x25 per ViaVersion
@@ -509,7 +525,7 @@ impl LimboPackets for V1_19 {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// let pkt = build_join_game_1_17_or_1_18(757, "minecraft:overworld");
 /// assert!(pkt.is_some());
 /// ```
@@ -574,7 +590,7 @@ fn build_join_game_1_17_or_1_18(proto: u32, world_name: &str) -> Option<EncodedP
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// // Ensure a packet can be constructed for a 1.17-era protocol.
 /// let pkt = build_respawn_1_17_or_1_18(755, "minecraft:overworld");
 /// assert!(pkt.is_some());

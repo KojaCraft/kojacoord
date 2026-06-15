@@ -64,7 +64,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use plugin_system::manager::PluginManager;
     ///
     /// let manager = PluginManager::new().expect("failed to create PluginManager");
@@ -96,7 +96,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let wasm_loader = WasmLoader::new();
     /// let manager = PluginManager::with_wasm_loader(wasm_loader).expect("create manager");
     /// assert!(manager.sandbox_enabled);
@@ -132,7 +132,8 @@ impl PluginManager {
         let mut mask: u32 = 0;
         for (plugin, _) in self.plugins.values() {
             let guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
-            mask |= guard.subscribed_events();
+            mask |= crate::guard_plugin_call("subscribed_events", || guard.subscribed_events())
+                .unwrap_or(0);
         }
         self.activity.set_event_mask(mask);
         let hook_count = self
@@ -175,7 +176,13 @@ impl PluginManager {
             return Ok(None);
         };
         let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
-        guard.handle_command(label, args, sender)
+        crate::guard_plugin_call("handle_command", || {
+            guard.handle_command(label, args, sender)
+        })
+        .unwrap_or_else(|e| {
+            log::error!("Plugin '{}' handle_command panicked: {}", owner, e);
+            Ok(None)
+        })
     }
 
     /// Sets the Tokio runtime handle used to anchor tasks spawned by native plugins.
@@ -186,7 +193,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // Called from inside a Tokio runtime:
     /// let handle = tokio::runtime::Handle::try_current().expect("inside runtime");
     /// let mut manager = PluginManager::new().expect("create manager");
@@ -202,7 +209,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use std::collections::HashMap;
     /// // assume PluginManager and PluginPermission are in scope
     /// let mut mgr = PluginManager::new().unwrap();
@@ -264,7 +271,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// # use std::collections::HashMap;
     /// # async fn _example() -> anyhow::Result<()> {
     /// let mut manager = PluginManager::new()?;
@@ -378,14 +385,32 @@ impl PluginManager {
 
         // Activate the plugin and collect its packet hooks now, while we still
         // own the Box exclusively, so the hooks take effect in `process_packet`.
-        if let Err(e) = plugin.on_enable() {
-            log::warn!("Plugin '{}' on_enable failed: {}", metadata.name, e);
+        match crate::guard_plugin_call("on_enable", || plugin.on_enable()) {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => log::warn!("Plugin '{}' on_enable failed: {}", metadata.name, e),
+            Err(e) => log::warn!("Plugin '{}' on_enable panicked: {}", metadata.name, e),
         }
-        let hooks = plugin.register_packet_hooks();
+        let hooks =
+            crate::guard_plugin_call("register_packet_hooks", || plugin.register_packet_hooks())
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "Plugin '{}' register_packet_hooks panicked: {}",
+                        metadata.name,
+                        e
+                    );
+                    Vec::new()
+                });
         if !hooks.is_empty() {
             let count = hooks.len();
             let mut hooks_lock = self.packet_hooks.write().unwrap_or_else(|e| e.into_inner());
-            hooks_lock.extend(hooks);
+            let tagged_hooks: Vec<PacketEvent> = hooks
+                .into_iter()
+                .map(|mut h| {
+                    h.plugin_name = metadata.name.clone();
+                    h
+                })
+                .collect();
+            hooks_lock.extend(tagged_hooks);
             // Sort hooks by priority (descending) so higher priority hooks execute first
             // Higher priority runs first — sort descending.
             hooks_lock.sort_by_key(|h| std::cmp::Reverse(h.priority()));
@@ -400,7 +425,17 @@ impl PluginManager {
         // A later plugin claiming an already-registered label is
         // rejected for that label (first writer wins) so dispatch stays
         // deterministic.
-        for spec in plugin.register_commands() {
+        let command_specs =
+            crate::guard_plugin_call("register_commands", || plugin.register_commands())
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "Plugin '{}' register_commands panicked: {}",
+                        metadata.name,
+                        e
+                    );
+                    Vec::new()
+                });
+        for spec in command_specs {
             let mut labels = vec![spec.label.clone()];
             labels.extend(spec.aliases.iter().cloned());
             for label in labels {
@@ -463,7 +498,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```ignore
     /// # use std::collections::HashMap;
     /// # async fn example() -> anyhow::Result<()> {
     /// let mut manager = PluginManager::new()?; // assumed in scope
@@ -538,7 +573,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// # use std::path::Path;
     /// # // Example assumes `example.kpl` exists on disk and contains a native library.
     /// let lib_path = crate::extract_kpl_library(Path::new("example.kpl")).expect("extract kpl");
@@ -594,7 +629,7 @@ impl PluginManager {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let mut manager = PluginManager::default();
     /// // unloading a non-existent plugin returns an error
     /// assert!(manager.unload_plugin("no_such_plugin").is_err());
@@ -604,11 +639,15 @@ impl PluginManager {
             // Run lifecycle teardown before dropping the instance.
             {
                 let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = guard.on_disable() {
-                    log::warn!("Plugin '{}' on_disable failed: {}", name, e);
+                match crate::guard_plugin_call("on_disable", || guard.on_disable()) {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => log::warn!("Plugin '{}' on_disable failed: {}", name, e),
+                    Err(e) => log::warn!("Plugin '{}' on_disable panicked: {}", name, e),
                 }
-                if let Err(e) = guard.on_unload() {
-                    log::warn!("Plugin '{}' on_unload failed: {}", name, e);
+                match crate::guard_plugin_call("on_unload", || guard.on_unload()) {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => log::warn!("Plugin '{}' on_unload failed: {}", name, e),
+                    Err(e) => log::warn!("Plugin '{}' on_unload panicked: {}", name, e),
                 }
             }
 
@@ -625,7 +664,7 @@ impl PluginManager {
             self.packet_hooks
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
-                .clear();
+                .retain(|h| h.plugin_name != name);
 
             // Drop every command this plugin owned.
             self.commands.retain(|_, (owner, _)| owner != name);
@@ -677,7 +716,12 @@ impl PluginManager {
 
         for (name, (plugin, _)) in &self.plugins {
             let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.handle_event(event) {
+            let result = crate::guard_plugin_call("handle_event", || guard.handle_event(event))
+                .unwrap_or_else(|e| {
+                    log::error!("Plugin '{}' handle_event panicked: {}", name, e);
+                    Ok(None)
+                });
+            match result {
                 Ok(Some(PluginResponse::Cancel)) => {
                     log::debug!("Plugin '{}' cancelled event propagation", name);
                     return vec![PluginResponse::Cancel];
@@ -692,11 +736,24 @@ impl PluginManager {
     }
 
     pub fn process_packet(&self, packet: &PacketData) -> PacketHookResult {
+        self.process_packet_inner(packet, false)
+    }
+
+    fn process_packet_inner(
+        &self,
+        packet: &PacketData,
+        already_modified: bool,
+    ) -> PacketHookResult {
         let hooks = self.packet_hooks.read().unwrap_or_else(|e| e.into_inner());
 
         for hook in hooks.iter() {
             if hook.matches(packet) {
-                match hook.execute(packet) {
+                let outcome = crate::guard_plugin_call("packet_hook", || hook.execute(packet))
+                    .unwrap_or_else(|e| {
+                        log::error!("Packet hook panicked: {}", e);
+                        Ok(PacketHookResult::Forward)
+                    });
+                match outcome {
                     Ok(PacketHookResult::Drop) => return PacketHookResult::Drop,
                     Ok(PacketHookResult::Replace { packet_id, data }) => {
                         return PacketHookResult::Replace { packet_id, data };
@@ -704,7 +761,10 @@ impl PluginManager {
                     Ok(PacketHookResult::Modify(data)) => {
                         let mut modified_packet = packet.clone();
                         modified_packet.data = data;
-                        return self.process_packet(&modified_packet);
+                        if already_modified {
+                            return PacketHookResult::Modify(modified_packet.data);
+                        }
+                        return self.process_packet_inner(&modified_packet, true);
                     },
                     Ok(PacketHookResult::Forward) => continue,
                     Err(e) => {

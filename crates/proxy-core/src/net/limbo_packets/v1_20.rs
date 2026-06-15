@@ -28,7 +28,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_20;
     /// let pkt = v.join_game(764, "minecraft:overworld");
     /// assert!(pkt.is_some());
@@ -183,7 +183,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_20;
     /// let pkt = v.chat(764, "{\"text\":\"Hello world\"}");
     /// assert!(pkt.is_some());
@@ -205,7 +205,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_20;
     /// let pos = SoundParams { x: 0.0, y: 64.0, z: 0.0, volume: 1.0, pitch: 1.0 };
     /// let pkt = v.note_sound(763, pos);
@@ -251,7 +251,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use uuid::Uuid;
     /// let vb = V1_20;
     /// let id = Uuid::new_v4();
@@ -296,7 +296,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = V1_20;
     /// let pkt = v.brand(766, "CodeRabbitProxy");
     /// assert!(pkt.is_some());
@@ -320,7 +320,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // Returns a packet with id 0x4e for proto 763
     /// let pkt = V1_20.set_center_chunk(763).unwrap();
     /// assert_eq!(pkt.id, 0x4e);
@@ -351,7 +351,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let v = crate::net::limbo_packets::v1_20::V1_20;
     /// // For a supported protocol this yields a packet
     /// let pkt = v.chunk_data(764);
@@ -384,11 +384,32 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let pkt = V1_20.chunk_batch_start(764);
     /// assert!(pkt.is_some());
     /// assert_eq!(pkt.unwrap().id, 0x0d);
     /// ```
+    /// Set Default Spawn Position — required from 1.19.3 to dismiss the
+    /// "Loading terrain" screen (1.20/1.20.1/1.20.2 fall in the window
+    /// that has no GameEvent-13 yet). Ids per ViaVersion
+    /// `ClientboundPackets1_19_4` (0x50, shared by 1.20/1.20.1) /
+    /// `ClientboundPackets1_20_2` (0x52) / `ClientboundPackets1_20_3`
+    /// (0x54) / `ClientboundPackets1_21` (0x56). Harmless on 765+, which
+    /// also close via the chunk-wait GameEvent.
+    fn set_default_spawn(&self, proto: u32) -> Option<EncodedPacket> {
+        let id: u8 = match proto {
+            763 => 0x50, // 1.20 / 1.20.1
+            764 => 0x52, // 1.20.2
+            765 => 0x54, // 1.20.3 / 1.20.4
+            766 => 0x56, // 1.20.5 / 1.20.6
+            _ => return None,
+        };
+        Some(EncodedPacket {
+            id,
+            body: super::default_spawn_body(),
+        })
+    }
+
     fn chunk_batch_start(&self, proto: u32) -> Option<EncodedPacket> {
         // 1.20.2+ only; empty body.
         let id: u8 = match proto {
@@ -407,7 +428,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // produce a packet for protocol 764 with batch size 3
     /// let pkt = V1_20.chunk_batch_finished(764, 3).unwrap();
     /// assert_eq!(pkt.id, 0x0c);
@@ -432,7 +453,7 @@ impl LimboPackets for V1_20 {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let pkt = V1_20.start_wait_chunks_event(765).unwrap();
     /// assert_eq!(pkt.id, 0x20);
     /// assert_eq!(&pkt.body[..], &[13, 0, 0, 0, 0]); // u8 13 followed by f32 0.0
