@@ -8,6 +8,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Crates.io](https://img.shields.io/crates/v/kojacoord-proxy)](https://crates.io/crates/kojacoord-proxy)
 [![Documentation](https://img.shields.io/badge/docs.rs-kojacoord--proxy-blue)](https://docs.rs/kojacoord-proxy)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Faleroycz%2Fkojacoord.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Faleroycz%2Fkojacoord?ref=badge_shield)
 
 </div>
 
@@ -280,6 +281,9 @@ The more details you give us, the faster we can fix it.
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 Copyright (c) 2026 Alex Guy Yann Le Roy
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Faleroycz%2Fkojacoord.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Faleroycz%2Fkojacoord?ref=badge_large)
 
 ## Thanks
 
