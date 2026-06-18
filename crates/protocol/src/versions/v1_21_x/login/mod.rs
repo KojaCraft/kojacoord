@@ -139,9 +139,10 @@ pub struct ClientboundLoginSuccess {
     pub uuid: uuid::Uuid,
     pub username: String,
     pub properties: Vec<ProfileProperty>,
-    /// `strict_error_handling` was added in 1.21 (proto 767) and
-    /// dropped again in 1.21.4 (proto 769). `None` ⇒ don't emit the
-    /// trailing byte.
+    /// `strict_error_handling` was added in 1.20.5 (proto 766) and
+    /// dropped again in 1.21.2 (proto 768) — so it is present only for
+    /// 766/767. `None` ⇒ don't emit the trailing byte (required for 768+,
+    /// else the client reads "1 byte extra" decoding login_finished).
     pub strict_error_handling: Option<bool>,
 }
 

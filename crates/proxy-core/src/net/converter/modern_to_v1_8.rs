@@ -1767,4 +1767,192 @@ mod tests {
             _ => panic!("BossBar should drop"),
         }
     }
+
+    // ── dispatch_1_16 specific handler tests ─────────────────────────────────
+
+    fn convert_1_16(id: u8, body: &[u8]) -> Option<(u8, Bytes)> {
+        convert(id, body, 754)
+    }
+
+    #[test]
+    fn dispatch_1_16_keep_alive() {
+        let mut body = BytesMut::new();
+        body.put_i64(42);
+        let (id, mut rest) = convert_1_16(0x1F, &body).unwrap();
+        assert_eq!(id, V18_S2C_KEEP_ALIVE);
+        assert_eq!(VarInt::decode(&mut rest).unwrap().0, 42);
+    }
+
+    #[test]
+    fn dispatch_1_16_chat_strips_sender_uuid() {
+        let mut body = BytesMut::new();
+        "{\"text\":\"hello\"}".to_owned().encode(&mut body).unwrap();
+        body.put_u8(0);
+        let mut uuid = [0u8; 16];
+        uuid[0] = 0xFF;
+        body.extend_from_slice(&uuid);
+        let (id, mut rest) = convert_1_16(0x0E, &body).unwrap();
+        assert_eq!(id, V18_S2C_CHAT);
+        let len = VarInt::decode(&mut rest).unwrap().0 as usize;
+        let json = String::from_utf8(rest.copy_to_bytes(len).to_vec()).unwrap();
+        assert_eq!(json, "{\"text\":\"hello\"}");
+        assert_eq!(rest.get_u8(), 0);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn dispatch_1_16_set_slot_empty() {
+        let mut body = BytesMut::new();
+        body.put_u8(0);
+        VarInt(5).encode(&mut body).unwrap();
+        VarInt(0).encode(&mut body).unwrap();
+        let (id, mut rest) = convert_1_16(0x15, &body).unwrap();
+        assert_eq!(id, V18_S2C_SET_SLOT);
+        assert_eq!(rest.get_u8(), 0);
+        assert_eq!(rest.get_i16(), 5);
+    }
+
+    #[test]
+    fn dispatch_1_16_window_items_empty() {
+        let mut body = BytesMut::new();
+        body.put_u8(1);
+        VarInt(2).encode(&mut body).unwrap();
+        for _ in 0..2 {
+            body.put_i16(-1);
+            body.put_u8(0);
+            body.put_i16(0);
+        }
+        let (id, mut rest) = convert_1_16(0x13, &body).unwrap();
+        assert_eq!(id, V18_S2C_WINDOW_ITEMS);
+        assert_eq!(rest.get_u8(), 1);
+        assert_eq!(rest.get_i16(), 2);
+    }
+
+    #[test]
+    fn dispatch_1_16_entity_equipment_empty() {
+        let mut body = BytesMut::new();
+        VarInt(100).encode(&mut body).unwrap();
+        VarInt(0).encode(&mut body).unwrap();
+        body.put_i16(-1);
+        body.put_u8(0);
+        body.put_i16(0);
+        let (id, mut rest) = convert_1_16(0x47, &body).unwrap();
+        assert_eq!(id, V18_S2C_ENTITY_EQUIPMENT);
+        assert_eq!(VarInt::decode(&mut rest).unwrap().0, 100);
+    }
+
+    #[test]
+    fn dispatch_1_16_named_sound() {
+        let mut body = BytesMut::new();
+        "minecraft:block.note.hat"
+            .to_owned()
+            .encode(&mut body)
+            .unwrap();
+        VarInt(4).encode(&mut body).unwrap();
+        body.put_i32(160);
+        body.put_i32(64);
+        body.put_i32(-200);
+        body.put_f32(1.0);
+        body.put_u8(63);
+        let (id, mut rest) = convert_1_16(0x18, &body).unwrap();
+        assert_eq!(id, V18_S2C_SOUND_EFFECT);
+        let len = VarInt::decode(&mut rest).unwrap().0 as usize;
+        let name = String::from_utf8(rest.copy_to_bytes(len).to_vec()).unwrap();
+        assert_eq!(name, "minecraft:block.note.hat");
+        assert_eq!(rest.get_u8(), 4);
+        assert_eq!(rest.get_i32(), 160);
+        assert_eq!(rest.get_i32(), 64);
+        assert_eq!(rest.get_i32(), -200);
+        assert_eq!(rest.get_u8(), 63);
+        assert_eq!(rest.get_u8(), 63);
+    }
+
+    #[test]
+    fn dispatch_1_16_join_game() {
+        let mut body = BytesMut::new();
+        body.put_i32(42);
+        body.put_u8(1);
+        body.put_i32(0);
+        body.put_u8(0);
+        body.put_u8(20);
+        "default".to_owned().encode(&mut body).unwrap();
+        body.put_u8(0);
+        let (id, mut rest) = convert_1_16(0x24, &body).unwrap();
+        assert_eq!(id, V18_S2C_JOIN_GAME);
+        assert_eq!(rest.get_i32(), 42);
+        assert_eq!(rest.get_u8(), 1);
+    }
+
+    #[test]
+    fn dispatch_1_16_respawn() {
+        let mut body = BytesMut::new();
+        body.put_i32(0);
+        body.put_u8(2);
+        body.put_u8(1);
+        "default".to_owned().encode(&mut body).unwrap();
+        let (id, mut rest) = convert_1_16(0x39, &body).unwrap();
+        assert_eq!(id, V18_S2C_RESPAWN);
+        assert_eq!(rest.get_i8(), 0);
+        assert_eq!(rest.get_u8(), 2);
+        assert_eq!(rest.get_u8(), 1);
+    }
+
+    #[test]
+    fn dispatch_1_16_player_pos_look_strips_teleport_id() {
+        let mut body = BytesMut::new();
+        body.put_f64(1.0);
+        body.put_f64(64.0);
+        body.put_f64(100.0);
+        body.put_f32(0.0);
+        body.put_f32(0.0);
+        body.put_u8(0);
+        VarInt(99).encode(&mut body).unwrap();
+        let (id, rest) = convert_1_16(0x34, &body).unwrap();
+        assert_eq!(id, V18_S2C_PLAYER_POS_LOOK);
+        assert_eq!(rest.len(), 33);
+    }
+
+    #[test]
+    fn dispatch_1_16_unload_chunk_drops() {
+        let mut full = BytesMut::new();
+        VarInt(0x1C).encode(&mut full).unwrap();
+        full.extend_from_slice(&[0; 25]);
+        match convert_s2c(full.freeze(), 754) {
+            ConversionResult::Drop => {},
+            _ => panic!("UnloadChunk should drop"),
+        }
+    }
+
+    #[test]
+    fn dispatch_1_16_unknown_passthrough() {
+        let mut full = BytesMut::new();
+        VarInt(0xFE).encode(&mut full).unwrap();
+        full.extend_from_slice(&[0xAB, 0xCD]);
+        match convert_s2c(full.freeze(), 754) {
+            ConversionResult::Passthrough => {},
+            _ => panic!("Unknown packet should passthrough"),
+        }
+    }
+
+    #[test]
+    fn dispatch_1_16_named_sound_volume_clamp() {
+        let mut body = BytesMut::new();
+        "minecraft:test".to_owned().encode(&mut body).unwrap();
+        VarInt(0).encode(&mut body).unwrap();
+        body.put_i32(0);
+        body.put_i32(0);
+        body.put_i32(0);
+        body.put_f32(0.5);
+        body.put_u8(127);
+        let (id, mut rest) = convert_1_16(0x18, &body).unwrap();
+        assert_eq!(id, V18_S2C_SOUND_EFFECT);
+        let _name_len = VarInt::decode(&mut rest).unwrap().0;
+        let _ = rest.copy_to_bytes(_name_len as usize);
+        let _ = rest.get_u8();
+        let _ = rest.get_i32();
+        let _ = rest.get_i32();
+        let _ = rest.get_i32();
+        assert_eq!(rest.get_u8(), 32);
+        assert_eq!(rest.get_u8(), 127);
+    }
 }

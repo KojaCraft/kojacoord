@@ -251,13 +251,14 @@ pub fn build_login_success(
             use kojacoord_protocol::versions::v1_21_x::login::{
                 ClientboundLoginSuccess, ProfileProperty,
             };
-            // 1.21 (767) and 1.21.2 (768) carry strictErrorHandling.
-            // 1.21.4+ (769+) dropped it again.
-            let strict = if (767..=768).contains(&proto) {
-                Some(true)
-            } else {
-                None
-            };
+            // `strictErrorHandling` was added in 1.20.5 (766), so 1.21/1.21.1
+            // (767) still carry it — but 1.21.2 (768) DROPPED it again. Emit
+            // the trailing byte for 767 only; for 768+ it must be absent or
+            // the client reads "1 byte extra" and fails to decode
+            // login_finished. Confirmed against ViaVersion
+            // `Protocol1_21To1_21_2` (reads the boolean from the 767 server,
+            // never writes it to the 768 client).
+            let strict = if proto == 767 { Some(true) } else { None };
             encode(
                 proto,
                 ClientboundLoginSuccess {

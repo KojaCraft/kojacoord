@@ -18,6 +18,75 @@ use bytes::{BufMut, BytesMut};
 use kojacoord_protocol::CanonicalVersion;
 use uuid::Uuid;
 
+/// Convert a JSON chat component (e.g. `{"text":"…","color":"yellow"}`) to a
+/// **nameless** network-NBT text component — the wire form 1.20.3+ (proto
+/// 765+) expects for chat components. 1.20.3 switched text components from
+/// JSON strings to NBT (ViaVersion rewrites them via
+/// `ComponentUtil.jsonToTag`); sending the old JSON string makes the client
+/// fail to decode the component (e.g. `Failed to decode packet
+/// 'clientbound/minecraft:system_chat'`). Returns `None` if the JSON can't be
+/// represented (the caller then falls back rather than emit a broken packet).
+pub(super) fn json_component_to_nameless_nbt(json: &str) -> Option<Vec<u8>> {
+    use kojacoord_protocol::codec::Encode;
+    use kojacoord_protocol::types::nbt::{Nbt, NbtTag};
+
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let root = match json_value_to_nbt(&value)? {
+        NbtTag::Compound(map) => map,
+        _ => return None,
+    };
+    let nbt = Nbt {
+        name: String::new(),
+        root,
+    };
+    let mut buf = BytesMut::new();
+    nbt.encode(&mut buf).ok()?;
+    // `Nbt::encode` emits `0x0a <u16 name_len=0> <payload>`. Strip the
+    // 2-byte empty name to get the nameless network form `0x0a <payload>`.
+    let bytes = buf.as_ref();
+    if bytes.len() < 3 || bytes[0] != 0x0a {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() - 2);
+    out.push(0x0a);
+    out.extend_from_slice(&bytes[3..]);
+    Some(out)
+}
+
+/// Map a `serde_json::Value` onto an `NbtTag`. Covers the subset chat
+/// components use: objects, arrays, strings, bools, and numbers.
+fn json_value_to_nbt(value: &serde_json::Value) -> Option<kojacoord_protocol::types::nbt::NbtTag> {
+    use kojacoord_protocol::types::nbt::NbtTag;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    Some(match value {
+        Value::String(s) => NbtTag::String(s.clone()),
+        Value::Bool(b) => NbtTag::Byte(*b as i8),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                NbtTag::Int(i as i32)
+            } else {
+                NbtTag::Double(n.as_f64()?)
+            }
+        },
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(json_value_to_nbt(it)?);
+            }
+            NbtTag::List(out)
+        },
+        Value::Object(map) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), json_value_to_nbt(v)?);
+            }
+            NbtTag::Compound(out)
+        },
+        Value::Null => return None,
+    })
+}
+
 /// Heightmaps wire encoding for `LevelChunkWithLight`, which changed
 /// twice in the modern era:
 ///   * [`NamedNbt`]  — ≤ 1.20.1 (proto ≤ 763): a *named* NBT compound.

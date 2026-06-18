@@ -160,6 +160,49 @@ pub fn build_dimension_codec_for_proto(proto: u32) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Build the single config-phase `ClientboundRegistryData` body for the
+/// 1.20.2 / 1.20.3 / 1.20.4 protocols (764 / 765).
+///
+/// 1.20.2 (proto 764) introduced the configuration phase and moved the
+/// dimension codec OUT of JoinGame into a single config-phase
+/// `ClientboundRegistryData` packet whose body is the whole codec as one
+/// **nameless** network NBT compound (1.20.2 dropped the root name from
+/// network NBT). The client requires this — without it, it hangs forever
+/// on "Joining world". ViaVersion does the same: it forwards the 1.20.1
+/// JoinGame codec verbatim as a 1.20.2 `REGISTRY_DATA` packet
+/// (`Protocol1_20To1_20_2.sendConfigurationPackets`, written with the
+/// nameless `Types.COMPOUND_TAG`).
+///
+/// 1.20.2-1.20.4 reuse the 1.20 codec content unchanged — no
+/// `dimension_type`/`worldgen/biome` schema changes landed until 1.20.5's
+/// per-registry split (handled by `net::registry_data`). So we ship the
+/// authoritative `DIM_CODEC_1_20` blob, re-framed from named-root JoinGame
+/// NBT to the nameless config form.
+///
+/// Returns `None` for protocols that don't use this single-codec config
+/// form: 763 still inlines the codec in JoinGame; 766+ split it into the
+/// per-registry bundles in `net::registry_data`.
+pub fn config_codec_nameless_for_proto(proto: u32) -> Option<Vec<u8>> {
+    if !(764..=765).contains(&proto) {
+        return None;
+    }
+    // Named-root JoinGame NBT: `0x0a <u16 name_len> <name…> <payload>`.
+    // Config-phase nameless NBT: `0x0a <payload>`. Strip the root name.
+    let named = DIM_CODEC_1_20;
+    if named.len() < 3 || named[0] != 0x0a {
+        return None;
+    }
+    let name_len = u16::from_be_bytes([named[1], named[2]]) as usize;
+    let payload_start = 3 + name_len;
+    if payload_start > named.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(1 + (named.len() - payload_start));
+    out.push(0x0a); // TAG_Compound, no name
+    out.extend_from_slice(&named[payload_start..]);
+    Some(out)
+}
+
 /// Extracts the inline `dimension` element for `dim_key` from the proto's
 /// dimension registry NBT and returns it as a network-shaped NBT blob with
 /// an empty root name (the wire form used as the inline `dimension` in
