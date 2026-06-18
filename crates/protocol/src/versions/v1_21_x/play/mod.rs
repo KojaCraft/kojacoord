@@ -167,6 +167,12 @@ mod packets {
         /// added in proto 768 (1.21.2). For proto 767 (1.21 / 1.21.1)
         /// the field is absent on the wire. `None` ⇒ omit.
         pub sea_level: Option<VarInt>,
+        /// `online_mode` (Boolean) was added to Login (play) in 26.2 (proto
+        /// 776) — between `sea_level` and `secure_profile`, per
+        /// minecraft.wiki Java_Edition_26.2 development page. `None` ⇒ omit
+        /// (required for ≤ 775, else the client reads it from
+        /// `secure_profile` and the field after misaligns).
+        pub online_mode: Option<bool>,
         /// Per BungeeCord `Login.java::read`: `secureProfile` has been
         /// mandatory since proto 766 (1.20.5). Every v1_21_x proto
         /// (767+) carries it.
@@ -208,6 +214,9 @@ mod packets {
             self.portal_cooldown.encode(dst)?;
             if let Some(s) = &self.sea_level {
                 s.encode(dst)?;
+            }
+            if let Some(online) = self.online_mode {
+                dst.put_u8(online as u8);
             }
             dst.put_u8(self.secure_profile as u8);
             Ok(())
@@ -255,6 +264,14 @@ mod packets {
             } else {
                 None
             };
+            // 26.2 (776) inserts `online_mode` before `secure_profile`. The
+            // decoder lacks proto context: ≥ 2 bytes remaining ⇒ both bytes
+            // present (online_mode + secure_profile); exactly 1 ⇒ secure only.
+            let online_mode = if src.remaining() >= 2 {
+                Some(src.get_u8() != 0)
+            } else {
+                None
+            };
             need(src, 1)?;
             let secure_profile = src.get_u8() != 0;
             Ok(Self {
@@ -277,6 +294,7 @@ mod packets {
                 death_location,
                 portal_cooldown,
                 sea_level,
+                online_mode,
                 secure_profile,
             })
         }

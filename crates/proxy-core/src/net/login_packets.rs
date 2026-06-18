@@ -247,7 +247,7 @@ pub fn build_login_success(
                 },
             )
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::login::{
                 ClientboundLoginSuccess, ProfileProperty,
             };
@@ -259,6 +259,13 @@ pub fn build_login_success(
             // `Protocol1_21To1_21_2` (reads the boolean from the 767 server,
             // never writes it to the 768 client).
             let strict = if proto == 767 { Some(true) } else { None };
+            // 26.2 (proto 776) appended a `sessionId` UUID to login_finished —
+            // a spec-identical 775 packet (no trailing field) is rejected by a
+            // 776 client which reads 16 more bytes. Per BungeeCord
+            // `LoginSuccess.{read,write}` (`protocolVersion >= MINECRAFT_26_2`
+            // ⇒ read/write a UUID). We have no real chat session, so send the
+            // player UUID (non-nil, deterministic). Absent for 775.
+            let session_id = if proto >= 776 { Some(uuid) } else { None };
             encode(
                 proto,
                 ClientboundLoginSuccess {
@@ -274,6 +281,7 @@ pub fn build_login_success(
                         })
                         .collect(),
                     strict_error_handling: strict,
+                    session_id,
                 },
             )
         },
@@ -364,7 +372,7 @@ pub fn build_encryption_request(
                 },
             )
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::login::ClientboundEncryptionRequest;
             encode(
                 proto,
@@ -446,7 +454,7 @@ pub fn build_set_compression(
                 },
             )
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::login::ClientboundSetCompression;
             encode(
                 proto,
@@ -493,7 +501,7 @@ pub fn build_login_disconnect(
             use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginDisconnect;
             encode(proto, ClientboundLoginDisconnect { reason })
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginDisconnect;
             encode(proto, ClientboundLoginDisconnect { reason })
         },
@@ -540,7 +548,7 @@ pub fn build_play_disconnect(
             use kojacoord_protocol::versions::v1_20_x::play::ClientboundDisconnect;
             encode(proto, ClientboundDisconnect { reason })
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::play::ClientboundDisconnect;
             encode(proto, ClientboundDisconnect { reason })
         },
@@ -616,7 +624,7 @@ pub fn skip_backend_login_success(canonical: CanonicalVersion, cursor: &mut byte
             use kojacoord_protocol::versions::v1_20_x::login::ClientboundLoginSuccess;
             let _ = ClientboundLoginSuccess::decode(cursor);
         },
-        CanonicalVersion::V1_21 => {
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => {
             use kojacoord_protocol::versions::v1_21_x::login::ClientboundLoginSuccess;
             let _ = ClientboundLoginSuccess::decode(cursor);
         },
@@ -655,7 +663,7 @@ pub fn build_backend_login_start(
     // 1.20.2+ (proto 764+) including 1.21: mandatory UUID.
     if matches!(
         canonical,
-        CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21
+        CanonicalVersion::V1_20_4 | CanonicalVersion::V1_21 | CanonicalVersion::V26
     ) {
         use kojacoord_protocol::versions::v1_20_x::login::ServerboundLoginStart;
         return encode(proto, ServerboundLoginStart { username, uuid });

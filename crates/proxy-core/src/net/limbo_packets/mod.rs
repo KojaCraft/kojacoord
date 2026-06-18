@@ -347,6 +347,7 @@ pub mod v1_21;
 pub mod v1_6;
 pub mod v1_7;
 pub mod v1_8;
+pub mod v26;
 
 // Minor-version aliases — each re-exports its canonical bucket so
 // downstream code can name the version directly. (1.9.x/1.10.x/1.11.x →
@@ -588,6 +589,7 @@ pub fn for_version(canonical: CanonicalVersion) -> &'static dyn LimboPackets {
         CanonicalVersion::V1_19_4 => &v1_19::V1_19,
         CanonicalVersion::V1_20_4 => &v1_20::V1_20,
         CanonicalVersion::V1_21 => &v1_21::V1_21,
+        CanonicalVersion::V26 => &v26::V26,
     }
 }
 

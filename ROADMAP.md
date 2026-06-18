@@ -25,9 +25,9 @@ after the text for extra context.
 - [x] Protocol support: 1.19.x
 - [x] Protocol support: 1.20.x
 - [x] Protocol support: 1.21.x
+- [x] Protocol support: 26.x (Latest - 26b23)
 
 ## In Progress
-- [ ] Protocol support: 26.x (Latest - 26b23)
 - [ ] Mojang Realms compatibility layer
 - [ ] Bedrock edition bridging
 

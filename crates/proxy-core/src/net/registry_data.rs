@@ -77,6 +77,26 @@ static REGISTRIES_1_21_6: &[u8] =
 /// captured verbatim from minecraft-data `pc/1.21.11`.
 static REGISTRIES_1_21_11: &[u8] =
     include_bytes!("../../../../crates/protocol/data/registries_1_21_11.bin");
+/// 26.1 (proto 775) — 28 registries: the 1.21.11 set with the
+/// fields 26.1 made required injected (dimension_type has_ender_dragon_fight,
+/// mob-variant baby_asset_id, wolf_variant baby_assets +"_baby",
+/// wolf_sound_variant adult_sounds/baby_sounds with constant
+/// step_sound=entity.wolf.step, timeline clock), PLUS the new
+/// minecraft:world_clock registry (overworld/the_end, appended last) and the
+/// four new entity sound-variant registries (cat/chicken/cow/pig_sound_variant)
+/// the 26.1 client rejects unless non-empty. Sound-variant entries captured
+/// from ViaVersion `sound-variant-registries-26.1.nbt`; all transforms mirror
+/// ViaVersion `Protocol1_21_11To26_1`. Built by
+/// `tools/registry-gen/build_26_1.py` from `registries_1_21_11.bin`.
+static REGISTRIES_26_1: &[u8] =
+    include_bytes!("../../../../crates/protocol/data/registries_26_1.bin");
+/// 26.2 (proto 776) — the 26.1 set with the 26.2 entity-predicate migration
+/// applied (enchantment `predicate:{type:…}` → `{minecraft:entity_type:…}`,
+/// per minecraft.wiki Java_Edition_26.2). 26.2 strictly validates the new
+/// entity-predicate codec and rejects the 26.1 form, so 775 and 776 need
+/// distinct bundles. Built by `tools/registry-gen/build_26_1.py … 26.2`.
+static REGISTRIES_26_2: &[u8] =
+    include_bytes!("../../../../crates/protocol/data/registries_26_2.bin");
 
 /// Selects the embedded registry bundle appropriate for a given Minecraft protocol version.
 ///
@@ -94,7 +114,9 @@ static REGISTRIES_1_21_11: &[u8] =
 /// - 770 → 1.21.5 bundle
 /// - 771..=773 → 1.21.6–1.21.9 bundle
 /// - 774 → 1.21.10 / 1.21.11 bundle
-/// - p > 774 → newest bundle (best-effort fallback)
+/// - 775 → 26.1 bundle
+/// - 776 → 26.2 bundle (new entity-predicate codec)
+/// - p > 776 → newest bundle (best-effort fallback)
 ///
 /// # Examples
 ///
@@ -111,30 +133,32 @@ pub fn bundle_for_proto(proto: u32) -> Option<&'static [u8]> {
         770 => Some(REGISTRIES_1_21_5),       // 1.21.5
         771..=773 => Some(REGISTRIES_1_21_6), // 1.21.6 – 1.21.9
         774 => Some(REGISTRIES_1_21_11),      // 1.21.10 / 1.21.11
+        775 => Some(REGISTRIES_26_1),         // 26.1 / 26.1.1 / 26.1.2
+        776 => Some(REGISTRIES_26_2),         // 26.2 (new entity-predicate codec)
         // Anything past the highest protocol we have data for reuses the
         // newest complete set as a logged best-effort.
-        p if p > 774 => Some(REGISTRIES_1_21_11),
+        p if p > 776 => Some(REGISTRIES_26_2),
         _ => None,
     }
 }
 
 /// Indicates whether the registry bundle chosen for `proto` is a best-effort fallback.
 ///
-/// Protocols greater than 774 reuse the newest-known embedded bundle as a best-effort mapping;
-/// protocols 774 and below have version-matched bundles.
+/// Protocols greater than 776 reuse the newest-known embedded bundle as a best-effort mapping;
+/// protocols 776 and below have version-matched bundles.
 ///
 /// # Returns
 ///
-/// `true` if the selection is a best-effort fallback (protocol > 774), `false` otherwise.
+/// `true` if the selection is a best-effort fallback (protocol > 776), `false` otherwise.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// assert_eq!(bundle_is_fallback(774), false);
-/// assert_eq!(bundle_is_fallback(775), true);
+/// assert_eq!(bundle_is_fallback(776), false);
+/// assert_eq!(bundle_is_fallback(777), true);
 /// ```
 pub fn bundle_is_fallback(proto: u32) -> bool {
-    proto > 774
+    proto > 776
 }
 
 /// Tag registries the 1.21.2+ client requires to be *bound* in the config
@@ -281,6 +305,22 @@ pub fn config_tags_body_for_proto(proto: u32) -> Option<Vec<u8>> {
         extend("minecraft:block", BLOCK_TAGS_1_21_11);
         extend("minecraft:timeline", TIMELINE_TAGS_1_21_11);
     }
+    // 26.1 (775) eagerly builds default item components during config: a
+    // `fire_resistant` item resolves `#minecraft:is_fire`, and other defaults
+    // reference the rest of the damage_type / banner_pattern tag sets. If those
+    // tag keys aren't bound the client aborts FinishConfiguration with
+    // "Missing tag TagKey[minecraft:damage_type / minecraft:is_fire]". Vanilla
+    // binds them via UpdateTags; ViaVersion `Protocol1_21_11To26_1` adds the
+    // same lists empty (`tagRewriter.addEmptyTags`). Bind them here, empty.
+    if proto >= 775 {
+        extend("minecraft:damage_type", DAMAGE_TYPE_TAGS_26_1);
+        extend("minecraft:banner_pattern", BANNER_PATTERN_TAGS_26_1);
+        // 26.x dimension_type entries reference `infiniburn:"#minecraft:..."`
+        // block tags; 26.2 validates them strictly during registry load
+        // ("Missing tag: minecraft:infiniburn_overworld in minecraft:block").
+        // Bind them (empty — no infinite-burn blocks needed in limbo).
+        extend("minecraft:block", INFINIBURN_TAGS_26);
+    }
 
     let mut body = Vec::new();
     write_varint(&mut body, registries.len() as u32);
@@ -321,6 +361,74 @@ const TIMELINE_TAGS_1_21_11: &[&str] = &[
     "minecraft:in_overworld",
     "minecraft:in_nether",
     "minecraft:in_end",
+];
+
+/// `minecraft:damage_type` tags the 26.1 (proto 775) client requires bound
+/// before FinishConfiguration: default item-component construction resolves
+/// `#minecraft:is_fire` (fire-resistant items) and the rest of these. Verbatim
+/// from ViaVersion `Protocol1_21_11To26_1.onMappingDataLoaded`
+/// (`addEmptyTags(RegistryType.DAMAGE_TYPE, …)`).
+const DAMAGE_TYPE_TAGS_26_1: &[&str] = &[
+    "minecraft:damages_helmet",
+    "minecraft:bypasses_armor",
+    "minecraft:bypasses_shield",
+    "minecraft:bypasses_invulnerability",
+    "minecraft:bypasses_cooldown",
+    "minecraft:bypasses_effects",
+    "minecraft:bypasses_resistance",
+    "minecraft:bypasses_enchantments",
+    "minecraft:is_fire",
+    "minecraft:is_projectile",
+    "minecraft:witch_resistant_to",
+    "minecraft:is_explosion",
+    "minecraft:is_fall",
+    "minecraft:is_drowning",
+    "minecraft:is_freezing",
+    "minecraft:is_lightning",
+    "minecraft:no_anger",
+    "minecraft:no_impact",
+    "minecraft:always_most_significant_fall",
+    "minecraft:wither_immune_to",
+    "minecraft:ignites_armor_stands",
+    "minecraft:burns_armor_stands",
+    "minecraft:avoids_guardian_thorns",
+    "minecraft:always_triggers_silverfish",
+    "minecraft:always_hurts_ender_dragons",
+    "minecraft:no_knockback",
+    "minecraft:always_kills_armor_stands",
+    "minecraft:can_break_armor_stand",
+    "minecraft:bypasses_wolf_armor",
+    "minecraft:is_player_attack",
+    "minecraft:burn_from_stepping",
+    "minecraft:panic_causes",
+    "minecraft:panic_environmental_causes",
+    "minecraft:mace_smash",
+];
+
+/// `minecraft:block` infiniburn tags referenced by 26.x dimension_type
+/// entries (`infiniburn:"#minecraft:infiniburn_<dim>"`). 26.2 validates these
+/// strictly at registry-load time.
+const INFINIBURN_TAGS_26: &[&str] = &[
+    "minecraft:infiniburn_overworld",
+    "minecraft:infiniburn_nether",
+    "minecraft:infiniburn_end",
+];
+
+/// `minecraft:banner_pattern` tags the 26.1 client requires bound (referenced
+/// by default item components). Verbatim from ViaVersion
+/// `addEmptyTags(RegistryType.BANNER_PATTERN, …)`.
+const BANNER_PATTERN_TAGS_26_1: &[&str] = &[
+    "minecraft:no_item_required",
+    "minecraft:pattern_item/flower",
+    "minecraft:pattern_item/creeper",
+    "minecraft:pattern_item/skull",
+    "minecraft:pattern_item/mojang",
+    "minecraft:pattern_item/globe",
+    "minecraft:pattern_item/piglin",
+    "minecraft:pattern_item/flow",
+    "minecraft:pattern_item/guster",
+    "minecraft:pattern_item/field_masoned",
+    "minecraft:pattern_item/bordure_indented",
 ];
 
 /// Transform a `ClientboundRegistryData` body so each biome's
@@ -622,15 +730,33 @@ mod tests {
 
     #[test]
     fn fallback_mapping() {
-        // Every protocol through 774 has a version-matched set.
-        for p in 766..=774 {
+        // Every protocol through 776 has a version-matched set (775 = 26.1,
+        // 776 = 26.2 with its distinct entity-predicate codec).
+        for p in 766..=776 {
             assert!(bundle_for_proto(p).is_some(), "proto {p} bundle");
             assert!(!bundle_is_fallback(p), "proto {p} should be exact");
         }
         // Only future/unknown protocols are best-effort.
-        assert!(bundle_for_proto(775).is_some());
-        assert!(bundle_is_fallback(775));
+        assert!(bundle_for_proto(777).is_some());
+        assert!(bundle_is_fallback(777));
         assert!(bundle_for_proto(765).is_none());
+    }
+
+    #[test]
+    fn entity_predicate_migration_26_2_only() {
+        // 26.2 (776) renames the enchantment entity-predicate `type` key to
+        // `minecraft:entity_type`; 26.1 (775) keeps the old form.
+        let has = |b: &[u8], needle: &str| b.windows(needle.len()).any(|w| w == needle.as_bytes());
+        let b775 = bundle_for_proto(775).unwrap();
+        let b776 = bundle_for_proto(776).unwrap();
+        assert!(
+            !has(b775, "minecraft:entity_type"),
+            "775 must keep old `type`"
+        );
+        assert!(
+            has(b776, "minecraft:entity_type"),
+            "776 must rename to entity_type"
+        );
     }
 
     #[test]

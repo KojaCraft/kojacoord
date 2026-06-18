@@ -1014,6 +1014,27 @@ impl ClientConnection {
         let _pkt_id = VarInt::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
         let username = String::decode(&mut cursor).map_err(ConnectionError::Protocol)?;
 
+        // Reject clients on a protocol we don't have an exact mapping for
+        // before doing any auth work. `nearest()` would otherwise silently
+        // best-effort an uncatalogued version onto the closest converter,
+        // producing subtly broken sessions; an explicit kick is clearer.
+        if !kojacoord_protocol::ProtocolVersion::from_id(self.protocol_version).is_supported() {
+            let json = serde_json::json!({
+                "text": format!(
+                    "Unsupported client version (protocol {}). This proxy supports \
+                     Minecraft 1.6.x – 26.2.",
+                    self.protocol_version
+                ),
+                "color": "red"
+            })
+            .to_string();
+            let _ = self.send_disconnect_login(&json).await;
+            return Err(ConnectionError::Auth(format!(
+                "unsupported protocol version {}",
+                self.protocol_version
+            )));
+        }
+
         let pv = nearest(self.protocol_version);
         let client_uuid = if pv.has_login_start_uuid() {
             let uuid_decode_err = || ConnectionError::Auth("failed to decode client UUID".into());

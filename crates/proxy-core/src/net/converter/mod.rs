@@ -498,7 +498,7 @@ fn nearest(raw: u32) -> ProtocolVersion {
 fn canonical_for_dispatch(raw: u32) -> CanonicalVersion {
     let v = nearest(raw).canonical_typed_packet_version();
     match v {
-        CanonicalVersion::V1_21 => CanonicalVersion::V1_20_4,
+        CanonicalVersion::V1_21 | CanonicalVersion::V26 => CanonicalVersion::V1_20_4,
         CanonicalVersion::V1_19_4 => CanonicalVersion::V1_16_5,
         CanonicalVersion::V1_15_2 => CanonicalVersion::V1_12_2,
         CanonicalVersion::V1_18_2 => CanonicalVersion::V1_16_5,
