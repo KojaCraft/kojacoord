@@ -144,6 +144,10 @@ pub struct ClientboundLoginSuccess {
     /// 766/767. `None` ⇒ don't emit the trailing byte (required for 768+,
     /// else the client reads "1 byte extra" decoding login_finished).
     pub strict_error_handling: Option<bool>,
+    /// `session_id` UUID was appended to login_finished in 26.2 (proto 776);
+    /// per BungeeCord `LoginSuccess` (`protocolVersion >= MINECRAFT_26_2`).
+    /// `None` ⇒ don't emit it (required for ≤ 775, else "16 bytes extra").
+    pub session_id: Option<uuid::Uuid>,
 }
 
 impl PacketId for ClientboundLoginSuccess {
@@ -162,6 +166,14 @@ impl Encode for ClientboundLoginSuccess {
         if let Some(flag) = self.strict_error_handling {
             flag.encode(dst)?;
         }
+        // 26.2 (proto 776) trailing sessionId UUID (raw 16 bytes), after the
+        // — by then absent — strict byte. Mutually exclusive with it in
+        // practice (strict is 766/767 only).
+        if let Some(session) = self.session_id {
+            let (hi, lo) = session.as_u64_pair();
+            (hi as i64).encode(dst)?;
+            (lo as i64).encode(dst)?;
+        }
         Ok(())
     }
 }
@@ -173,16 +185,25 @@ impl Decode for ClientboundLoginSuccess {
         let uuid = uuid::Uuid::from_u64_pair(hi, lo);
         let username = String::decode(src)?;
         let properties = Vec::<ProfileProperty>::decode(src)?;
-        let strict_error_handling = if src.is_empty() {
-            None
-        } else {
-            Some(bool::decode(src)?)
+        // The trailing field is version-dependent and `Decode` has no proto:
+        // disambiguate by remaining length within this packet body. 1 byte ⇒
+        // the 766/767 strict bool; 16 bytes ⇒ the 26.2+ sessionId UUID; 0 ⇒
+        // neither (768..=775). (Vanilla never emits both.)
+        let (strict_error_handling, session_id) = match src.len() {
+            1 => (Some(bool::decode(src)?), None),
+            16 => {
+                let hi = i64::decode(src)? as u64;
+                let lo = i64::decode(src)? as u64;
+                (None, Some(uuid::Uuid::from_u64_pair(hi, lo)))
+            },
+            _ => (None, None),
         };
         Ok(Self {
             uuid,
             username,
             properties,
             strict_error_handling,
+            session_id,
         })
     }
 }
@@ -364,6 +385,7 @@ mod tests {
             username: "Player1".to_string(),
             properties: Vec::new(),
             strict_error_handling: Some(true),
+            session_id: None,
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();
@@ -372,6 +394,26 @@ mod tests {
         assert_eq!(d.uuid, p.uuid);
         assert_eq!(d.username, p.username);
         assert!(d.properties.is_empty());
+    }
+
+    #[test]
+    fn login_success_26_2_session_id_roundtrip() {
+        // 26.2 (proto 776): trailing sessionId UUID, no strict byte.
+        let session = uuid::Uuid::new_v4();
+        let p = ClientboundLoginSuccess {
+            uuid: uuid::Uuid::new_v4(),
+            username: "Player1".to_string(),
+            properties: Vec::new(),
+            strict_error_handling: None,
+            session_id: Some(session),
+        };
+        let mut buf = BytesMut::new();
+        p.encode(&mut buf).unwrap();
+        // uuid(16) + VarInt len + "Player1"(7) + VarInt(0) props + uuid(16)
+        let mut b = buf.freeze();
+        let d = ClientboundLoginSuccess::decode(&mut b).unwrap();
+        assert_eq!(d.session_id, Some(session));
+        assert_eq!(d.strict_error_handling, None);
     }
 
     #[test]
@@ -392,6 +434,7 @@ mod tests {
                 },
             ],
             strict_error_handling: Some(true),
+            session_id: None,
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();

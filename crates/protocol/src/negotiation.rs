@@ -97,6 +97,10 @@ pub enum ProtocolVersion {
     V1_21_9,  // 773
     V1_21_11, // 774
 
+    // 26.x family — Mojang's calendar-based versioning.
+    V26_1, // 775 (26.1 / 26.1.1 / 26.1.2)
+    V26_2, // 776
+
     Unknown(u32),
 }
 
@@ -186,6 +190,8 @@ impl ProtocolVersion {
             772 => ProtocolVersion::V1_21_8,
             773 => ProtocolVersion::V1_21_9,
             774 => ProtocolVersion::V1_21_11,
+            775 => ProtocolVersion::V26_1,
+            776 => ProtocolVersion::V26_2,
             x => ProtocolVersion::Unknown(x),
         }
     }
@@ -247,6 +253,8 @@ impl ProtocolVersion {
             ProtocolVersion::V1_21_8 => 772,
             ProtocolVersion::V1_21_9 => 773,
             ProtocolVersion::V1_21_11 => 774,
+            ProtocolVersion::V26_1 => 775,
+            ProtocolVersion::V26_2 => 776,
             ProtocolVersion::Unknown(x) => *x,
         }
     }
@@ -311,7 +319,9 @@ impl ProtocolVersion {
             | ProtocolVersion::V1_21_6
             | ProtocolVersion::V1_21_8
             | ProtocolVersion::V1_21_9
-            | ProtocolVersion::V1_21_11 => Epoch::V1_21Plus,
+            | ProtocolVersion::V1_21_11
+            | ProtocolVersion::V26_1
+            | ProtocolVersion::V26_2 => Epoch::V1_21Plus,
             ProtocolVersion::Unknown(_) => Epoch::Unknown,
         }
     }
@@ -363,6 +373,9 @@ impl ProtocolVersion {
     /// versions that has a concrete typed-packet module in `versions::`. Used
     /// at dispatch sites that map `ProtocolVersion` to a typed packet builder.
     pub fn canonical_typed_packet_version(&self) -> CanonicalVersion {
+        if matches!(self, ProtocolVersion::V26_1 | ProtocolVersion::V26_2) {
+            return CanonicalVersion::V26;
+        }
         match self.epoch() {
             Epoch::PreNetty => CanonicalVersion::V1_6_4,
             Epoch::V1_7 => CanonicalVersion::V1_7_10,
@@ -437,6 +450,7 @@ pub enum CanonicalVersion {
     V1_19_4,
     V1_20_4,
     V1_21,
+    V26,
 }
 
 impl CanonicalVersion {
@@ -452,6 +466,7 @@ impl CanonicalVersion {
             CanonicalVersion::V1_19_4 => ProtocolVersion::V1_19_4,
             CanonicalVersion::V1_20_4 => ProtocolVersion::V1_20_4,
             CanonicalVersion::V1_21 => ProtocolVersion::V1_21,
+            CanonicalVersion::V26 => ProtocolVersion::V26_1,
         }
     }
 }
@@ -463,7 +478,7 @@ impl VersionRegistry {
     const SUPPORTED: &'static [u32] = &[
         4, 5, 47, 73, 74, 78, 107, 108, 109, 110, 210, 315, 316, 335, 338, 340, 393, 401, 404, 477,
         480, 485, 490, 498, 573, 575, 578, 735, 736, 751, 753, 754, 755, 756, 757, 758, 759, 760,
-        761, 762, 763, 764, 765, 766, 767, 768, 769, 770,
+        761, 762, 763, 764, 765, 766, 767, 768, 769, 770, 771, 772, 773, 774, 775, 776,
     ];
 
     /// Resolve any wire protocol ID to the closest known version. Used so an

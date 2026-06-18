@@ -17,7 +17,12 @@ impl LimboPackets for V1_21 {
         encode(
             proto,
             p::ClientboundLogin {
-                entity_id: 0,
+                // 26.x (proto 775+) made entity ID 0 the "not assigned"
+                // sentinel: a player entity with id 0 makes the client throw
+                // "Tried to access entity ID before ID assignment" in
+                // ClientLevel.addEntity during handleLogin. Use a non-zero id.
+                // Older protos accept 0, but 1 is equally valid everywhere.
+                entity_id: if proto >= 775 { 1 } else { 0 },
                 is_hardcore: false,
                 dimension_names: vec![world_name.to_owned()],
                 max_players: VarInt(20),
@@ -38,6 +43,10 @@ impl LimboPackets for V1_21 {
                 // `sea_level` is on the wire only from proto 768 (1.21.2+).
                 // Proto 767 (1.21 / 1.21.1) must omit it.
                 sea_level: if proto >= 768 { Some(VarInt(63)) } else { None },
+                // `online_mode` (Boolean) was added in 26.2 (proto 776),
+                // before `secure_profile`. Absent for ≤ 775. Limbo is
+                // effectively offline ⇒ false.
+                online_mode: if proto >= 776 { Some(false) } else { None },
                 // `secure_profile` has been mandatory since proto 766
                 // (1.20.5+); always present for the V1_21 bucket.
                 secure_profile: false,
