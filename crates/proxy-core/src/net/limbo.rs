@@ -466,14 +466,44 @@ impl<'a> LimboHandler<'a> {
             // the limbo's keepalive loop catches it.
         }
 
-        // 1b. Proxy → client: ClientboundRegistryData (1.20.5+ / proto
-        // 766+). These clients clear their registries entering config and
-        // need the dimension_type / biome / damage_type / … sets sent
-        // explicitly or the JoinGame dimension reference fails to resolve
-        // and they disconnect. 1.20.2-1.20.4 (764/765) keep built-in
-        // defaults, so `bundle_for_proto` returns None for them and this
-        // block no-ops.
-        if let Some(bundle) = crate::net::registry_data::bundle_for_proto(proto) {
+        // 1b. Proxy → client: ClientboundRegistryData. Modern clients
+        // populate their dimension_type / biome / damage_type / … registries
+        // from config-phase RegistryData; without it the JoinGame dimension
+        // reference never resolves and the client hangs on "Joining world"
+        // (or disconnects). Two distinct wire forms:
+        //   * 1.20.2-1.20.4 (proto 764/765): ONE RegistryData packet whose
+        //     body is the entire codec as a single nameless NBT compound —
+        //     the 1.20.1 JoinGame codec moved into config. Handled here.
+        //   * 1.20.5+ (proto 766+): the codec was SPLIT into one RegistryData
+        //     packet per registry; `bundle_for_proto` carries those bodies.
+        // The earlier code skipped 764/765 entirely on the false assumption
+        // they keep built-in defaults, which left every 1.20.2 client stuck
+        // at "Joining world". ViaVersion sends the same single codec packet
+        // (`Protocol1_20To1_20_2.sendConfigurationPackets`).
+        if let Some(codec) = crate::protocol::config_codec_nameless_for_proto(proto) {
+            let id_registry = crate::packet_ids::cb_config(proto, "ClientboundRegistryData");
+            if id_registry == 0xFF {
+                tracing::warn!(
+                    proto,
+                    "limbo config phase: no ClientboundRegistryData id — \
+                     1.20.2+ client will hang on Joining world"
+                );
+            } else {
+                tracing::debug!(
+                    proto,
+                    bytes = codec.len(),
+                    "limbo config phase: sending single-codec RegistryData (1.20.2-1.20.4)"
+                );
+                crate::packet_io::write_typed_packet(
+                    &mut *self.stream,
+                    id_registry,
+                    &codec,
+                    proto,
+                    threshold,
+                )
+                .await?;
+            }
+        } else if let Some(bundle) = crate::net::registry_data::bundle_for_proto(proto) {
             let id_registry = crate::packet_ids::cb_config(proto, "ClientboundRegistryData");
             if id_registry == 0xFF {
                 tracing::warn!(
@@ -497,6 +527,13 @@ impl<'a> LimboHandler<'a> {
                             "limbo config phase: sending RegistryData"
                         );
                         for body in bodies {
+                            // 1.21.4 (769) reshaped biome `effects.music`
+                            // from an object to a weighted list; rewrite the
+                            // biome registry body in place for that proto so
+                            // the shared 768/769 bundle stays valid for both.
+                            let transformed =
+                                crate::net::registry_data::biome_music_list_transform(proto, body);
+                            let body: &[u8] = transformed.as_deref().unwrap_or(body);
                             crate::packet_io::write_typed_packet(
                                 &mut *self.stream,
                                 id_registry,
@@ -512,6 +549,29 @@ impl<'a> LimboHandler<'a> {
                     },
                 }
             }
+        }
+
+        // 1c. Proxy → client: ClientboundUpdateTags (config id 0x0D, stable
+        // across 1.21.x). From 1.21.2 (proto 768) the client validates the
+        // data-driven enchantment registry against the item/enchantment/
+        // entity/block/biome tags it references; if they're never bound it
+        // aborts config with "Errors in registry minecraft:enchantment" /
+        // "Unbound tags …". We bind them all (empty) here. No-op < 768.
+        if let Some(tags) = crate::net::registry_data::config_tags_body_for_proto(proto) {
+            const CONFIG_UPDATE_TAGS_ID: u8 = 0x0D;
+            tracing::debug!(
+                proto,
+                bytes = tags.len(),
+                "limbo config phase: sending UpdateTags (enchantment tag binding)"
+            );
+            crate::packet_io::write_typed_packet(
+                &mut *self.stream,
+                CONFIG_UPDATE_TAGS_ID,
+                &tags,
+                proto,
+                threshold,
+            )
+            .await?;
         }
 
         // 2. Proxy → client: ClientboundFinishConfiguration.

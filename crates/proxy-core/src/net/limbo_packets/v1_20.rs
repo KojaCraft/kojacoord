@@ -6,7 +6,9 @@ use kojacoord_protocol::types::VarInt;
 use kojacoord_protocol::versions::v1_20_x::play as p;
 use uuid::Uuid;
 
-use super::{encode, EncodedPacket, LimboPackets, PlayerPos, SoundParams};
+use super::{
+    encode, json_component_to_nameless_nbt, EncodedPacket, LimboPackets, PlayerPos, SoundParams,
+};
 
 pub struct V1_20;
 
@@ -189,6 +191,22 @@ impl LimboPackets for V1_20 {
     /// assert!(pkt.is_some());
     /// ```
     fn chat(&self, proto: u32, json_message: &str) -> Option<EncodedPacket> {
+        // 1.20.3+ (proto 765+) send the chat component as NBT, not a JSON
+        // string. Hand-encode the System Chat body `[component NBT][bool
+        // overlay]` for those; 1.20/1.20.1/1.20.2 (≤764) still use the JSON
+        // string form below. Without this a 765+ client decodes our JSON
+        // string as NBT and dies with `DecoderException: Loading NBT data`.
+        if proto >= 765 {
+            let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundSystemChat");
+            if id == 0xFF {
+                return None;
+            }
+            let component = json_component_to_nameless_nbt(json_message)?;
+            let mut body = BytesMut::new();
+            body.put_slice(&component);
+            body.put_u8(0); // overlay = false
+            return Some(EncodedPacket { id, body });
+        }
         encode(
             proto,
             p::ClientboundSystemChat {
@@ -259,6 +277,28 @@ impl LimboPackets for V1_20 {
     /// assert!(pkt.is_some());
     /// ```
     fn bossbar_add(&self, proto: u32, uuid: Uuid, title: &str) -> Option<EncodedPacket> {
+        // 1.20.3+ (proto 765+): the BossBar Add `title` is an NBT chat
+        // component, not a JSON string — same component-as-NBT change that
+        // affects System Chat. Sending the JSON string crashes the client
+        // with `DecoderException: Loading NBT data`. Hand-encode the body:
+        // `[UUID][VarInt 0=add][component NBT][f32 health][VarInt color]
+        //  [VarInt division][u8 flags]`.
+        if proto >= 765 {
+            let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundBossBar");
+            if id == 0xFF {
+                return None;
+            }
+            let component = json_component_to_nameless_nbt(title)?;
+            let mut body = BytesMut::new();
+            uuid.encode(&mut body).ok()?;
+            VarInt(0).encode(&mut body).ok()?; // action: add
+            body.put_slice(&component); // title component
+            body.put_f32(1.0); // health
+            VarInt(1).encode(&mut body).ok()?; // color
+            VarInt(0).encode(&mut body).ok()?; // division
+            body.put_u8(0); // flags
+            return Some(EncodedPacket { id, body });
+        }
         encode(
             proto,
             p::ClientboundBossBar {

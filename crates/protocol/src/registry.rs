@@ -1442,11 +1442,18 @@ const PLAY: &[Entry] = &[
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundLogin", 0x29),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerAbilities", 0x36),
     (765, ProtocolState::Play, Direction::Clientbound, "ClientboundPlayerPosition", 0x3e),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundRespawn", 0x43),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSetHeldItem", 0x4f),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSetCarriedItem", 0x4f),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSound", 0x64),
-    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundNamedSoundEffect", 0x64),
+    // 1.20.3 inserted RESET_SCORE (0x42) and split RESOURCE_PACK into
+    // POP/PUSH (0x43/0x44), shifting every clientbound play id >= 0x42 up
+    // by +2 vs 1.20.2. The original 765 rows below 0x42 are unaffected, but
+    // these were left at the 1.20.2 values — Sound at 0x64 made the client
+    // mis-read a smaller packet and bail ("packet 100 was larger than I
+    // expected, found 44 bytes extra"). IDs per ViaVersion
+    // ClientboundPackets1_20_3.
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundRespawn", 0x45),
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSetHeldItem", 0x51),
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSetCarriedItem", 0x51),
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundSound", 0x66),
+    (765, ProtocolState::Play, Direction::Clientbound, "ClientboundNamedSoundEffect", 0x66),
     // Per BungeeCord `Protocol.java::TO_CLIENT` SystemChat table:
     //   `map(MINECRAFT_1_20_2, 0x67)` then `map(MINECRAFT_1_20_3, 0x69)`.
     // Proto 765 (1.20.4 = `MINECRAFT_1_20_3` in BungeeCord) → 0x69. The

@@ -10,26 +10,30 @@ after the text for extra context.
 
 ## Shipped
 - [x] Protocol support: 1.6.x (PreNetty)
+- [x] Protocol support: 1.7.x
+- [x] Protocol support: 1.8.x
+- [x] Protocol support: 1.9.x
+- [x] Protocol support: 1.10.x
+- [x] Protocol support: 1.11.x
+- [x] Protocol support: 1.12.x
 - [x] Protocol support: 1.13.x
 - [x] Protocol support: 1.14.x
 - [x] Protocol support: 1.15.x
 - [x] Protocol support: 1.16.x
 - [x] Protocol support: 1.17.x
 - [x] Protocol support: 1.18.x
-- [x] Multi-version protocol support — Java Edition 1.7.x through 1.21.x with automatic conversion
-- [x] Authentication pipeline — online-mode Mojang session auth + offline-mode support
-- [x] Anti-cheat engine at the proxy edge
+- [x] Protocol support: 1.19.x
+- [x] Protocol support: 1.20.x
+- [x] Protocol support: 1.21.x
 
 ## In Progress
-- [ ] Protocol support: 1.19.x
-- [ ] Protocol support: 1.20.x
-- [ ] Protocol support: 1.21.x
 - [ ] Protocol support: 26.x (Latest - 26b23)
+- [ ] Mojang Realms compatibility layer
+- [ ] Bedrock edition bridging
 
 ## Planned
-- [ ] Bedrock edition bridging
 - [ ] Plugin marketplace / registry
-- [ ] Mojang Realms compatibility layer
+
 
 ## Exploring
 - [ ] QUIC / HTTP/3 client transport — once a vanilla client supports it

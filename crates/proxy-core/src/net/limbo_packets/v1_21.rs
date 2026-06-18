@@ -6,7 +6,9 @@ use kojacoord_protocol::types::VarInt;
 use kojacoord_protocol::versions::v1_21_x::play as p;
 use uuid::Uuid;
 
-use super::{encode, EncodedPacket, LimboPackets, PlayerPos, SoundParams};
+use super::{
+    encode, json_component_to_nameless_nbt, EncodedPacket, LimboPackets, PlayerPos, SoundParams,
+};
 
 pub struct V1_21;
 
@@ -81,6 +83,31 @@ impl LimboPackets for V1_21 {
         pos: PlayerPos,
         teleport_id: i32,
     ) -> Option<EncodedPacket> {
+        // 1.21.2 (proto 768) reworked Synchronize Player Position: the
+        // teleport id moved to the FRONT, delta-movement (velocity) doubles
+        // were added, and the relative-flags field widened from a byte to a
+        // 32-bit int. The old ≤1.21.1 typed layout makes a 768 client fail
+        // with `Failed to decode packet 'clientbound/minecraft:player_position'`.
+        // New body (ViaVersion `EntityPacketRewriter1_21_2`):
+        //   [VarInt tp_id][f64 x,y,z][f64 dx,dy,dz][f32 yaw,pitch][i32 flags]
+        if proto >= 768 {
+            let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundPlayerPosition");
+            if id == 0xFF {
+                return None;
+            }
+            let mut body = BytesMut::new();
+            VarInt(teleport_id).encode(&mut body).ok()?;
+            body.put_f64(pos.x);
+            body.put_f64(pos.y);
+            body.put_f64(pos.z);
+            body.put_f64(0.0); // delta movement x
+            body.put_f64(0.0); // delta movement y
+            body.put_f64(0.0); // delta movement z
+            body.put_f32(pos.yaw);
+            body.put_f32(pos.pitch);
+            body.put_i32(0); // relative flags (absolute position)
+            return Some(EncodedPacket { id, body });
+        }
         encode(
             proto,
             p::ClientboundPlayerPosition {
@@ -107,13 +134,21 @@ impl LimboPackets for V1_21 {
     /// assert!(pkt.is_some());
     /// ```
     fn chat(&self, proto: u32, json_message: &str) -> Option<EncodedPacket> {
-        encode(
-            proto,
-            p::ClientboundSystemChat {
-                json_message: json_message.to_owned(),
-                overlay: false,
-            },
-        )
+        // All 1.21.x (proto 767+) send the chat component as NBT, not a JSON
+        // string (the component-as-NBT change landed in 1.20.3). The typed
+        // `ClientboundSystemChat` encodes `json_message` as a String, so the
+        // client fails with `Failed to decode packet
+        // 'clientbound/minecraft:system_chat'`. Hand-encode the body
+        // `[component NBT][bool overlay]` instead.
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundSystemChat");
+        if id == 0xFF {
+            return None;
+        }
+        let component = json_component_to_nameless_nbt(json_message)?;
+        let mut body = BytesMut::new();
+        body.put_slice(&component);
+        body.put_u8(0); // overlay = false
+        Some(EncodedPacket { id, body })
     }
 
     /// Constructs a clientbound sound packet that plays the "minecraft:music_disc.cat" inline sound at a given position.
@@ -182,19 +217,24 @@ impl LimboPackets for V1_21 {
     /// let pkt = V1_21.bossbar_add(&V1_21, 770, Uuid::nil(), "Welcome");
     /// ```
     fn bossbar_add(&self, proto: u32, uuid: Uuid, title: &str) -> Option<EncodedPacket> {
-        encode(
-            proto,
-            kojacoord_protocol::versions::v1_20_x::play::ClientboundBossBar {
-                uuid,
-                action: kojacoord_protocol::versions::v1_20_x::play::BossBarAction::Add {
-                    title: title.to_owned(),
-                    health: 1.0,
-                    color: VarInt(1),
-                    division: VarInt(0),
-                    flags: 0,
-                },
-            },
-        )
+        // 1.21.x BossBar Add `title` is an NBT chat component, not a JSON
+        // string (same 1.20.3+ component-as-NBT change). Hand-encode the
+        // body: `[UUID][VarInt 0=add][component NBT][f32 health][VarInt
+        // color][VarInt division][u8 flags]`.
+        let id = kojacoord_protocol::registry::cb_play(proto, "ClientboundBossBar");
+        if id == 0xFF {
+            return None;
+        }
+        let component = json_component_to_nameless_nbt(title)?;
+        let mut body = BytesMut::new();
+        uuid.encode(&mut body).ok()?;
+        VarInt(0).encode(&mut body).ok()?; // action: add
+        body.put_slice(&component); // title component
+        body.put_f32(1.0); // health
+        VarInt(1).encode(&mut body).ok()?; // color
+        VarInt(0).encode(&mut body).ok()?; // division
+        body.put_u8(0); // flags
+        Some(EncodedPacket { id, body })
     }
 
     fn bossbar_remove(&self, proto: u32, uuid: Uuid) -> Option<EncodedPacket> {
