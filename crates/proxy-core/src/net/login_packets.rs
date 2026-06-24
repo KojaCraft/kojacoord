@@ -71,25 +71,13 @@ pub fn build_login_success(
             encode(proto, ClientboundLoginSuccess { uuid, username })
         },
         CanonicalVersion::V1_12_2 | CanonicalVersion::V1_15_2 => {
-            use kojacoord_protocol::versions::v1_12_x::login::{
-                ClientboundLoginSuccess, ProfileProperty,
-            };
-            encode(
-                proto,
-                ClientboundLoginSuccess {
-                    uuid,
-                    username,
-                    properties: profile
-                        .properties
-                        .iter()
-                        .map(|p| ProfileProperty {
-                            name: p.name.clone(),
-                            value: p.value.clone(),
-                            signature: p.signature.clone(),
-                        })
-                        .collect(),
-                },
-            )
+            // 1.9–1.15.2 LoginSuccess is { String UUID, String username } with
+            // NO properties trailer (added in 1.19 / proto 759). Attaching the
+            // player's `textures` property here makes the client read ~1100
+            // bytes of trailing garbage and crash. See the encode note in
+            // `v1_12_x::login::ClientboundLoginSuccess`.
+            use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginSuccess;
+            encode(proto, ClientboundLoginSuccess { uuid, username })
         },
         CanonicalVersion::V1_16_5 | CanonicalVersion::V1_18_2 => {
             // LoginSuccess wire shape — three distinct era boundaries
@@ -120,15 +108,12 @@ pub fn build_login_success(
             // `"Packet 2/2 (sy) was larger than I expected, found NNNN
             // bytes extra whilst reading packet 2"`.
             if proto < 735 {
+                // proto < 735 (≤ 1.15.2): String UUID + String username, no
+                // properties trailer — matches BungeeCord LoginSuccess.write
+                // (`protocolVersion < MINECRAFT_1_19`). The v1_12_x struct is
+                // the canonical wire shape for this whole sub-735 range.
                 use kojacoord_protocol::versions::v1_12_x::login::ClientboundLoginSuccess;
-                encode(
-                    proto,
-                    ClientboundLoginSuccess {
-                        uuid,
-                        username,
-                        properties: Vec::new(),
-                    },
-                )
+                encode(proto, ClientboundLoginSuccess { uuid, username })
             } else if proto < 759 {
                 // 1.16 - 1.18: raw UUID + String username, no
                 // properties trailer. Hand-encode rather than

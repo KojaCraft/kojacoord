@@ -32,10 +32,9 @@ use crate::{
     chat_signing::{determine_signing_mode, strip_chat_signature},
     commands,
     config_synthesis::{build_cfg_packets, determine_synthesis_mode, SynthesisMode},
-    converter::{ConversionDirection, ConversionResult, PacketConverter},
     cookies_transfers::supports_cookies_transfers,
     error::ConnectionError,
-    exploit_guard::{build_kick_message, check_chat_message, ExploitGuard, KickReason},
+    exploit_guard::{build_kick_message, check_chat_message, KickReason},
     modloader,
     packet_builder::{
         build_brand_packet, build_disconnect_packet, build_plugin_message_packet,
@@ -65,7 +64,6 @@ pub struct PacketRelay {
     pub client_compression_threshold: i32,
     pub backend_compression_threshold: i32,
     pub ml_kind: modloader::ModloaderKind,
-    pub conversion_enabled: bool,
     pub backend_protocol: u32,
 }
 
@@ -245,25 +243,11 @@ impl PacketRelay {
         let proto = self.protocol_version;
         let client_thresh = self.client_compression_threshold;
         let backend_thresh = self.backend_compression_threshold;
-        let conv_enabled = self.conversion_enabled;
+        // Cross-version packet conversion has been removed: the proxy now
+        // forwards play packets verbatim and relies on ViaVersion (on the
+        // backend) for any client↔backend protocol bridging. `backend_proto`
+        // is still used for chat-signing and config-synthesis decisions below.
         let backend_proto = self.backend_protocol;
-
-        // ViaVersion detection.
-        //
-        // ViaVersion-instrumented backends announce themselves to proxies
-        // via a clientbound plugin message on the `vv:proxy_details` (or
-        // `viaversion:proxy_details`) channel. When we see one we flip
-        // this flag and skip our own per-packet converter for the rest of
-        // the session — ViaVersion on the backend has already translated
-        // every packet into the client's exact protocol, so any further
-        // conversion on our side would corrupt the wire.
-        //
-        // Both directions check the same atomic, so detection in the
-        // s2c loop flows immediately to the c2s loop's converter gate
-        // without a lock.
-        let via_version_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let via_version_detected_s2c = via_version_detected.clone();
-        let via_version_detected_c2s = via_version_detected.clone();
 
         // Determine chat signing mode if enabled
         let chat_signing_mode = if self.state.config.proxy.chat_signing_translation {
@@ -430,101 +414,23 @@ impl PacketRelay {
                     return Ok(());
                 }
 
-                // ViaVersion detection: sniff clientbound plugin messages
-                // for the `vv:proxy_details` channel. ViaVersion sends one
-                // shortly after configuration to announce itself.
-                if pkt_id == cb_pm_id {
-                    if let Some(channel) = try_decode_plugin_channel(payload.clone()) {
-                        if (channel == "vv:proxy_details"
-                            || channel == "viaversion:proxy_details")
-                            && !via_version_detected_s2c
-                                .swap(true, std::sync::atomic::Ordering::AcqRel)
-                        {
-                            tracing::info!(
-                                target: "relay",
-                                channel = %channel,
-                                proto,
-                                backend_proto,
-                                "ViaVersion detected on backend — disabling proxy-side converter for this session"
-                            );
-                        }
+                // Verbatim forward (no cross-version conversion). Plugin
+                // packet hooks still run; ViaVersion on the backend handles
+                // any protocol bridging.
+                match Self::process_packet_hooks(
+                    &state_s2c,
+                    proto,
+                    pkt_id as i32,
+                    PacketDirection::Clientbound,
+                    payload.clone(),
+                    player_uuid,
+                ) {
+                    Ok(data) => {
+                        let mut cw = cw_s2c.lock().await;
+                        write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
                     }
-                }
-
-                let convert_active = conv_enabled
-                    && proto != backend_proto
-                    && !via_version_detected_s2c
-                        .load(std::sync::atomic::Ordering::Acquire);
-                if convert_active {
-                    let direction = ConversionDirection::ServerToClient {
-                        server_proto: backend_proto,
-                        client_proto: proto,
-                    };
-                    let repacker = Some(state_s2c.chunk_repacker.clone());
-                    match PacketConverter::convert_with_repacker(payload.clone(), direction, repacker) {
-                        ConversionResult::Passthrough => {
-                            match Self::process_packet_hooks(
-                                &state_s2c,
-                                proto,
-                                pkt_id as i32,
-                                PacketDirection::Clientbound,
-                                payload.clone(),
-                                player_uuid,
-                            ) {
-                                Ok(data) => {
-                                    let mut cw = cw_s2c.lock().await;
-                                    write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
-                                }
-                                Err(_) => {
-                                    tracing::trace!(pkt_id, "S→C dropped by plugin hook");
-                                }
-                            }
-                        }
-                        ConversionResult::Converted(packets) => {
-                            let mut cw = cw_s2c.lock().await;
-                            for pkt in packets {
-                                let mut pkt_id_decoded = pkt.clone();
-                                let pkt_id = VarInt::decode(&mut pkt_id_decoded).map(|v| v.0).unwrap_or(pkt_id as i32);
-                                match Self::process_packet_hooks(
-                                    &state_s2c,
-                                    proto,
-                                    pkt_id,
-                                    PacketDirection::Clientbound,
-                                    pkt,
-                                    player_uuid,
-                                ) {
-                                    Ok(data) => {
-                                        write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
-                                    }
-                                    Err(_) => {
-                                        tracing::trace!(pkt_id, "S→C converted packet dropped by plugin hook");
-                                    }
-                                }
-                            }
-                        }
-                        ConversionResult::Drop => {
-                            tracing::trace!(pkt_id, "S→C dropped by converter");
-                        }
-                        ConversionResult::InjectS2C(_) => {
-                            tracing::warn!(pkt_id, "S→C converter returned InjectS2C — only valid in C→S direction; dropping");
-                        }
-                    }
-                } else {
-                    match Self::process_packet_hooks(
-                        &state_s2c,
-                        proto,
-                        pkt_id as i32,
-                        PacketDirection::Clientbound,
-                        payload.clone(),
-                        player_uuid,
-                    ) {
-                        Ok(data) => {
-                            let mut cw = cw_s2c.lock().await;
-                            write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
-                        }
-                        Err(_) => {
-                            tracing::trace!(pkt_id, "S→C dropped by plugin hook");
-                        }
+                    Err(_) => {
+                        tracing::trace!(pkt_id, "S→C dropped by plugin hook");
                     }
                 }
             }
@@ -539,7 +445,6 @@ impl PacketRelay {
         };
 
         let c2s = async move {
-            let mut exploit_guard = ExploitGuard::new();
             let result: Result<(), ConnectionError> = async move {
                 loop {
                     if stopped_c2s_chk.load(Ordering::Acquire) {
@@ -569,13 +474,8 @@ impl PacketRelay {
                         r = read_client_packet(&mut *cr_mut, proto, client_thresh) => r?,
                     };
 
-                    // Per-connection abuse guard: enforce inbound packet-rate and
-                    // per-packet size ceilings before any further processing.
-                    if let Err(reason) = exploit_guard.check_packet(payload.len()) {
-                        let username = session_c2s.read().await.username.clone();
-                        tracing::warn!(username = %username, ?reason, "exploit_guard: kicking client");
-                        kick!(cw_c2s, reason, proto, client_thresh);
-                    }
+                    // Inbound abuse guard removed — the backend Minecraft server
+                    // already enforces packet-rate/size limits.
 
                     if let Some(m) = &metrics_c2s {
                         let now_micros = metrics_epoch.elapsed().as_micros() as u64;
@@ -617,9 +517,11 @@ impl PacketRelay {
 
                     state_c2s.metrics.record_packet(payload.len());
 
-                    let session_data = session_c2s.read().await;
-                    let uuid = session_data.uuid;
-                    drop(session_data);
+                    // `player_uuid` is captured once at relay start and never
+                    // changes for the life of the connection. Re-reading it from
+                    // the session RwLock on every C→S packet was a needless
+                    // per-packet lock acquisition on the hot path.
+                    let uuid = player_uuid;
 
                     // Dispatch movement events to plugin system (anticheat, etc.).
                     // Movement is the highest-frequency C→S packet, so gate the
@@ -931,66 +833,29 @@ impl PacketRelay {
                         }
                     }
 
-                    // Same ViaVersion gate as the s2c loop above. Once
-                    // the backend has identified itself as ViaVersion-
-                    // backed, we leave c2s packets alone too — the
-                    // backend will translate them itself.
-                    let convert_active_c2s = conv_enabled
-                        && proto != backend_proto
-                        && !via_version_detected_c2s
-                            .load(std::sync::atomic::Ordering::Acquire);
-                    if convert_active_c2s {
-                        let direction = ConversionDirection::ClientToServer {
-                            client_proto: proto,
-                            server_proto: backend_proto,
-                        };
-                        let payload_to_convert = if modified_payload != payload {
-                            modified_payload.clone()
-                        } else {
-                            payload.clone()
-                        };
-                        let repacker = Some(state_c2s.chunk_repacker.clone());
-                        match PacketConverter::convert_with_repacker(payload_to_convert.clone(), direction, repacker) {
-                            ConversionResult::Passthrough => {
-                                write_packet(&mut *bw_mut, &payload_to_convert, backend_thresh).await?;
-                            },
-                            ConversionResult::Converted(packets) => {
-                                for pkt in packets {
-                                    write_packet(&mut *bw_mut, &pkt, backend_thresh).await?;
-                                }
-                            },
-                            ConversionResult::Drop => {
-                                tracing::trace!(pkt_id, "C→S dropped by converter");
-                            },
-                            ConversionResult::InjectS2C(packets) => {
-                                tracing::trace!(pkt_id, count = packets.len(), "C→S swallowed; injecting s2c packets back to client");
-                                for pkt in packets {
-                                    let _ = inject_s2c_tx.send(pkt);
-                                }
-                            },
-                        }
-                    } else {
-                        // Config synthesis: inject RegistryData (766+) + FinishConfiguration
-                        if synthesis_mode == SynthesisMode::ClientSide {
-                            let canonical = ProtocolVersion::from_id(proto);
-                            if pkt_id == 0x03 && canonical.has_configuration_phase() {
-                                if let Ok(cfg_packets) = build_cfg_packets(proto) {
-                                    for pkt in cfg_packets {
-                                        tracing::trace!("Injecting synthetic config-phase packet ({} bytes)", pkt.len());
-                                        let _ = inject_s2c_tx.send(pkt.into());
-                                    }
+                    // Verbatim forward (no cross-version conversion). ViaVersion
+                    // on the backend handles any protocol bridging.
+
+                    // Config synthesis: inject RegistryData (766+) + FinishConfiguration
+                    if synthesis_mode == SynthesisMode::ClientSide {
+                        let canonical = ProtocolVersion::from_id(proto);
+                        if pkt_id == 0x03 && canonical.has_configuration_phase() {
+                            if let Ok(cfg_packets) = build_cfg_packets(proto) {
+                                for pkt in cfg_packets {
+                                    tracing::trace!("Injecting synthetic config-phase packet ({} bytes)", pkt.len());
+                                    let _ = inject_s2c_tx.send(pkt.into());
                                 }
                             }
                         }
-
-                        // Use modified payload if signature was stripped
-                        let payload_to_send = if modified_payload != payload {
-                            modified_payload.clone()
-                        } else {
-                            payload.clone()
-                        };
-                        write_packet(&mut *bw_mut, &payload_to_send, backend_thresh).await?;
                     }
+
+                    // Use modified payload if signature was stripped
+                    let payload_to_send = if modified_payload != payload {
+                        modified_payload.clone()
+                    } else {
+                        payload.clone()
+                    };
+                    write_packet(&mut *bw_mut, &payload_to_send, backend_thresh).await?;
                 }
 
                 #[allow(unreachable_code)]
@@ -1237,13 +1102,4 @@ fn format_remaining(total_secs: i64) -> String {
         parts.push(format!("{}s", secs));
     }
     parts.join(" ")
-}
-
-fn try_decode_plugin_channel(payload: bytes::Bytes) -> Option<String> {
-    use kojacoord_protocol::codec::Decode;
-    let mut cur = payload;
-    // Drop the leading packet id (VarInt).
-    let _ = kojacoord_protocol::types::VarInt::decode(&mut cur).ok()?;
-    // Channel name is the first VarInt-string field.
-    String::decode(&mut cur).ok()
 }

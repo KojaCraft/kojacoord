@@ -119,9 +119,19 @@ pub struct WasmPluginInstance {
     pub store: Mutex<Store<WasmHostState>>,
     pub instance: Mutex<Option<Instance>>,
     pub metadata: PluginMetadata,
+    /// Set once a guest call traps (e.g. froze and was interrupted by the
+    /// epoch watchdog, or hit `unreachable`). A disabled plugin is skipped on
+    /// every subsequent call so one bad plugin can't repeatedly stall the
+    /// proxy or spam crash reports.
+    pub disabled: AtomicBool,
 }
 
 /// Shared wasmtime engine plus the registry of loaded modules.
+/// How often the watchdog thread bumps the engine epoch. Guest deadlines are
+/// expressed in epoch ticks, so this also sets the granularity of guest-CPU
+/// interruption.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct WasmLoader {
     engine: Engine,
     plugins: Arc<RwLock<HashMap<String, Arc<Mutex<WasmPluginInstance>>>>>,
@@ -155,8 +165,31 @@ impl WasmLoader {
         config.wasm_threads(false);
         config.wasm_reference_types(true);
         config.max_wasm_stack(512 * 1024);
+        // Epoch-based interruption: a watchdog thread bumps the engine epoch on
+        // a timer, and every guest call is armed with a deadline. A runaway
+        // guest (infinite loop) then *traps* instead of freezing the proxy;
+        // the trap is turned into a panic + crash report and the plugin is
+        // disabled. (This only bounds guest CPU — blocking host imports are
+        // bounded by their own timeouts.)
+        config.epoch_interruption(true);
 
         let engine = Engine::new(&config).context("Failed to create Wasmtime engine")?;
+
+        // Watchdog: increment the epoch every EPOCH_TICK. A weak handle lets the
+        // thread exit on its own once the engine is dropped.
+        {
+            let weak = engine.weak();
+            std::thread::Builder::new()
+                .name("wasm-epoch-watchdog".into())
+                .spawn(move || loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    match weak.upgrade() {
+                        Some(engine) => engine.increment_epoch(),
+                        None => break,
+                    }
+                })
+                .context("Failed to spawn wasm epoch watchdog")?;
+        }
 
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |s: &mut WasmHostState| {
@@ -290,9 +323,22 @@ impl WasmLoader {
                 };
                 let redis = caller.data().redis.clone();
                 let result = run_blocking(&handle, async move {
-                    let client = redis::Client::open(url)?;
-                    let conn = client.get_multiplexed_async_connection().await?;
-                    Ok::<_, redis::RedisError>((client, conn))
+                    // Bounded connect: this is a synchronous host import driven
+                    // via block_in_place/block_on under the plugin lock. An
+                    // unreachable Redis would otherwise hang the worker (and the
+                    // lock) indefinitely, freezing the proxy.
+                    let fut = async {
+                        let client = redis::Client::open(url)?;
+                        let conn = client.get_multiplexed_async_connection().await?;
+                        Ok::<_, redis::RedisError>((client, conn))
+                    };
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(redis::RedisError::from((
+                            redis::ErrorKind::IoError,
+                            "redis_connect timed out",
+                        ))),
+                    }
                 });
                 match result {
                     Ok((client, conn)) => {
@@ -324,14 +370,27 @@ impl WasmLoader {
                 let chan = read_string(&mut caller, chan_ptr, chan_len)?;
                 let msg = read_bytes(&mut caller, msg_ptr, msg_len)?;
                 let (Some(handle), Some(mut conn)) = redis_ready(&caller) else {
+                    log::warn!(
+                        "[wasm:{}] redis_publish('{}') dropped: Redis not connected (UseRedis missing or redis_connect failed)",
+                        caller.data().plugin_name,
+                        chan
+                    );
                     return Ok::<u32, anyhow::Error>(0);
                 };
-                let ok = run_blocking(
+                let chan_for_log = chan.clone();
+                let result = run_blocking(
                     &handle,
                     async move { conn.publish::<_, _, ()>(chan, msg).await },
-                )
-                .is_ok();
-                Ok(u32::from(ok))
+                );
+                if let Err(e) = &result {
+                    log::warn!(
+                        "[wasm:{}] redis_publish('{}') failed: {}",
+                        caller.data().plugin_name,
+                        chan_for_log,
+                        e
+                    );
+                }
+                Ok(u32::from(result.is_ok()))
             },
         )?;
 
@@ -662,7 +721,19 @@ impl WasmLoader {
                 .clone()
                 .or_else(|| tokio::runtime::Handle::try_current().ok()),
             redis: RedisShared::new(),
-            http: reqwest::Client::new(),
+            // Bounded timeouts are mandatory: `http_request` is a synchronous
+            // host import driven via `block_in_place`/`block_on`, invoked while
+            // the plugin instance lock (and transitively the plugin_manager
+            // read lock) is held. An unbounded request to an unreachable
+            // orchestrator would hang the worker forever and cascade into a
+            // full proxy freeze (every player-event dispatch blocks on the same
+            // locks). Cap connect + total request time so the call always
+            // returns and releases the locks.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         };
 
         let mut store = Store::new(&self.engine, host_state);
@@ -700,6 +771,7 @@ impl WasmLoader {
             store: Mutex::new(store),
             instance: Mutex::new(Some(instance)),
             metadata,
+            disabled: AtomicBool::new(false),
         };
 
         let plugin = Arc::new(Mutex::new(plugin_instance));
@@ -799,6 +871,7 @@ impl WasmLoader {
             min_proxy_version: "0.1.0".to_string(),
             dependencies: vec![],
             permissions: vec![],
+            events: kojacoord_plugin_abi::default_event_mask(),
         };
 
         match find_custom_section(module_bytes, &["kojacoord_metadata", "kojacoord:meta"]) {
@@ -945,13 +1018,19 @@ pub struct WasmPluginAdapter {
 
 impl WasmPluginAdapter {
     pub fn new(instance: Arc<Mutex<WasmPluginInstance>>, loader: Arc<WasmLoader>) -> Self {
-        let (name, version, author, description) = {
+        let (name, version, author, description, subscribed_events) = {
             let guard = instance.lock().unwrap();
             (
                 guard.name.clone(),
                 guard.version.clone(),
                 guard.metadata.author.clone(),
                 guard.metadata.description.clone(),
+                // Honour the plugin's declared event subscription from its
+                // manifest. Plugins that don't declare one fall back to
+                // `default_event_mask` (everything except the per-tick
+                // PlayerMove) via serde, so the host never does a WASM
+                // round-trip for an event the plugin ignores.
+                guard.metadata.events,
             )
         };
         Self {
@@ -961,7 +1040,7 @@ impl WasmPluginAdapter {
             version,
             author,
             description,
-            subscribed_events: kojacoord_plugin_abi::ALL_EVENTS,
+            subscribed_events,
         }
     }
 

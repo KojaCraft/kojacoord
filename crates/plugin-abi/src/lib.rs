@@ -333,6 +333,21 @@ pub struct PluginMetadata {
     pub min_proxy_version: String,
     pub dependencies: Vec<String>,
     pub permissions: Vec<PluginPermission>,
+    /// Bitmask of [`PluginEventKind`] the plugin wants delivered to its
+    /// `handle_event`. The host skips dispatching (and the per-event WASM
+    /// round-trip) for any event not in this mask — critical for
+    /// high-frequency events like `PlayerMove`. Defaults to
+    /// [`default_event_mask`] for older plugins whose serialized metadata
+    /// predates this field.
+    #[serde(default = "default_event_mask")]
+    pub events: u32,
+}
+
+/// Default event subscription for plugins that don't declare `events`: every
+/// event except the per-tick `PlayerMove` (which is too hot to route through
+/// WASM unless explicitly requested).
+pub fn default_event_mask() -> u32 {
+    ALL_EVENTS & !(PluginEventKind::PlayerMove as u32)
 }
 
 impl PluginMetadata {
@@ -346,6 +361,7 @@ impl PluginMetadata {
             min_proxy_version: "0.1.0".to_string(),
             dependencies: Vec::new(),
             permissions: Vec::new(),
+            events: default_event_mask(),
         }
     }
 }

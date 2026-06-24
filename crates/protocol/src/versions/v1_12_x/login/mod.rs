@@ -238,7 +238,6 @@ impl Decode for ProfileProperty {
 pub struct ClientboundLoginSuccess {
     pub uuid: uuid::Uuid,
     pub username: String,
-    pub properties: Vec<ProfileProperty>,
 }
 
 impl PacketId for ClientboundLoginSuccess {
@@ -258,11 +257,12 @@ impl Encode for ClientboundLoginSuccess {
         VarInt(user_bytes.len() as i32).encode(dst)?;
         dst.put_slice(user_bytes);
 
-        VarInt(self.properties.len() as i32).encode(dst)?;
-        for prop in &self.properties {
-            prop.encode(dst)?;
-        }
-
+        // 1.9–1.15.2 (proto 340–578) LoginSuccess is exactly
+        // { String UUID, String username } on the wire — Mojang did not add
+        // the profile-properties trailer until 1.19 (proto 759). Writing a
+        // properties array here (even an empty one) appends bytes the client
+        // never reads, which it rejects as
+        // "Packet 2/2 ... was larger than I expected, found N bytes extra".
         Ok(())
     }
 }
@@ -308,17 +308,9 @@ impl Decode for ClientboundLoginSuccess {
             ))
         })?;
 
-        let prop_count = VarInt::decode(src)?.0 as usize;
-        let mut properties = Vec::with_capacity(prop_count);
-        for _ in 0..prop_count {
-            properties.push(ProfileProperty::decode(src)?);
-        }
-
-        Ok(Self {
-            uuid,
-            username,
-            properties,
-        })
+        // No properties trailer in this era — see the matching note in
+        // `encode`. The packet ends after the username string.
+        Ok(Self { uuid, username })
     }
 }
 
@@ -536,11 +528,6 @@ mod tests {
         let p = ClientboundLoginSuccess {
             uuid: uuid::Uuid::new_v4(),
             username: "Steve".to_string(),
-            properties: vec![ProfileProperty {
-                name: "textures".to_string(),
-                value: "abc123".to_string(),
-                signature: Some("sig".to_string()),
-            }],
         };
         let mut buf = BytesMut::new();
         p.encode(&mut buf).unwrap();

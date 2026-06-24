@@ -45,8 +45,8 @@ pub use control_plane::{ControlPlaneConfig, ControlPlaneServer, ControlPlaneStat
 pub use data::{db, permissions};
 pub use features::{commands, exploit_guard, server_selector, transfer};
 pub use net::{
-    connection, connection_pool, connection_throttle, converter, limbo, limbo_packets,
-    login_packets, modloader, packet_builder, packet_ids, packet_io, plugin_decoder, relay,
+    connection, connection_pool, connection_throttle, limbo, limbo_packets, login_packets,
+    modloader, packet_builder, packet_ids, packet_io, plugin_decoder, relay,
 };
 pub use protocol::{
     ConverterBuilder, ConverterInfo, CoverageStatus, ProtocolCoverage, VersionPair,

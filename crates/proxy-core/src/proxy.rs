@@ -36,7 +36,6 @@ use crate::failover::FailoverManager;
 use crate::health_probe::start_health_probes;
 use crate::metrics::ProxyMetrics;
 use crate::metrics_player::PlayerMetricsRegistry;
-use crate::net::converter::chunk_repack::ChunkRepacker;
 use crate::net::plugin_channel_rate_limit::PluginChannelRateLimiter;
 use crate::protocol::ProtocolCoverage;
 use crate::routing::RoutingRules;
@@ -238,9 +237,6 @@ pub struct ProxyState {
 
     /// Protocol coverage tracker for converter management
     pub protocol_coverage: Arc<ProtocolCoverage>,
-
-    /// Chunk repacker for cross-version chunk data conversion
-    pub chunk_repacker: Arc<ChunkRepacker>,
 
     /// Encryption manager for pluggable encryption algorithms
     pub encryption_manager: Arc<EncryptionManager>,
@@ -508,9 +504,6 @@ impl ProxyState {
         let protocol_coverage = Arc::new(ProtocolCoverage::new());
         tracing::info!("Protocol coverage tracker initialized");
 
-        let chunk_repacker = Arc::new(ChunkRepacker::new());
-        tracing::info!("Chunk repacker initialized");
-
         let encryption_manager = Arc::new(EncryptionManager::new());
         tracing::info!(
             "Encryption manager initialized with algorithms: {:?}",
@@ -596,7 +589,6 @@ impl ProxyState {
                         .to_string(),
             })),
             protocol_coverage,
-            chunk_repacker,
             encryption_manager,
             control_plane_state,
             control_plane_server: None,

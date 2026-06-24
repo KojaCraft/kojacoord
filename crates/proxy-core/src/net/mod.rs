@@ -10,7 +10,6 @@
 pub mod connection;
 pub mod connection_pool;
 pub mod connection_throttle;
-pub mod converter;
 pub mod limbo;
 pub mod limbo_packets;
 pub mod login_packets;
