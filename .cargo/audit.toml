@@ -1,0 +1,38 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa 0.9.x Marvin Attack (timing sidechannel).
+    # No fixed upgrade available. Mitigated by: network-level rate limiting,
+    # short session token lifetimes, and the proxy never exposes raw RSA
+    # decryption to untrusted clients (only Mojang session-server verification).
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0437: protobuf 2.28 uncontrolled recursion.
+    # Transitive via tonic 0.11 -> prost 0.12. The proxy never deserialises
+    # untrusted protobuf from the network (only gRPC control-plane traffic
+    # between trusted peers). Upgrade blocked on tonic 0.12+.
+    "RUSTSEC-2024-0437",
+
+    # RUSTSEC-2026-0049: rustls-webpki 0.102.8 CRL Distribution Point matching.
+    # RUSTSEC-2026-0098: rustls-webpki 0.102.8 URI name constraints accepted.
+    # RUSTSEC-2026-0099: rustls-webpki 0.102.8 wildcard name constraints accepted.
+    # RUSTSEC-2026-0104: rustls-webpki 0.102.8 CRL parsing panic.
+    # Transitive via tonic 0.11 -> tokio-rustls 0.25 -> rustls 0.22.
+    # Only affects gRPC control-plane TLS between trusted peers.
+    # Upgrade blocked on tonic 0.12+ which uses rustls 0.23+ / webpki 0.103+.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # RUSTSEC-2025-0057: fxhash unmaintained (transitive via wasmtime).
+    # No security vulns; only informational.
+    "RUSTSEC-2025-0057",
+
+    # RUSTSEC-2024-0436: paste unmaintained (transitive).
+    # No security vulns; only informational.
+    "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained (transitive via tonic).
+    # No security vulns; only informational.
+    "RUSTSEC-2025-0134",
+]

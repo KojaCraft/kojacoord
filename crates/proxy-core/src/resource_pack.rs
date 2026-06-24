@@ -49,7 +49,9 @@ pub fn build_resource_pack_packet(
         765 => 0x40,
         766 | 767 => 0x46,
         768..=u32::MAX => 0x4A,
-        _ => unreachable!(),
+        // Unreachable: the `< 765` guard above rejects everything below 765,
+        // so the ranges 765 / 766..=767 / 768.. cover all remaining values.
+        _ => unreachable!("protocol id guaranteed >= 765 by guard above"),
     };
 
     let mut payload = BytesMut::new();

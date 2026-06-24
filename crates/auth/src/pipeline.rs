@@ -212,8 +212,8 @@ impl AuthPipeline {
     ) -> Result<(AuthState, Vec<AuthOutbound>), AuthError> {
         match &self.state {
             AuthState::AwaitingLoginStart => {
-                let username = match &event {
-                    AuthEvent::LoginStart { username, .. } => username.clone(),
+                let username = match event {
+                    AuthEvent::LoginStart { username, .. } => username,
                     _ => return Err(AuthError::EncryptionSetupFailed("unexpected event".into())),
                 };
 
@@ -266,28 +266,24 @@ impl AuthPipeline {
                 username,
                 client_ip,
             } => {
-                let (shared_secret_enc, verify_token_enc, proto_version) = match &event {
-                    AuthEvent::EncryptionResponse {
-                        shared_secret_enc,
-                        verify_token_enc,
-                        proto_version,
-                    } => (
-                        shared_secret_enc.clone(),
-                        verify_token_enc.clone(),
-                        *proto_version,
-                    ),
-                    _ => return Err(AuthError::EncryptionSetupFailed("unexpected event".into())),
+                let AuthEvent::EncryptionResponse {
+                    shared_secret_enc,
+                    verify_token_enc,
+                    proto_version,
+                } = event
+                else {
+                    return Err(AuthError::EncryptionSetupFailed("unexpected event".into()));
                 };
                 let stored_token = *verify_token;
                 let username = username.clone();
                 let client_ip = *client_ip;
 
                 let rsa_key_1 = self.rsa_key.clone();
-                let ss_enc = shared_secret_enc.clone();
-                let shared_secret =
-                    tokio::task::spawn_blocking(move || rsa_decrypt(&rsa_key_1, &ss_enc))
-                        .await
-                        .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
+                let shared_secret = tokio::task::spawn_blocking(move || {
+                    rsa_decrypt(&rsa_key_1, &shared_secret_enc)
+                })
+                .await
+                .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
 
                 // 1.19 / 1.19.1 / 1.19.2 (proto 759-760) clients with a
                 // Mojang profile key send the SIGNED form of the
@@ -312,11 +308,11 @@ impl AuthPipeline {
                     }
                 } else {
                     let rsa_key_2 = self.rsa_key.clone();
-                    let vt_enc = verify_token_enc.clone();
-                    let decrypted_token =
-                        tokio::task::spawn_blocking(move || rsa_decrypt(&rsa_key_2, &vt_enc))
-                            .await
-                            .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
+                    let decrypted_token = tokio::task::spawn_blocking(move || {
+                        rsa_decrypt(&rsa_key_2, &verify_token_enc)
+                    })
+                    .await
+                    .map_err(|_| AuthError::EncryptionSetupFailed("task panic".into()))??;
 
                     if decrypted_token.as_slice() != stored_token.as_slice() {
                         return Err(AuthError::VerifyTokenMismatch);

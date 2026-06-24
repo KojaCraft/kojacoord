@@ -415,6 +415,7 @@ macro_rules! plugin_manifest {
         $(, min_proxy_version: $minv:expr)?
         $(, dependencies: [ $($dep:expr),* $(,)? ])?
         $(, permissions: [ $($perm:ident),* $(,)? ])?
+        $(, events: [ $($evt:ident),* $(,)? ])?
         $(,)?
     ) => {
         #[no_mangle]
@@ -426,6 +427,9 @@ macro_rules! plugin_manifest {
             $( __m.min_proxy_version = ($minv).into(); )?
             $( __m.dependencies = ::std::vec![ $( ($dep).into() ),* ]; )?
             $( __m.permissions = ::std::vec![ $( $crate::PluginPermission::$perm ),* ]; )?
+            // When `events:` is declared, subscribe to exactly those kinds so
+            // the host never does a WASM round-trip for events we ignore.
+            $( __m.events = 0 $( | ($crate::PluginEventKind::$evt as u32) )*; )?
             $crate::__return_metadata(&__m)
         }
     };

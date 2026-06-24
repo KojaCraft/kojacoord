@@ -130,25 +130,22 @@ impl ClusterCoordinator {
             }
         }
 
+        // `nodes` is guaranteed non-empty by the early return above, so the
+        // fallback `min_by_key` always yields a node. Iterate by reference and
+        // clone only the elected node rather than cloning the whole Vec.
         let leader = if let Some(id) = leader_id {
             nodes
-                .clone()
-                .into_iter()
+                .iter()
                 .find(|n| n.id == id)
-                .unwrap_or_else(|| {
-                    nodes
-                        .clone()
-                        .into_iter()
-                        .min_by_key(|n| n.id)
-                        .expect("At least one node exists")
-                })
+                .or_else(|| nodes.iter().min_by_key(|n| n.id))
+                .expect("at least one node exists (checked non-empty above)")
         } else {
             nodes
-                .clone()
-                .into_iter()
+                .iter()
                 .min_by_key(|n| n.id)
-                .expect("At least one node exists")
-        };
+                .expect("at least one node exists (checked non-empty above)")
+        }
+        .clone();
 
         *self.leader_id.write().await = Some(leader.id);
 

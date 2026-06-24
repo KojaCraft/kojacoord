@@ -29,7 +29,7 @@ use uuid::Uuid;
 use aes::cipher::BlockEncrypt;
 use aes::Aes128;
 use bytes::{BufMut, Bytes, BytesMut};
-use kojacoord_protocol::{CanonicalVersion, Epoch, MinecraftEdition, ProtocolVersion};
+use kojacoord_protocol::{CanonicalVersion, Epoch, MinecraftEdition};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -1883,7 +1883,9 @@ impl ClientConnection {
             server_compression,
         )
         .await?;
-        let backend_protocol = self.backend_protocol_for(Some(target));
+        // Backend speaks the client's protocol (ViaVersion mirrors it); see
+        // `connect_to_relay`.
+        let backend_protocol = self.protocol_version;
         let backend_threshold = self
             .complete_backend_login(
                 &mut backend,
@@ -1904,7 +1906,80 @@ impl ClientConnection {
         session.write().await.current_server = Some(target.to_owned());
         tracing::debug!(username = %username, server = %target, "switched player to backend");
 
+        // Legacy (pre-1.16, i32-dimension) clients won't rebuild the world when
+        // the destination dimension matches the one they're already in — and
+        // after limbo they're always in the limbo world (dimension 0). Without a
+        // fix, switching to a dimension-0 lobby leaves the player stuck/glitched
+        // ("can't move"). Modern clients go through ViaVersion and are untouched.
+        if self.protocol_version < 735 {
+            self.apply_switch_world_reset(&mut backend, backend_threshold)
+                .await?;
+        }
+
         Ok((backend, backend_threshold))
+    }
+
+    /// Force a client-side world reload after a live server switch for legacy
+    /// (i32-dimension, pre-1.16) clients.
+    ///
+    /// Mirrors BungeeCord's `ServerConnector` dimension bounce: read the new
+    /// backend's first Play packet (vanilla always sends JoinGame first), and
+    /// if its dimension equals the dimension the client is currently in (the
+    /// limbo world = dimension 0), send a Respawn to the opposite dimension
+    /// before forwarding the JoinGame. Vanilla only rebuilds the client world
+    /// on a dimension *change*, so the bounce guarantees the reload.
+    ///
+    /// `read_packet` consumes exactly one frame, so the relay's reader picks up
+    /// cleanly from the packet after the JoinGame.
+    async fn apply_switch_world_reset(
+        &mut self,
+        backend: &mut TcpStream,
+        backend_threshold: i32,
+    ) -> Result<(), ConnectionError> {
+        use bytes::Buf;
+        use kojacoord_protocol::codec::{Decode, Encode};
+        use kojacoord_protocol::versions::v1_12_x::play::ClientboundRespawn;
+
+        /// Dimension of the synthetic limbo world (see `limbo_packets::v1_12`).
+        const LIMBO_DIMENSION: i32 = 0;
+
+        let join = crate::packet_io::read_packet(backend, backend_threshold).await?;
+
+        let join_game_id = cb_play(self.protocol_version, "ClientboundJoinGame");
+        let mut cur = join.clone();
+        let pkt_id = VarInt::decode(&mut cur).map(|v| v.0 as u8).unwrap_or(0xFF);
+
+        // Legacy JoinGame body: entity_id(i32), gamemode(u8), dimension(i32), …
+        if pkt_id == join_game_id && cur.remaining() >= 9 {
+            let _entity_id = cur.get_i32();
+            let _gamemode = cur.get_u8();
+            let dimension = cur.get_i32();
+
+            if dimension == LIMBO_DIMENSION {
+                let bounce_dim = if dimension >= 0 { -1 } else { 0 };
+                let respawn = ClientboundRespawn {
+                    dimension: bounce_dim,
+                    difficulty: 0,
+                    game_mode: 0,
+                    level_type: "flat".to_string(),
+                };
+                let mut buf = BytesMut::new();
+                VarInt(cb_play(self.protocol_version, "ClientboundRespawn") as i32)
+                    .encode(&mut buf)?;
+                respawn.encode(&mut buf)?;
+                crate::packet_io::write_packet(&mut self.stream, &buf, self.compression_threshold)
+                    .await?;
+                tracing::debug!(
+                    backend_dim = dimension,
+                    bounce_dim,
+                    "switch: dimension bounce to force client world reload"
+                );
+            }
+        }
+
+        // Forward the backend's first Play packet (the JoinGame) to the client.
+        crate::packet_io::write_packet(&mut self.stream, &join, self.compression_threshold).await?;
+        Ok(())
     }
 
     pub async fn send_set_compression(&mut self) -> Result<(), ConnectionError> {
@@ -2274,7 +2349,9 @@ impl ClientConnection {
                                 .run_limbo_then_connect(username, session, &fwd_host, uuid)
                                 .await;
                         }
-                        let backend_protocol = self.backend_protocol_for(Some(&server_name));
+                        // Backend speaks the client's protocol (ViaVersion mirrors
+                        // it); see `connect_to_relay`.
+                        let backend_protocol = self.protocol_version;
                         match self
                             .complete_backend_login(
                                 &mut conn,
@@ -2378,8 +2455,9 @@ impl ClientConnection {
             server_compression,
         )
         .await?;
-        let backend_protocol =
-            self.backend_protocol_for(selected_server.as_ref().map(|b| b.name.as_str()));
+        // Backend speaks the client's protocol (ViaVersion mirrors it); see
+        // `connect_to_relay`.
+        let backend_protocol = self.protocol_version;
         let backend_threshold = self
             .complete_backend_login(
                 &mut backend,
@@ -2419,37 +2497,6 @@ impl ClientConnection {
             kojacoord_config::ForwardingMode::Bungeecord
         } else {
             global
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    /// Resolve the backend protocol the proxy expects to be speaking on the
-    /// wire to the named target server. Used so login/encryption-request
-    /// rewrites pick the right wire shape rather than blindly using the
-    /// client's protocol. Falls back to:
-    ///   * the lobby's configured `lobby_server_protocol` for the lobby
-    ///   * the per-server `backend_protocol` if configured
-    ///   * 1.12.2 (340) for V1_7 / V1_8 epoch clients with no explicit override
-    ///   * the client's own protocol otherwise
-    fn backend_protocol_for(&self, target_server: Option<&str>) -> u32 {
-        let lobby_name = &self.state.config.proxy.lobby_server_name;
-        let is_lobby = target_server
-            .map(|name| name == lobby_name.as_str())
-            .unwrap_or(false);
-
-        if is_lobby {
-            return self.state.config.proxy.lobby_server_protocol;
-        }
-        if let Some(name) = target_server {
-            if let Some(srv) = self.state.config.servers.iter().find(|s| s.name == name) {
-                if srv.backend_protocol > 0 {
-                    return srv.backend_protocol;
-                }
-            }
-        }
-        match nearest(self.protocol_version).epoch() {
-            Epoch::V1_7 | Epoch::V1_8 => ProtocolVersion::V1_12_2.id(),
-            _ => self.protocol_version,
         }
     }
 
@@ -3151,68 +3198,15 @@ impl ClientConnection {
         session: SharedSession,
         backend_compression_threshold: i32,
     ) -> Result<crate::relay::RelayExit, ConnectionError> {
-        let current_server = session.read().await.current_server.clone();
-        let lobby_name = &self.state.config.proxy.lobby_server_name;
-
-        let is_lobby = current_server
-            .as_deref()
-            .map(|name| name == lobby_name.as_str())
-            .unwrap_or(false);
-
-        let backend_protocol = self.backend_protocol_for(current_server.as_deref());
-
-        // Reject a client we can't faithfully translate to this backend. When
-        // the protocols differ and no converter covers the pair (e.g. a 26.x
-        // client whose shifted play ids have no remap onto an older backend),
-        // forwarding would feed the client mismatched-id packets and hang it at
-        // "Joining world". Kick with a clear "Outdated client" notice and the
-        // protocol the backend actually speaks.
-        if backend_protocol != self.protocol_version
-            && !crate::converter::has_support(self.protocol_version, backend_protocol)
-        {
-            let reason = format!(
-                r#"{{"text":"Outdated client! This server requires protocol {}. Please connect with a matching version.","color":"red"}}"#,
-                backend_protocol
-            );
-            tracing::warn!(
-                client_proto = self.protocol_version,
-                backend_proto = backend_protocol,
-                "rejecting client: no converter for client↔backend protocol pair"
-            );
-            let canonical = nearest(self.protocol_version).canonical_typed_packet_version();
-            if let Some(pkt) = crate::login_packets::build_play_disconnect(
-                canonical,
-                self.protocol_version,
-                &reason,
-            ) {
-                let mut buf = BytesMut::new();
-                VarInt(pkt.id as i32).encode(&mut buf)?;
-                buf.extend_from_slice(&pkt.body);
-                let _ = crate::packet_io::write_packet(
-                    &mut self.stream,
-                    &buf,
-                    self.compression_threshold,
-                )
-                .await;
-            }
-            return Err(ConnectionError::Closed);
-        }
-
-        // Legacy clients always need conversion (their wire shape differs from
-        // every modern backend); other clients need it whenever the lobby's
-        // protocol doesn't match theirs. Epoch grouping makes "legacy" clean.
-        let client_epoch = nearest(self.protocol_version).epoch();
-        let conversion_enabled = (is_lobby && backend_protocol != self.protocol_version)
-            || matches!(client_epoch, Epoch::PreNetty | Epoch::V1_7 | Epoch::V1_8);
-
-        if conversion_enabled {
-            tracing::debug!(
-                client_proto  = self.protocol_version,
-                backend_proto = backend_protocol,
-                server        = %current_server.as_deref().unwrap_or("?"),
-                "protocol conversion enabled"
-            );
-        }
+        // The proxy speaks the client's protocol on BOTH links: it announces the
+        // client's version to the backend in the handshake, so ViaVersion mirrors
+        // that version on the proxy↔backend connection and translates down to the
+        // real server version itself. Cross-version conversion was removed and the
+        // relay forwards play packets verbatim, so the backend protocol the proxy
+        // reads/writes is always the client's. (Chat-signing/config-synthesis
+        // comparisons against this value therefore self-disable, which is correct
+        // — ViaVersion already handles them.)
+        let backend_protocol = self.protocol_version;
 
         PacketRelay {
             client_stream: std::mem::replace(&mut self.stream, McStream::empty()),
@@ -3223,7 +3217,6 @@ impl ClientConnection {
             client_compression_threshold: self.compression_threshold,
             backend_compression_threshold,
             ml_kind: self.ml_session.kind,
-            conversion_enabled: is_lobby,
             backend_protocol,
         }
         .run()

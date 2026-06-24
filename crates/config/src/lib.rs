@@ -165,9 +165,6 @@ pub struct ProxySection {
     #[serde(default = "default_lobby_name")]
     pub lobby_server_name: String,
 
-    #[serde(default)]
-    pub lobby_server_protocol: u32,
-
     /// Stable node identity — generated once on first run and persisted to the
     /// config file. Never regenerated unless the field is manually cleared.
     #[serde(default)]
@@ -204,7 +201,6 @@ impl Default for ProxySection {
             chat_signing_translation: false,
             max_connections_per_ip: default_max_conns_per_ip(),
             lobby_server_name: default_lobby_name(),
-            lobby_server_protocol: 47,
             // Empty on first construction — ensure_server_id() fills and
             // persists the value before Figment reads the file.
             server_id: String::new(),
@@ -341,9 +337,6 @@ pub struct ServerEntry {
     /// Region for this server (e.g., "us-east", "eu-west", "asia")
     #[serde(default)]
     pub region: String,
-
-    #[serde(default)]
-    pub backend_protocol: u32,
 
     #[serde(default)]
     pub backend_type: BackendType,
