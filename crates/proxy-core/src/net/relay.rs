@@ -842,7 +842,6 @@ impl PacketRelay {
                     // Verbatim forward (no cross-version conversion). ViaVersion
                     // on the backend handles any protocol bridging.
                     // Config synthesis: inject RegistryData (766+) + FinishConfiguration
-                    
                     if synthesis_mode == SynthesisMode::ClientSide {
                         let canonical = ProtocolVersion::from_id(proto);
                         if pkt_id == 0x03 && canonical.has_configuration_phase() {
