@@ -132,6 +132,20 @@ pub struct WasmPluginInstance {
 /// interruption.
 const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How many epoch ticks a single guest call (instantiation, lifecycle, or
+/// `handle_event`) may run before the watchdog traps it. At `EPOCH_TICK`
+/// = 100ms this is a ~5s budget. The store deadline must be (re-)armed
+/// before every guest invocation: with `epoch_interruption(true)` a store
+/// defaults to a deadline of 0, so an un-armed call traps *immediately*
+/// with `wasm trap: interrupt` (the watchdog has already advanced the
+/// engine epoch past 0 by the time any plugin runs).
+const EPOCH_DEADLINE_TICKS: u64 = 50;
+
+/// Arm `store` with a fresh epoch deadline ahead of a guest call.
+fn arm_epoch_deadline(store: &mut Store<WasmHostState>) {
+    store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+}
+
 pub struct WasmLoader {
     engine: Engine,
     plugins: Arc<RwLock<HashMap<String, Arc<Mutex<WasmPluginInstance>>>>>,
@@ -149,6 +163,34 @@ fn run_blocking<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F)
         tokio::task::block_in_place(|| handle.block_on(fut))
     } else {
         handle.block_on(fut)
+    }
+}
+
+/// Upper bound on any single blocking host I/O call (Redis / HTTP).
+///
+/// These imports are driven synchronously via [`run_blocking`] while the
+/// calling plugin's lock is held, often on a relay hot path (e.g. publishing
+/// chat from `handle_event`). An unbounded call against a wedged Redis or a
+/// black-holed HTTP endpoint would pin the worker thread *and* the plugin lock
+/// indefinitely, freezing the whole proxy. Bounding every call keeps a hung
+/// backend to a degraded-but-alive failure instead of a deadlock.
+const HOST_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`run_blocking`] for a fallible host I/O future, bounded by
+/// [`HOST_IO_TIMEOUT`]. A timeout is surfaced as an `Err` so callers treat a
+/// hung backend exactly like a failed call. The timer runs inside the runtime
+/// context that `run_blocking` enters, so it fires even while the worker is
+/// parked in `block_on`.
+fn run_blocking_io<T, E: std::fmt::Display>(
+    handle: &tokio::runtime::Handle,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, anyhow::Error> {
+    match run_blocking(handle, tokio::time::timeout(HOST_IO_TIMEOUT, fut)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "host I/O timed out after {HOST_IO_TIMEOUT:?}"
+        )),
     }
 }
 
@@ -378,7 +420,7 @@ impl WasmLoader {
                     return Ok::<u32, anyhow::Error>(0);
                 };
                 let chan_for_log = chan.clone();
-                let result = run_blocking(
+                let result = run_blocking_io(
                     &handle,
                     async move { conn.publish::<_, _, ()>(chan, msg).await },
                 );
@@ -408,7 +450,7 @@ impl WasmLoader {
                     return Ok::<i32, anyhow::Error>(-1);
                 };
                 let value: Option<Vec<u8>> =
-                    run_blocking(&handle, async move { conn.get(key).await }).unwrap_or(None);
+                    run_blocking_io(&handle, async move { conn.get(key).await }).unwrap_or(None);
                 match value {
                     Some(bytes) => Ok(write_out(&mut caller, out_ptr, out_cap, &bytes) as i32),
                     None => Ok(-1),
@@ -430,8 +472,9 @@ impl WasmLoader {
                 let (Some(handle), Some(mut conn)) = redis_ready(&caller) else {
                     return Ok::<u32, anyhow::Error>(0);
                 };
-                let ok = run_blocking(&handle, async move { conn.set::<_, _, ()>(key, val).await })
-                    .is_ok();
+                let ok =
+                    run_blocking_io(&handle, async move { conn.set::<_, _, ()>(key, val).await })
+                        .is_ok();
                 Ok(u32::from(ok))
             },
         )?;
@@ -445,7 +488,8 @@ impl WasmLoader {
                 let (Some(handle), Some(mut conn)) = redis_ready(&caller) else {
                     return Ok::<u32, anyhow::Error>(0);
                 };
-                let ok = run_blocking(&handle, async move { conn.del::<_, ()>(key).await }).is_ok();
+                let ok =
+                    run_blocking_io(&handle, async move { conn.del::<_, ()>(key).await }).is_ok();
                 Ok(u32::from(ok))
             },
         )?;
@@ -459,7 +503,7 @@ impl WasmLoader {
                 let (Some(handle), Some(mut conn)) = redis_ready(&caller) else {
                     return Ok::<u32, anyhow::Error>(0);
                 };
-                let ok = run_blocking(&handle, async move {
+                let ok = run_blocking_io(&handle, async move {
                     conn.expire::<_, ()>(key, secs as i64).await
                 })
                 .is_ok();
@@ -631,7 +675,7 @@ impl WasmLoader {
                     return Ok(-1);
                 };
                 let client = caller.data().http.clone();
-                let result = run_blocking(&handle, async move {
+                let result = run_blocking_io(&handle, async move {
                     let m = reqwest::Method::from_bytes(method.as_bytes())
                         .unwrap_or(reqwest::Method::GET);
                     let mut req = client.request(m, &url);
@@ -737,6 +781,11 @@ impl WasmLoader {
         };
 
         let mut store = Store::new(&self.engine, host_state);
+        // Arm the epoch deadline before any guest code runs. Instantiation
+        // itself executes the module's start/data initialisation under the
+        // watchdog, so without this the plugin traps with `wasm trap:
+        // interrupt` the instant it is instantiated.
+        arm_epoch_deadline(&mut store);
 
         let module = Module::from_binary(&self.engine, &module_bytes)
             .context("Failed to compile WASM module")?;
@@ -749,6 +798,7 @@ impl WasmLoader {
         };
 
         if let Ok(init_func) = instance.get_typed_func::<(), ()>(&mut store, "init") {
+            arm_epoch_deadline(&mut store);
             init_func
                 .call(&mut store, ())
                 .context("Failed to call init function")?;
@@ -843,6 +893,7 @@ impl WasmLoader {
         let func = instance
             .get_typed_func::<(), u64>(&mut *store, "metadata")
             .ok()?;
+        arm_epoch_deadline(store);
         let packed = func.call(&mut *store, ()).ok()?;
         if packed == 0 {
             return None;
@@ -1057,6 +1108,7 @@ impl WasmPluginAdapter {
             .ok_or_else(|| anyhow::anyhow!("Plugin instance not initialized"))?;
         let mut store = guard.store.lock().unwrap();
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, func_name) {
+            arm_epoch_deadline(&mut store);
             func.call(&mut *store, ())
                 .with_context(|| format!("Failed to call {func_name}"))?;
         }
@@ -1117,6 +1169,9 @@ impl Plugin for WasmPluginAdapter {
             None => return Ok(None),
         };
         let mut store = guard.store.lock().unwrap();
+        // Arm the watchdog for the whole guest round-trip (alloc + the
+        // handle_event call + dealloc all run guest code).
+        arm_epoch_deadline(&mut store);
 
         let event_bytes = match serde_json::to_vec(event) {
             Ok(b) => b,
@@ -1190,6 +1245,7 @@ impl Plugin for WasmPluginAdapter {
             None => return vec![],
         };
         let mut store = guard.store.lock().unwrap();
+        arm_epoch_deadline(&mut store);
 
         let Ok(get_hooks) = instance.get_typed_func::<(), u32>(&mut *store, "get_packet_hooks")
         else {

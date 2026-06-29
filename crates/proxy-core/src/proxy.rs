@@ -1380,8 +1380,9 @@ impl ProxyState {
                 online,
             } => {
                 if let Some(db) = &self.db {
-                    let server_name = server.unwrap_or_default();
-                    if let Err(e) = db.update_player_status(uuid, &server_name, online).await {
+                    // Pass server through as-is: `None` clears the column (NULL)
+                    // on disconnect rather than writing an empty string.
+                    if let Err(e) = db.update_player_status(uuid, server.as_deref(), online).await {
                         tracing::warn!(plugin = %plugin_name, error = %e, "Failed to update player status");
                     }
                 }

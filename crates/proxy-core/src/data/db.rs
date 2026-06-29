@@ -93,7 +93,7 @@ impl Db {
             "CREATE TABLE IF NOT EXISTS players (
                 uuid VARCHAR(36) NOT NULL PRIMARY KEY,
                 username VARCHAR(16) NOT NULL,
-                role VARCHAR(32) NOT NULL DEFAULT 'PLAYER',
+                `rank` VARCHAR(32) NOT NULL DEFAULT 'PLAYER',
                 online TINYINT(1) NOT NULL DEFAULT 0,
                 server VARCHAR(64) NULL,
                 first_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -585,8 +585,11 @@ impl Db {
         match self.db_type {
             DbType::MySql => {
                 if let Some(pool) = &self.mysql_pool {
+                    // Create the row if absent, and in all cases mark the player
+                    // online and refresh username + last_seen. The current server
+                    // is set separately once routing picks one (UpdatePlayerStatus).
                     sqlx::query(
-                        "INSERT INTO players (uuid, username) VALUES (?, ?) ON DUPLICATE KEY UPDATE username = VALUES(username), last_seen = CURRENT_TIMESTAMP",
+                        "INSERT INTO players (uuid, username, online) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE username = VALUES(username), online = 1, last_seen = CURRENT_TIMESTAMP",
                     )
                     .bind(uuid.hyphenated().to_string())
                     .bind(username)
@@ -597,7 +600,7 @@ impl Db {
             DbType::Sqlite => {
                 if let Some(pool) = &self.sqlite_pool {
                     sqlx::query(
-                        "INSERT INTO players (uuid, username) VALUES (?, ?) ON CONFLICT(uuid) DO UPDATE SET username = excluded.username, last_seen = CURRENT_TIMESTAMP",
+                        "INSERT INTO players (uuid, username, online) VALUES (?, ?, 1) ON CONFLICT(uuid) DO UPDATE SET username = excluded.username, online = 1, last_seen = CURRENT_TIMESTAMP",
                     )
                     .bind(uuid.hyphenated().to_string())
                     .bind(username)
@@ -621,11 +624,12 @@ impl Db {
                 let Some(pool) = &self.mysql_pool else {
                     return Ok(None);
                 };
-                let row = sqlx::query("SELECT role FROM players WHERE uuid = ? LIMIT 1")
+                // `rank` is a reserved word in MySQL 8 — must be backtick-quoted.
+                let row = sqlx::query("SELECT `rank` FROM players WHERE uuid = ? LIMIT 1")
                     .bind(&uuid_str)
                     .fetch_optional(pool)
                     .await?;
-                Ok(row.map(|r| r.get::<String, _>("role")))
+                Ok(row.map(|r| r.get::<String, _>("rank")))
             },
             DbType::Sqlite => {
                 let Some(pool) = &self.sqlite_pool else {
@@ -1175,10 +1179,14 @@ impl Db {
         Ok(())
     }
 
+    /// Update a player's online flag and current server, always refreshing
+    /// `last_seen`. `server == None` clears the column (`NULL`) — used on
+    /// disconnect so a logged-off player has no lingering server. The row is
+    /// expected to exist already (created by [`Self::upsert_player_on_join`]).
     pub async fn update_player_status(
         &self,
         uuid: Uuid,
-        server: &str,
+        server: Option<&str>,
         online: bool,
     ) -> Result<(), sqlx::Error> {
         let uuid_str = uuid.hyphenated().to_string();
