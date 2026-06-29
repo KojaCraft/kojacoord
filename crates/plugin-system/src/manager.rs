@@ -27,7 +27,10 @@ pub struct PluginManager {
     wasm_loader: Arc<WasmLoader>,
     plugins: HashMap<String, (SharedPlugin, PluginMetadata)>,
     plugin_configs: HashMap<String, PluginContext>,
-    packet_hooks: Arc<RwLock<Vec<PacketEvent>>>,
+    // `Arc<PacketEvent>` so the hot packet path can snapshot the matching hooks
+    // under the read lock and then release it BEFORE executing any plugin code
+    // (see `snapshot_matching_hooks` + `run_hooks`).
+    packet_hooks: Arc<RwLock<Vec<Arc<PacketEvent>>>>,
     sandbox_enabled: bool,
     sandbox_config: SandboxConfig,
     /// Allowed permissions per plugin (from config)
@@ -385,11 +388,11 @@ impl PluginManager {
         if !hooks.is_empty() {
             let count = hooks.len();
             let mut hooks_lock = self.packet_hooks.write().unwrap_or_else(|e| e.into_inner());
-            let tagged_hooks: Vec<PacketEvent> = hooks
+            let tagged_hooks: Vec<Arc<PacketEvent>> = hooks
                 .into_iter()
                 .map(|mut h| {
                     h.plugin_name = metadata.name.clone();
-                    h
+                    Arc::new(h)
                 })
                 .collect();
             hooks_lock.extend(tagged_hooks);
@@ -680,43 +683,64 @@ impl PluginManager {
         responses
     }
 
+    /// Convenience: snapshot matching hooks and run them in one call. Holds the
+    /// registry lock only for the snapshot, never during execution.
     pub fn process_packet(&self, packet: &PacketData) -> PacketHookResult {
-        self.process_packet_inner(packet, false)
+        let hooks = self.snapshot_matching_hooks(packet);
+        Self::run_hooks(&hooks, packet)
     }
 
-    fn process_packet_inner(
-        &self,
+    /// Cheaply clone the hooks that match `packet`, holding the registry read
+    /// lock only for the duration of the snapshot. Callers should run the
+    /// returned hooks via [`run_hooks`](Self::run_hooks) *after* releasing any
+    /// outer lock (e.g. the proxy's `RwLock<PluginManager>`), so plugin code
+    /// never executes while a lock is held — that was the proxy-freeze cause.
+    pub fn snapshot_matching_hooks(&self, packet: &PacketData) -> Vec<Arc<PacketEvent>> {
+        let hooks = self.packet_hooks.read().unwrap_or_else(|e| e.into_inner());
+        hooks
+            .iter()
+            .filter(|h| h.matches(packet))
+            .cloned()
+            .collect()
+    }
+
+    /// Execute a previously-snapshotted hook set against `packet`. Pure over the
+    /// snapshot — holds no locks — so it is safe to call without the manager
+    /// lock. `matches()` ignores packet *data*, so a Modify re-pass reuses the
+    /// same snapshot.
+    pub fn run_hooks(hooks: &[Arc<PacketEvent>], packet: &PacketData) -> PacketHookResult {
+        Self::run_hooks_inner(hooks, packet, false)
+    }
+
+    fn run_hooks_inner(
+        hooks: &[Arc<PacketEvent>],
         packet: &PacketData,
         already_modified: bool,
     ) -> PacketHookResult {
-        let hooks = self.packet_hooks.read().unwrap_or_else(|e| e.into_inner());
-
-        for hook in hooks.iter() {
-            if hook.matches(packet) {
-                let outcome = crate::guard_plugin_call("packet_hook", || hook.execute(packet))
-                    .unwrap_or_else(|e| {
-                        log::error!("Packet hook panicked: {}", e);
-                        Ok(PacketHookResult::Forward)
-                    });
-                match outcome {
-                    Ok(PacketHookResult::Drop) => return PacketHookResult::Drop,
-                    Ok(PacketHookResult::Replace { packet_id, data }) => {
-                        return PacketHookResult::Replace { packet_id, data };
-                    },
-                    Ok(PacketHookResult::Modify(data)) => {
-                        let mut modified_packet = packet.clone();
-                        modified_packet.data = data;
-                        if already_modified {
-                            return PacketHookResult::Modify(modified_packet.data);
-                        }
-                        return self.process_packet_inner(&modified_packet, true);
-                    },
-                    Ok(PacketHookResult::Forward) => continue,
-                    Err(e) => {
-                        log::error!("Packet hook error: {}", e);
-                        continue;
-                    },
-                }
+        for hook in hooks {
+            let outcome = crate::guard_plugin_call("packet_hook", || hook.execute(packet))
+                .unwrap_or_else(|e| {
+                    log::error!("Packet hook panicked: {}", e);
+                    Ok(PacketHookResult::Forward)
+                });
+            match outcome {
+                Ok(PacketHookResult::Drop) => return PacketHookResult::Drop,
+                Ok(PacketHookResult::Replace { packet_id, data }) => {
+                    return PacketHookResult::Replace { packet_id, data };
+                },
+                Ok(PacketHookResult::Modify(data)) => {
+                    let mut modified_packet = packet.clone();
+                    modified_packet.data = data;
+                    if already_modified {
+                        return PacketHookResult::Modify(modified_packet.data);
+                    }
+                    return Self::run_hooks_inner(hooks, &modified_packet, true);
+                },
+                Ok(PacketHookResult::Forward) => continue,
+                Err(e) => {
+                    log::error!("Packet hook error: {}", e);
+                    continue;
+                },
             }
         }
 

@@ -124,7 +124,12 @@ impl PacketRelay {
             player_uuid: Some(player_uuid),
         };
 
-        let hook_result = state
+        // Snapshot the matching hooks while holding the manager lock, then
+        // RELEASE the lock before executing plugin code. Running hooks while
+        // holding the proxy-level `RwLock<PluginManager>` read lock let a slow
+        // or blocking plugin stall every connection and block plugin
+        // load/unload (write lock) — a proxy freeze.
+        let hooks = state
             .plugin_manager
             .read()
             .unwrap_or_else(|e| {
@@ -133,7 +138,8 @@ impl PacketRelay {
                 );
                 e.into_inner()
             })
-            .process_packet(&packet_data);
+            .snapshot_matching_hooks(&packet_data);
+        let hook_result = kojacoord_plugin_system::PluginManager::run_hooks(&hooks, &packet_data);
         match hook_result {
             PacketHookResult::Forward => Ok(data),
             PacketHookResult::Drop => Err(data),
@@ -835,7 +841,6 @@ impl PacketRelay {
 
                     // Verbatim forward (no cross-version conversion). ViaVersion
                     // on the backend handles any protocol bridging.
-
                     // Config synthesis: inject RegistryData (766+) + FinishConfiguration
                     if synthesis_mode == SynthesisMode::ClientSide {
                         let canonical = ProtocolVersion::from_id(proto);
