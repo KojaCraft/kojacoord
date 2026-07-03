@@ -1922,27 +1922,34 @@ impl ClientConnection {
     /// Force a client-side world reload after a live server switch for legacy
     /// (i32-dimension, pre-1.16) clients.
     ///
-    /// Mirrors BungeeCord's `ServerConnector` dimension bounce: read the new
-    /// backend's first Play packet (vanilla always sends JoinGame first), and
-    /// if its dimension equals the dimension the client is currently in (the
-    /// limbo world = dimension 0), send a Respawn to the opposite dimension
-    /// before forwarding the JoinGame. Vanilla only rebuilds the client world
-    /// on a dimension *change*, so the bounce guarantees the reload.
+    /// Mirrors BungeeCord's `ServerConnector` switch path: a client that is
+    /// already in the Play state must change worlds via `Respawn` packets, NOT
+    /// a second `JoinGame`. Vanilla only processes one `JoinGame` per
+    /// connection — forwarding the backend's `JoinGame` here desyncs the client
+    /// (frozen player, no gravity, "can't move").
+    ///
+    /// So we *consume* the backend's first Play packet (vanilla always sends
+    /// `JoinGame` first), read its dimension, and translate it into `Respawn`s:
+    ///   1. if the destination dimension equals the client's current (limbo)
+    ///      dimension, bounce to the opposite dimension first — vanilla only
+    ///      rebuilds the world on a dimension *change*;
+    ///   2. `Respawn` into the real destination dimension.
     ///
     /// `read_packet` consumes exactly one frame, so the relay's reader picks up
-    /// cleanly from the packet after the JoinGame.
+    /// cleanly from the packet after the `JoinGame` (chunks, position, …).
     async fn apply_switch_world_reset(
         &mut self,
         backend: &mut TcpStream,
         backend_threshold: i32,
     ) -> Result<(), ConnectionError> {
         use bytes::Buf;
-        use kojacoord_protocol::codec::{Decode, Encode};
-        use kojacoord_protocol::versions::v1_12_x::play::ClientboundRespawn;
+        use kojacoord_protocol::codec::Decode;
 
         /// Dimension of the synthetic limbo world (see `limbo_packets::v1_12`).
+        /// After limbo the client is always in this dimension.
         const LIMBO_DIMENSION: i32 = 0;
 
+        // Consume — but do NOT forward — the backend's first Play packet.
         let join = crate::packet_io::read_packet(backend, backend_threshold).await?;
 
         let join_game_id = cb_play(self.protocol_version, "ClientboundJoinGame");
@@ -1950,35 +1957,68 @@ impl ClientConnection {
         let pkt_id = VarInt::decode(&mut cur).map(|v| v.0 as u8).unwrap_or(0xFF);
 
         // Legacy JoinGame body: entity_id(i32), gamemode(u8), dimension(i32), …
-        if pkt_id == join_game_id && cur.remaining() >= 9 {
+        // We carry the backend's gamemode into the Respawn (as BungeeCord does
+        // with `login.getGameMode()`) — the backend doesn't resend it, so
+        // dropping it would land the player in the wrong gamemode.
+        let (target_dim, game_mode) = if pkt_id == join_game_id && cur.remaining() >= 9 {
             let _entity_id = cur.get_i32();
-            let _gamemode = cur.get_u8();
+            let game_mode = cur.get_u8();
             let dimension = cur.get_i32();
+            (dimension, game_mode)
+        } else {
+            // Not a JoinGame we recognise (shouldn't happen with vanilla).
+            // Forward it untouched rather than swallow a real packet.
+            tracing::warn!(
+                pkt_id,
+                "switch: backend's first Play packet was not a recognised JoinGame; forwarding verbatim"
+            );
+            crate::packet_io::write_packet(&mut self.stream, &join, self.compression_threshold)
+                .await?;
+            return Ok(());
+        };
 
-            if dimension == LIMBO_DIMENSION {
-                let bounce_dim = if dimension >= 0 { -1 } else { 0 };
-                let respawn = ClientboundRespawn {
-                    dimension: bounce_dim,
-                    difficulty: 0,
-                    game_mode: 0,
-                    level_type: "flat".to_string(),
-                };
-                let mut buf = BytesMut::new();
-                VarInt(cb_play(self.protocol_version, "ClientboundRespawn") as i32)
-                    .encode(&mut buf)?;
-                respawn.encode(&mut buf)?;
-                crate::packet_io::write_packet(&mut self.stream, &buf, self.compression_threshold)
-                    .await?;
-                tracing::debug!(
-                    backend_dim = dimension,
-                    bounce_dim,
-                    "switch: dimension bounce to force client world reload"
-                );
-            }
+        // Bounce only when the destination matches the client's current world.
+        if target_dim == LIMBO_DIMENSION {
+            let bounce_dim = if target_dim >= 0 { -1 } else { 0 };
+            self.send_switch_respawn(bounce_dim, game_mode).await?;
+            tracing::debug!(
+                target_dim,
+                bounce_dim,
+                "switch: dimension bounce to force client world reload"
+            );
         }
+        // Respawn into the real destination dimension.
+        self.send_switch_respawn(target_dim, game_mode).await?;
+        Ok(())
+    }
 
-        // Forward the backend's first Play packet (the JoinGame) to the client.
-        crate::packet_io::write_packet(&mut self.stream, &join, self.compression_threshold).await?;
+    /// Send a play-state `Respawn` to `dimension` (carrying `game_mode`) using
+    /// the legacy (pre-1.16) i32-dimension wire shape for the client's
+    /// protocol. Used by the live-switch world reset to move the client
+    /// between worlds without a second `JoinGame`. See
+    /// [`crate::limbo_packets::build_legacy_respawn`].
+    async fn send_switch_respawn(
+        &mut self,
+        dimension: i32,
+        game_mode: u8,
+    ) -> Result<(), ConnectionError> {
+        let proto = self.protocol_version;
+        if let Some(pkt) = crate::limbo_packets::build_legacy_respawn(proto, dimension, game_mode) {
+            crate::packet_io::write_typed_packet(
+                &mut self.stream,
+                pkt.id,
+                &pkt.body,
+                proto,
+                self.compression_threshold,
+            )
+            .await?;
+        } else {
+            tracing::warn!(
+                proto,
+                dimension,
+                "switch: no legacy Respawn shape for this protocol; skipping world reset"
+            );
+        }
         Ok(())
     }
 

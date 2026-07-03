@@ -14,6 +14,11 @@ use crate::{proxy::ProxyState, session::SharedSession};
 pub enum CommandResult {
     Handled,
 
+    /// The proxy handled the command and the player should be live-switched to
+    /// the named backend. The relay performs the actual switch (it owns the
+    /// client stream + switch machinery); handlers can only request it.
+    Switch(String),
+
     NotACommand,
 
     Error(String),
@@ -272,7 +277,7 @@ async fn handle_server(
         }
         send_message(format!("§aConnecting you to §f{}§a…", target));
 
-        CommandResult::Handled
+        CommandResult::Switch(target.to_owned())
     }
 }
 
@@ -302,7 +307,7 @@ async fn handle_hub(
     }
 
     send_message(format!("§aSending you to §f{}§a…", default));
-    CommandResult::Handled
+    CommandResult::Switch(default)
 }
 
 async fn handle_glist(

@@ -620,6 +620,57 @@ pub(crate) fn encode<T: kojacoord_protocol::codec::Encode + kojacoord_protocol::
     Some(EncodedPacket { id, body })
 }
 
+/// Build a pre-1.16 (legacy i32-dimension) `Respawn` to an arbitrary
+/// `dimension` / `game_mode`.
+///
+/// Used by the live-switch and limbo-entry world reset to move a client that
+/// is **already in Play** between worlds *without* sending a second
+/// `JoinGame`. Vanilla processes exactly one `JoinGame` per connection, so a
+/// second one mid-Play desyncs the client (frozen player, no gravity); the
+/// world is instead changed via `Respawn`, exactly like BungeeCord's
+/// `ServerConnector` switch path.
+///
+/// Per-version body (minecraft.wiki §Respawn, matching
+/// [`v1_16::build_respawn_1_13_through_1_15`]):
+///   * proto < 477  (≤1.13):  dimension i32, difficulty u8, gamemode u8, level_type
+///   * proto 477-572 (1.14):  dimension i32, gamemode u8, level_type   (no difficulty)
+///   * proto >= 573 (1.15):   dimension i32, hashed_seed i64, gamemode u8, level_type
+///
+/// Returns `None` when the protocol has no `ClientboundRespawn` id (e.g. it
+/// uses the 1.16+ NBT/identifier-dimension shape, which this helper does not
+/// emit).
+pub(crate) fn build_legacy_respawn(
+    proto: u32,
+    dimension: i32,
+    game_mode: u8,
+) -> Option<EncodedPacket> {
+    use kojacoord_protocol::codec::Encode;
+    use kojacoord_protocol::types::VarInt;
+
+    // Guard: this helper only emits the legacy i32-dimension shape (pre-1.16).
+    if proto >= 735 {
+        return None;
+    }
+    let id = crate::packet_ids::cb_play(proto, "ClientboundRespawn");
+    if id == 0xFF {
+        return None;
+    }
+
+    let mut body = BytesMut::new();
+    body.put_i32(dimension);
+    if proto < 477 {
+        body.put_u8(0); // difficulty (≤1.13)
+    } else if proto >= 573 {
+        body.put_i64(0); // hashed_seed (1.15+)
+    }
+    body.put_u8(game_mode);
+    let level_type = b"flat";
+    VarInt(level_type.len() as i32).encode(&mut body).ok()?;
+    body.put_slice(level_type);
+
+    Some(EncodedPacket { id, body })
+}
+
 #[cfg(test)]
 mod chunk_tests {
     use super::*;

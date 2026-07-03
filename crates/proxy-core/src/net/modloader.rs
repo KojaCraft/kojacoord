@@ -158,17 +158,22 @@ pub fn parse_fml1_discriminator(body: &[u8]) -> Option<FmlDiscriminator> {
     body.first().copied().map(FmlDiscriminator::from)
 }
 
-/// Build the FML1 handshake-reset plugin message in modern (1.7+) wire
-/// format. The packet id is varint-encoded and the channel string is
+/// Build the FML1 handshake-reset plugin message body in modern (1.7+)
+/// wire format. The packet id is varint-encoded and the channel string is
 /// length-prefixed. For 1.6.x clients use
 /// [`build_fml1_handshake_reset_legacy`] — pre-netty has no varint length
 /// prefix.
+///
+/// Returns the UNFRAMED `[varint id][channel][0xFE]` body. The caller is
+/// responsible for length-framing (and compressing) it via the normal IO
+/// layer — `frame_bytes` here would double-frame, leaving the client to
+/// read the inner length prefix as a bogus packet id and crash decoding it.
 pub fn build_fml1_handshake_reset(plugin_msg_id: u8) -> Bytes {
     let mut payload = BytesMut::new();
     VarInt(plugin_msg_id as i32).encode(&mut payload).unwrap();
     FML1_HS.to_owned().encode(&mut payload).unwrap();
     payload.put_u8(0xFE);
-    frame_bytes(payload.freeze())
+    payload.freeze()
 }
 
 /// Pick the right FML1 handshake-reset bytes for the negotiated
@@ -255,13 +260,6 @@ pub fn is_quilt_channel(channel: &str) -> bool {
         || channel.starts_with("quilt:")
         || channel.starts_with("qsl:")
         || channel.starts_with("quilted_fabric_")
-}
-
-fn frame_bytes(payload: Bytes) -> Bytes {
-    let mut frame = BytesMut::new();
-    VarInt(payload.len() as i32).encode(&mut frame).unwrap();
-    frame.extend_from_slice(&payload);
-    frame.freeze()
 }
 
 #[allow(dead_code)]
