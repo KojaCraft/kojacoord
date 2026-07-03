@@ -813,8 +813,28 @@ impl PacketRelay {
                                 // Proxy handled it — swallow. Otherwise fall
                                 // through so the original command packet reaches
                                 // the backend for server-side execution.
-                                if matches!(result, commands::CommandResult::Handled) {
-                                    continue;
+                                match result {
+                                    // A `/server`/`/hub` switch request: perform
+                                    // the live switch via the same path the
+                                    // server-selector connect channel uses.
+                                    commands::CommandResult::Switch(target) => {
+                                        if request_switch(
+                                            &target,
+                                            &state_c2s,
+                                            &switch_c2s,
+                                            &cw_c2s,
+                                            proto,
+                                            client_thresh,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(());
+                                        }
+                                        continue;
+                                    },
+                                    commands::CommandResult::Handled => continue,
+                                    // NotACommand / Error: fall through to backend.
+                                    _ => {},
                                 }
                             } else {
                                 // Plain chat. Hand to plugins (a plugin may kick),

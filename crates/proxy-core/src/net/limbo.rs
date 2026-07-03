@@ -294,11 +294,27 @@ impl<'a> LimboHandler<'a> {
             self.send_plugin_brand().await?;
         }
 
-        // FML1 clients (1.6 Forge through 1.12 Forge) get stuck if the
-        // server side never starts the `FML|HS` handshake. While limbo
-        // can't speak FML, sending a HandshakeReset on the same channel
-        // tells the client to drop into vanilla mode and stop waiting.
-        if matches!(self.ml_kind, modloader::ModloaderKind::Fml1) {
+        // FML1 clients (1.6 Forge through 1.12 Forge): force them off the
+        // `FML|HS` handshake so they fall back to vanilla while in limbo
+        // (limbo can't speak FML).
+        //
+        // For 1.7+ Forge we must NOT send a `HandshakeReset` here: the
+        // client's FML handshake state machine is still in its HELLO state
+        // (waiting for a `ServerHello`) and unconditionally casts whatever
+        // message arrives to `ServerHello`, so a `HandshakeReset` throws
+        // `ClassCastException`, corrupts the FML pipeline, and the client
+        // then NPEs handling our JoinGame and disconnects. Instead we send
+        // nothing on `FML|HS`: a Forge client that receives a plain vanilla
+        // JoinGame from a server that never engaged FML auto-aborts the
+        // handshake to vanilla on its own (logged client-side as
+        // `Aborting client handshake "VANILLA"`).
+        //
+        // The pre-netty 1.6.x FML handshake uses an entirely different wire
+        // format and has no such state-machine cast, so the legacy reset is
+        // still sent there.
+        if matches!(self.ml_kind, modloader::ModloaderKind::Fml1)
+            && crate::packet_io::is_pre_netty_proto(self.protocol_version)
+        {
             self.send_fml1_handshake_reset().await?;
         }
 
@@ -725,6 +741,19 @@ impl<'a> LimboHandler<'a> {
     }
 
     async fn send_login_play(&mut self) -> Result<(), ConnectionError> {
+        // A legacy (pre-1.16, i32-dimension) client that is already in Play —
+        // a live server switch or backend kick — must NOT receive a second
+        // JoinGame. Vanilla processes exactly one JoinGame per connection; a
+        // second one mid-Play desyncs the client (frozen, no gravity). Mirror
+        // BungeeCord's ServerConnector switch path and enter the limbo world
+        // via Respawn packets instead.
+        //
+        // Proto 764+ in-play clients were already dropped back to the
+        // Configuration state by `run_configuration_phase`, so a JoinGame is
+        // the correct (and required) transition for them.
+        if self.client_in_play && self.protocol_version < 735 {
+            return self.send_limbo_entry_respawn().await;
+        }
         let built = self
             .packets
             .join_game(self.protocol_version, LIMBO_WORLD_NAME);
@@ -735,6 +764,28 @@ impl<'a> LimboHandler<'a> {
             );
         }
         self.send_built(built).await
+    }
+
+    /// Enter the limbo world via `Respawn` packets — the legacy in-play switch
+    /// path (see [`Self::send_login_play`]).
+    ///
+    /// The client's source dimension (its previous backend's world) is unknown
+    /// to the proxy, so we can't know whether a single `Respawn` into the limbo
+    /// dimension would be a no-op. We therefore bounce to the opposite
+    /// dimension first (guaranteeing a dimension *change*, which is what forces
+    /// vanilla to rebuild the world) and then `Respawn` into the limbo world
+    /// (dimension 0). Spectator game-mode (3) matches the limbo `JoinGame` so
+    /// the player floats in the void instead of falling.
+    async fn send_limbo_entry_respawn(&mut self) -> Result<(), ConnectionError> {
+        const LIMBO_DIMENSION: i32 = 0;
+        const LIMBO_GAME_MODE: u8 = 3; // spectator — float, don't fall
+        let proto = self.protocol_version;
+        // Bounce away from the limbo dimension first.
+        let bounce = limbo_packets::build_legacy_respawn(proto, -1, LIMBO_GAME_MODE);
+        self.send_built(bounce).await?;
+        // Land in the limbo world.
+        let land = limbo_packets::build_legacy_respawn(proto, LIMBO_DIMENSION, LIMBO_GAME_MODE);
+        self.send_built(land).await
     }
 
     pub async fn send_respawn(&mut self) -> Result<(), ConnectionError> {
