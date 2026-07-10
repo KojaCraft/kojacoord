@@ -1,12 +1,12 @@
 {
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "High-performance Minecraft proxy",
   "homepage": "https://github.com/KojaCraft/kojacoord",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.14/kojacoord-proxy-windows-x86_64.exe",
-      "hash": "c7075a9ea907d98b1c2d50a7b3b069e87890e275bf15e9660c934955a2994766",
+      "url": "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.15/kojacoord-proxy-windows-x86_64.exe",
+      "hash": "8951ef0e8c9c742e58b03c162ea5c47f29dd929ad618f3563c0ce85427de560f",
       "bin": [["kojacoord-proxy-windows-x86_64.exe", "kojacoord-proxy"]]
     }
   },

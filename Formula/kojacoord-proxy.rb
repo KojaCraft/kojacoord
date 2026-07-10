@@ -2,28 +2,28 @@
 class KojacoordProxy < Formula
   desc "High-performance Minecraft proxy"
   homepage "https://github.com/KojaCraft/kojacoord"
-  version "0.1.14"
+  version "0.1.15"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.14/kojacoord-proxy-macos-aarch64"
-      sha256 "467b67915ddc7f9e7b9912ee16a54cbe5299a5980595f2c5f9608c8313c86b54"
+      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.15/kojacoord-proxy-macos-aarch64"
+      sha256 "200fac49c4a7b3af8781cfd5e4e15dd9d01378d801d211c02c81e6fddfb8b1ed"
     end
     on_intel do
-      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.14/kojacoord-proxy-macos-x86_64"
-      sha256 "26064b6d62d321376ec200495c5ce2440df7f6796c2478d5b5fa40ed8e42878b"
+      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.15/kojacoord-proxy-macos-x86_64"
+      sha256 "5eb14ca9bad881117c512fd59df31d90c1f294ddf3b2137b4bdb9014250bb9c4"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.14/kojacoord-proxy-linux-aarch64"
-      sha256 "19b7d40f74a4f1516c2ac6ea233a20644739d20e154efb62467c327cfaf0da2b"
+      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.15/kojacoord-proxy-linux-aarch64"
+      sha256 "849d76f40b3690f5691d67e275df236055e742536e6949892091d5776de4f5bd"
     end
     on_intel do
-      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.14/kojacoord-proxy-linux-x86_64"
-      sha256 "fa080b48dc968951764ad299f5be6ab993c58b8a612dd46eb26e16c268a02a2e"
+      url "https://github.com/KojaCraft/kojacoord/releases/download/v0.1.15/kojacoord-proxy-linux-x86_64"
+      sha256 "2324ebdc79b7b1e57557bb8bcb086371eed958708af35f679c64bff33cf0eb6e"
     end
   end
 
