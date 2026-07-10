@@ -1,169 +1,84 @@
-# Contributing to Kojacoord Proxy
+# Contributing to Kojacoord
 
-Thank you for your interest in contributing to Kojacoord Proxy! This document provides guidelines and instructions for contributors.
+Thanks for considering it. This is a fairly technical codebase (a Minecraft
+protocol proxy with per-version packet handling), so a bit of context up
+front will save you time.
 
-## Code of Conduct
+Found a security issue instead of a bug? Don't open an issue for it — see
+[SECURITY.md](SECURITY.md).
 
-By participating in this project, you agree to uphold our Code of Conduct (see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)).
+## Before you start
 
-## How to Contribute
+- Rust 1.92+ and `protoc` (needed for the gRPC control plane). See the
+  [README](README.md#building) for the full build setup.
+- For anything non-trivial, open an issue first, especially for new
+  protocol version support or anything touching packet framing/compression
+  — those are the most fragile parts of the codebase and it's easy to build
+  something that works for the version you tested and breaks three others.
+- Check [ROADMAP.md](ROADMAP.md) and existing issues so you're not
+  duplicating work already in flight.
 
-### Reporting Bugs
+## Workflow
 
-Before creating bug reports, please check the existing issues to avoid duplicates. When creating a bug report, include:
+1. Fork the repo, branch off `main`.
+2. Make your change. Keep it scoped — a bug fix doesn't need a refactor
+   riding along with it, and vice versa.
+3. Add tests for new behavior and rustdoc (`///`) for anything public.
+4. Before pushing: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo test --workspace`. CI runs the same checks (plus `cargo audit` /
+   `cargo deny`) and will fail the same way it does for you locally.
+5. Open a PR describing what changed and why — the *why* matters more than
+   a mechanical diff summary. Reference any related issue.
 
-- A clear and descriptive title
-- Steps to reproduce the issue
-- Expected behavior vs. actual behavior
-- Environment details (proxy version, Rust version, OS, Minecraft versions)
-- Relevant logs or error messages
-- Configuration files (with sensitive information redacted)
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:`, `fix:`, `refactor:`, `chore:`, etc.) — that's what drives the
+generated changelog, so it's not just a style preference.
 
-### Suggesting Enhancements
+## Reporting bugs
 
-Enhancement suggestions are welcome. Please:
+Include the proxy version, Rust version, OS, the client and backend
+Minecraft versions involved, relevant logs, and a config with secrets
+redacted. "It doesn't work" without a repro is hard to act on in a codebase
+that behaves differently per protocol version.
 
-- Use a clear and descriptive title
-- Provide a detailed description of the proposed enhancement
-- Explain why this enhancement would be useful
-- Provide examples or mockups if applicable
+## Adding a dependency
 
-### Pull Requests
+New dependencies go through `cargo deny` (license, advisory, and source
+checks — see `deny.toml`) in CI. If you're adding something with an
+unusual license or pulling from a non-crates.io source, expect that check
+to flag it and be ready to justify it in the PR.
 
-#### Before Submitting
-
-1. **Fork the repository** and create your branch from `main`
-2. **Make your changes** following the coding standards below
-3. **Write tests** for new functionality
-4. **Update documentation** as needed
-5. **Ensure all tests pass**: `cargo test`
-6. **Format your code**: `cargo fmt`
-7. **Run linter**: `cargo clippy`
-
-#### PR Guidelines
-
-- Keep PRs focused on a single issue or feature
-- Write clear commit messages
-- Reference related issues in your PR description
-- Include tests for new features
-- Update relevant documentation
-- Ensure CI checks pass before requesting review
-
-#### Commit Message Format
-
-Follow conventional commits:
-
-```
-feat: add new protocol version support
-fix: resolve memory leak in connection pool
-docs: update API documentation
-refactor: simplify packet parsing logic
-test: add integration tests for auth module
-```
-
-## Development Setup
-
-### Prerequisites
-
-- Rust 1.70 or later
-- Cargo (included with Rust)
-- Git
-
-### Building
-
-```bash
-# Clone your fork
-git clone https://github.com/yourusername/kojacoord-proxy.git
-cd kojacoord-proxy
-
-# Build in debug mode
-cargo build
-
-# Build in release mode
-cargo build --release
-```
-
-### Running Tests
-
-```bash
-# Run all tests
-cargo test
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test test_name
-
-# Run tests in release mode
-cargo test --release
-```
-
-### Code Style
-
-- Use `cargo fmt` for formatting
-- Use `cargo clippy` for linting
-- Follow Rust naming conventions
-- Add documentation comments (`///`) for public APIs
-- Keep functions focused and reasonably sized
-
-## Coding Standards
-
-### Rust Guidelines
-
-- Use `Result<T, E>` for error handling, avoid `panic!` in production code
-- Prefer `Arc<Mutex<T>>` or `Arc<RwLock<T>>` for shared state
-- Use `async/await` for I/O operations
-- Document public APIs with rustdoc comments
-- Write unit tests for non-trivial functions
-- Use meaningful variable and function names
-
-### Documentation
-
-- Document all public APIs with `///` comments
-- Include examples in documentation where helpful
-- Update the README for user-facing changes
-- Update the wiki for architectural changes
-- Keep comments concise and technical
-
-### Testing
-
-- Write unit tests for new functionality
-- Test error conditions and edge cases
-- Use descriptive test names
-- Keep tests independent and fast
-- Mock external dependencies where appropriate
-
-## Project Structure
+## Project layout
 
 ```
 kojacoord-proxy/
 ├── crates/
-│   ├── protocol/          # Protocol definitions and codecs
-│   ├── netty/             # Network layer with encryption
-│   ├── auth/              # Authentication pipeline
-│   ├── proxy-core/        # Core proxy logic
-│   ├── anticheat/         # Anti-cheat detection
-│   ├── config/            # Configuration management
-│   ├── api/               # Public API for plugins
-│   └── dashboard-api/     # Dashboard REST API
-├── src/                   # Main entry point
-├── docs/                  # Documentation
-├── .github/               # GitHub configuration
-│   └── ISSUE_TEMPLATE/    # Issue templates
-├── Cargo.toml             # Workspace configuration
-├── Cargo.lock             # Dependency lock file
-├── LICENSE                # MIT License
-└── README.md              # Project documentation
+│   ├── protocol/        # Packet types, codecs, per-version registries
+│   ├── netty/           # Framing, compression, encryption codec layer
+│   ├── auth/            # Session authentication, login-phase encryption
+│   ├── proxy-core/      # The proxy itself: relay, routing, limbo, control planes
+│   ├── config/          # Config schema, loading, validation
+│   ├── api/             # Public API surface for plugin development
+│   ├── plugin-abi/      # Wire types shared by the plugin host and guest SDK
+│   ├── plugin-sdk/      # Guest SDK for writing WASM plugins
+│   ├── plugin-system/   # Plugin loading, lifecycle, host API
+│   ├── cluster/         # Redis-backed cluster coordination
+│   └── metrics/         # Prometheus metrics collection and exporter
+├── src/                 # Binary entry point
+├── docs/                # Usage docs, brand assets
+├── kr8s/                # Kubernetes manifests
+└── Cargo.toml           # Workspace definition
 ```
 
-## Getting Help
+If you're touching `proxy-core::net` (connection/relay/limbo), read the
+module docs there first — a lot of the trickier behavior (per-protocol-era
+framing, the shared client-writer mutex, live server switching) is
+documented inline because it's not obvious from the code alone.
 
-- Check existing [documentation](docs/Usage.md)
-- Search [existing issues](https://github.com/yourusername/kojacoord-proxy/issues)
-- Ask questions in a new issue with the `question` label
-- Join our community discussions (link to be added)
+## Code of conduct
+
+Covered in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 
-By contributing to Kojacoord Proxy, you agree that your contributions will be licensed under the MIT License.
+Contributions are licensed under the project's [MIT License](LICENSE).

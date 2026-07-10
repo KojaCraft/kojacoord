@@ -1,8 +1,16 @@
+# Public-facing Service — Minecraft traffic ONLY. `server-mgmt` (8080) used to
+# be listed here too, which on any cloud provider's LoadBalancer controller
+# puts it directly on the internet, protected by nothing but the token —
+# directly contradicting `configmap.yaml`'s own comment that it should only be
+# reachable "from trusted backends". It stays available cluster-internally via
+# `kojacoord-proxy-internal` below. (The admin HTTP API this comment used to
+# also mention has been removed entirely — the proxy holds no persistent
+# state and exposes no inbound HTTP/REST surface by design.)
 apiVersion: v1
 kind: Service
 metadata:
   name: kojacoord-proxy
-  namespace: default
+  namespace: kojacoord-system
   labels:
     app: kojacoord-proxy
 spec:
@@ -12,14 +20,6 @@ spec:
   - name: minecraft
     port: 25577
     targetPort: 25577
-    protocol: TCP
-  - name: server-mgmt
-    port: 8080
-    targetPort: 8080
-    protocol: TCP
-  - name: http-api
-    port: 8081
-    targetPort: 8081
     protocol: TCP
   selector:
     app: kojacoord-proxy
@@ -32,7 +32,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: kojacoord-proxy-internal
-  namespace: default
+  namespace: kojacoord-system
   labels:
     app: kojacoord-proxy
 spec:
@@ -45,10 +45,6 @@ spec:
   - name: server-mgmt
     port: 8080
     targetPort: 8080
-    protocol: TCP
-  - name: http-api
-    port: 8081
-    targetPort: 8081
     protocol: TCP
   selector:
     app: kojacoord-proxy

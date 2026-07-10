@@ -5,6 +5,11 @@ compression_threshold = 256
 max_players = 1000
 prevent_proxy_connections = false
 session_timeout_secs = 5
+# Coalesce S->C packet writes when several are already buffered together
+# (chunk bursts, teleports) instead of one write+flush per packet. Purely a
+# wire-syscall optimization, transparent to clients; set false to instantly
+# revert to the old per-packet-flush behavior.
+batch_s2c_writes = true
 mojang_public_key = "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAylB4B6m5lz7jwrcFz6Fd/fnfUhcvlxsTSn5kIK/2aGG1C3kMy4VjhwlxF6BFUSnfxhNswPjh3ZitkBxEAFY25uzkJFRwHwVA9mdwjashXILtR6OqdLXXFVyUPIURLOSWqGNBtb08EN5fMnG8iFLgEJIBMxs9BvF3s3/FhuHyPKiVTZmXY0WY4ZyYqvoKR+XjaTRPPvBsDa4WI2u1zxXMeHlodT3lnCzVvyOYBLXL6CJgByuOxccJ8hnXfF9yY4F0aeL080Jz/3+EBNG8RO4ByhtBf4Ny8NQ6stWsjfeUIvH7bU/4zCYcYOq4WrInXHqS8qruDmIl7P5XXGcabuzQstPf/h2CRAUpP/PlHXcMlvewjmGU6MfDK+lifScNYwjPxRo4nKTGFZf/0aqHCh/EAsQyLKrOIYRE0lDG3bzBh8ogIMLAugsAfBb6M3mqCqKaTMAf/VAjh5FFJnjS+7bE+bZEV0qwax1CEoPPJL1fIQjOS8zj086gjpGRCtSy9+bTPTfTR/SJ+VUB5G2IeCItnkNHpJX2ygojFZ9n5Fnj7R9ZnOM+L8nyIjPu3aePvtcrXlyLhH/hvOfIOjPxOlqW+O5QwSFP4OEcyLAUgDdUgyW36Z5mB285uKW/ighzZsOTevVUG2QwDItObIV6i8RCxFbN2oDHyPaO5j1tTaBNyVt8CAwEAAQ=="
 
 [listeners]
@@ -28,6 +33,53 @@ mode = "none"
 # Generate with e.g. `openssl rand -hex 32` and copy it to the backend.
 velocity_secret = ""
 
+# Region-aware lobby selection (picks the closest online lobby by IP
+# geolocation). Optional: leave database_path empty to skip it entirely —
+# every player then buckets to the "global" region, same as if this whole
+# section were omitted. Point it at a MaxMind GeoLite2 Country or City .mmdb
+# (free account required at https://www.maxmind.com) to enable it; City-level
+# databases additionally split North America into us-east/us-west.
+[geoip]
+database_path = ""
+
+# IP reputation / hosting-provider blocklist, checked on every accepted TCP
+# connection before any per-connection work starts. blocklist_cidrs is always
+# available with zero I/O; provider_url is optional and, if set, has the
+# proxy make an outbound GET to that URL (expecting a JSON {"blocked": bool}
+# body) — a slow/unreachable provider fails OPEN (connection allowed) rather
+# than stalling new connections.
+[ip_reputation]
+blocklist_cidrs = []
+provider_url = ""
+api_key = ""
+cache_ttl_secs = 3600
+timeout_ms = 300
+
+# Built-in maintenance mode. `enabled` here is only the boot-time default —
+# flip it live (no restart, no file edit) via the TCP server-management
+# control-plane's MaintenanceToggle command. bypass_uuids lets staff/testers
+# still log in while it's on.
+[maintenance]
+enabled = false
+kick_message = "The network is currently down for maintenance. Please check back soon."
+bypass_uuids = []
+
+# Full-server connection queueing. When a [[servers]] entry's max_players is
+# reached, a connecting player is held in limbo with a live "Position in
+# queue" message instead of being rejected, and let through in arrival order
+# as slots free up. max_queue_size = 0 means unlimited.
+[queue]
+enabled = true
+max_queue_size = 0
+
+# GameSpy4 (UT3) query protocol — the same enable-query/query.port protocol
+# vanilla servers speak, so third-party server-list aggregators that ping
+# via UDP query (not the normal Java status ping) see this proxy correctly.
+# Off by default: opening another UDP listener is a deliberate choice.
+[query]
+enabled = false
+bind = "0.0.0.0:25565"
+
 # Anonymous, opt-out usage telemetry. When enabled, the proxy periodically sends
 # coarse, non-identifying metrics (version, OS/arch, peak players, backend count)
 # to help us understand adoption. No IPs, hostnames, server names or player
@@ -37,13 +89,6 @@ velocity_secret = ""
 enabled = true
 endpoint = "https://metric.kojacoord.net"
 interval_secs = 1800
-
-[database]
-# Leave empty to use a local SQLite file (data/proxy.db). For MySQL, supply the
-# URL via the KOJA_DATABASE__URL environment variable / a secret store rather
-# than committing credentials here, e.g. mysql://user:pass@host/kojacoord
-url = ""
-max_connections = 10
 
 [[servers]]
 name = "lobby"
@@ -68,3 +113,17 @@ game_type = "survival"
 modpack = "kojacraft"
 modpack_version = "1.0.0"
 max_players = 100
+# weight = 1  # Relative weight for [[server_groups]] "weighted" selection — see below
+
+# Named backend pools: reference "survival-pool" as a [[routing.rules]]
+# target (or as `routing.default_server`) instead of one literal server
+# name, and the proxy picks a member per `strategy`:
+#   least_connections (default) | weighted (uses each member's `weight`
+#   above) | latency (prefers the member with the lowest measured
+#   health-probe TCP-connect latency; requires health_probe_interval_secs >
+#   0 on the members — an unmeasured member is never preferred over a
+#   measured one).
+# [[server_groups]]
+# name = "survival-pool"
+# members = ["survival", "survival-2"]
+# strategy = "least_connections"

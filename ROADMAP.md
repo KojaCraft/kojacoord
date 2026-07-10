@@ -29,10 +29,10 @@ after the text for extra context.
 
 ## In Progress
 - [ ] Mojang Realms compatibility layer
-- [ ] Bedrock edition bridging
+- [ ] Plugin marketplace / registry
 
 ## Planned
-- [ ] Plugin marketplace / registry
+
 
 
 ## Exploring

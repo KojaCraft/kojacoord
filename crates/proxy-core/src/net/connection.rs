@@ -61,6 +61,20 @@ use kojacoord_auth::{
     AuthEvent, AuthOutbound,
 };
 
+/// Human-facing text for a play/login-state kick given the error that
+/// ended the session. `ConnectionError::Backend` (a failure on the
+/// *backend* socket — see its doc comment) gets a clean fixed message
+/// rather than the raw I/O error text: the client doesn't need the
+/// internals, and error text can contain `"`/`\`/control characters
+/// that would corrupt hand-rolled chat JSON on the wire.
+fn disconnect_reason_text(err: &ConnectionError) -> String {
+    match err {
+        ConnectionError::Auth(msg) => msg.clone(),
+        ConnectionError::Backend(_) => "Lost connection to the server.".to_string(),
+        other => other.to_string(),
+    }
+}
+
 struct Cfb8State {
     cipher: Aes128,
     sr: [u8; 16],
@@ -391,14 +405,15 @@ impl ClientConnection {
     ///
     /// Errors that mean "the client already left" (`ConnectionError::Closed`,
     /// any `Io` error) are also silent — there's nobody to talk to.
+    /// `ConnectionError::Backend` — a failure talking to the *backend*
+    /// socket — is deliberately excluded from that check: the client is
+    /// still connected and would otherwise see a bare TCP reset instead
+    /// of a reason, regardless of which protocol version it speaks.
     async fn send_graceful_kick(&mut self, err: &ConnectionError) {
         if matches!(err, ConnectionError::Closed | ConnectionError::Io(_)) {
             return;
         }
-        let reason = match err {
-            ConnectionError::Auth(msg) => msg.clone(),
-            other => other.to_string(),
-        };
+        let reason = disconnect_reason_text(err);
         // Modern clients want a chat-component JSON; pre-netty wants a
         // raw string. `send_disconnect_login` / `send_play_disconnect`
         // both branch on `is_pre_netty_proto` and emit the right shape.
@@ -1070,27 +1085,15 @@ impl ClientConnection {
 
         let is_offline_mode = !self.state.config.proxy.online_mode;
 
-        // In offline mode, generate/retrieve UUID from database if not provided by client
+        // In offline mode, derive the UUID deterministically from the
+        // username via the same MD5-based UUIDv3 algorithm vanilla/Bukkit
+        // offline servers use (`kojacoord_auth::offline::offline_uuid`) —
+        // stable across restarts and identical to what any other offline
+        // server derives for the same name, with no storage required.
         let final_uuid = if is_offline_mode {
-            if let Some(db) = &self.state.db {
-                match db.get_or_create_offline_uuid(&username).await {
-                    Ok(uuid) => {
-                        tracing::debug!(
-                            "Generated/retrieved offline UUID {} for username {}",
-                            uuid,
-                            username
-                        );
-                        Some(uuid)
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to get offline UUID for {}, using client UUID or generating random", username);
-                        client_uuid.or_else(|| Some(uuid::Uuid::new_v4()))
-                    },
-                }
-            } else {
-                tracing::warn!("No database available for offline UUID generation, using client UUID or random");
-                client_uuid.or_else(|| Some(uuid::Uuid::new_v4()))
-            }
+            let uuid = kojacoord_auth::offline::offline_uuid(&username);
+            tracing::debug!(%uuid, %username, "derived offline-mode UUID");
+            Some(uuid)
         } else {
             client_uuid
         };
@@ -1303,44 +1306,55 @@ impl ClientConnection {
         &mut self,
         uuid: uuid::Uuid,
         username: String,
-        mut properties: Vec<kojacoord_auth::ProfileProperty>,
+        properties: Vec<kojacoord_auth::ProfileProperty>,
         original_host: String,
         client_gone: &impl Fn(&ConnectionError) -> bool,
     ) -> Result<SharedSession, ConnectionError> {
-        // Reject banned players before completing login. Best-effort: a DB error
-        // never blocks a legitimate login.
-        if let Some(db) = &self.state.db {
-            if let Ok(Some(ban)) = db.active_ban(uuid).await {
+        // Maintenance mode: block non-bypassed logins before doing any
+        // further work. `maintenance_enabled` is the live in-memory flag
+        // (flip-able over the TCP control-plane without a config edit or
+        // restart); `bypass_uuids` still comes straight from config since
+        // that list only needs to change on a deploy, not live.
+        if self
+            .state
+            .maintenance_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let uuid_str = uuid.hyphenated().to_string();
+            let bypassed = self
+                .state
+                .config
+                .maintenance
+                .bypass_uuids
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&uuid_str));
+            if !bypassed {
                 let reason = serde_json::json!({
-                    "text": format!("You are banned: {}", ban.reason),
-                    "color": "red"
+                    "text": self.state.config.maintenance.kick_message,
+                    "color": "red",
                 })
                 .to_string();
                 let _ = self.send_disconnect_login(&reason).await;
-                tracing::debug!(username = %username, reason = %ban.reason, "rejected banned player");
-                return Err(ConnectionError::Auth(format!("banned: {}", ban.reason)));
+                tracing::debug!(username = %username, "rejected login: maintenance mode active");
+                return Err(ConnectionError::Auth("maintenance mode active".to_string()));
             }
         }
 
         // ── Profile-property caching / skin recovery ─────────────────
         //
-        // Two cases the proxy needs to handle around the dead pre-1.7
-        // Mojang auth endpoint:
+        // Online-mode 1.7+ login → Mojang-verified properties on hand.
+        // **Verify the signatures** against `[proxy.mojang_public_key]`
+        // before trusting them — a MITM (or a proxy running in online
+        // mode talking to a spoofed backend) could otherwise inject
+        // forged skin/cape data. Only runs when the proxy is configured
+        // for online mode AND the client is post-1.6 (a 1.6.x client
+        // never sent us a signature in the first place).
         //
-        //  1. Online-mode 1.7+ login → Mojang-verified properties on
-        //     hand. **Verify the signatures** against
-        //     `[proxy.mojang_public_key]` and then **cache** the
-        //     (uuid, username, properties) tuple so we can hand it back
-        //     to a future 1.6.x connection.
-        //
-        //  2. Pre-netty 1.6.x login → no Mojang auth, no skin. **Load**
-        //     the cached profile by username (the only key 1.6.x sends)
-        //     and graft the cached signed property in so downstream
-        //     limbo/relay code can synthesise the skin.
-        //
-        // Online-mode signature verification only runs when the proxy
-        // is configured for online mode AND the client is post-1.6 (a
-        // 1.6.x client never sent us a signature in the first place).
+        // There used to be a DB-backed cache here so a 1.6.x login (no
+        // Mojang auth, no skin) could recover the most recently seen
+        // signed properties for the same username. The proxy no longer
+        // owns any persistent storage, so that recovery path is gone —
+        // 1.6.x connections always join with the default skin.
         let online_mode = self.state.config.proxy.online_mode;
         let canonical = nearest(self.protocol_version).canonical_typed_packet_version();
         let is_pre_netty_login = matches!(canonical, CanonicalVersion::V1_6_4);
@@ -1356,13 +1370,6 @@ impl ClientConnection {
                             verified = n,
                             "Mojang property signatures verified"
                         );
-                        if let Some(db) = &self.state.db {
-                            if let Err(e) =
-                                db.cache_player_profile(uuid, &username, &properties).await
-                            {
-                                tracing::warn!(error = %e, "failed to cache verified profile");
-                            }
-                        }
                     },
                     Err(e) => {
                         // A bad signature in online mode means someone
@@ -1391,65 +1398,8 @@ impl ClientConnection {
             }
         }
 
-        // Pre-netty (1.6.x) path: pull whatever signed properties we
-        // cached for this username from a previous 1.7+ login. The
-        // cached `value`/`signature` base64 strings round-trip
-        // verbatim, so a 1.7+ relay-target that re-verifies the
-        // signature will see the same bytes Mojang signed.
-        if is_pre_netty_login && properties.is_empty() {
-            if let Some(db) = &self.state.db {
-                match db.load_cached_profile_by_username(&username).await {
-                    Ok(Some((_cached_uuid, cached_props))) => {
-                        tracing::info!(
-                            username = %username,
-                            count = cached_props.len(),
-                            "restored cached skin properties for 1.6.x login (Mojang auth unreachable for pre-1.7)"
-                        );
-                        properties = cached_props;
-                    },
-                    Ok(None) => {
-                        tracing::debug!(
-                            username = %username,
-                            "no cached profile for 1.6.x login — player will appear with default skin"
-                        );
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to load cached profile");
-                    },
-                }
-            }
-        }
-
         self.send_login_success(uuid, &username, &properties)
             .await?;
-
-        // Player lifecycle: create the row on first join, refresh username and
-        // last_seen otherwise, and read back the persisted rank. Best-effort — a
-        // database outage must not block login, so failures default to "PLAYER".
-        let rank = match &self.state.db {
-            Some(db) => match db.upsert_player_on_join(uuid, &username).await {
-                Ok(rank) => rank,
-                Err(e) => {
-                    tracing::warn!(username = %username, error = %e, "failed to persist player record");
-                    "PLAYER".to_owned()
-                },
-            },
-            None => "PLAYER".to_owned(),
-        };
-
-        // Load any active chat mute so the relay can gate chat without a
-        // per-message DB hit. Best-effort — a DB error just leaves the
-        // player unmuted for this session.
-        let mute = match &self.state.db {
-            Some(db) => match db.active_mute(uuid).await {
-                Ok(Some(m)) => Some(crate::session::MuteState {
-                    reason: m.reason,
-                    expires_at: m.expires_at,
-                }),
-                _ => None,
-            },
-            None => None,
-        };
 
         let session = Arc::new(RwLock::new(PlayerSession {
             uuid,
@@ -1469,9 +1419,7 @@ impl ClientConnection {
                 .collect(),
             locale: None,
             view_distance: None,
-            rank,
             cookies: crate::cookies_transfers::CookieStore::default(),
-            mute,
         }));
 
         self.state.sessions.insert(uuid, session.clone());
@@ -1516,29 +1464,6 @@ impl ClientConnection {
                         tracing::warn!(error = %e, "Failed to build resource pack packet");
                     },
                 }
-            }
-        }
-
-        // Load this player's LuckPerms-shaped permission nodes from the DB
-        // and cache them for the session, so command/permission checks see
-        // their per-user grants. Best-effort: an absent DB or error leaves
-        // them on role-only permissions.
-        if let Some(db) = &self.state.db {
-            match db.load_user_nodes(uuid).await {
-                Ok(rows) => {
-                    let nodes = rows
-                        .into_iter()
-                        .map(|(node, value, server)| crate::permissions::UserNode {
-                            node,
-                            value,
-                            server,
-                        })
-                        .collect();
-                    self.state.permissions.cache_user(uuid, nodes);
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, %uuid, "failed to load user permission nodes");
-                },
             }
         }
 
@@ -1785,8 +1710,10 @@ impl ClientConnection {
 
         self.state.sessions.remove(&uuid);
 
-        // Drop cached permission nodes for this player.
-        self.state.permissions.evict_user(&uuid);
+        // In case they disconnected while still waiting in a full-server
+        // queue (net::queue) — otherwise they'd sit there forever, blocking
+        // whoever's behind them.
+        self.state.queue_manager.remove_from_all(uuid).await;
 
         // Unregister player from metrics tracking
         self.state.player_metrics.unregister_player(uuid).await;
@@ -1819,7 +1746,11 @@ impl ClientConnection {
 
         if let Err(ref e) = result {
             if !client_gone(e) {
-                let msg = format!(r#"{{"text":"{}","color":"red"}}"#, e);
+                let msg = serde_json::json!({
+                    "text": disconnect_reason_text(e),
+                    "color": "red",
+                })
+                .to_string();
                 let _ = self.send_play_disconnect(&msg).await;
             }
         }

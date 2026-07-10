@@ -6,11 +6,12 @@
 //!     limbo, packet I/O, converters, modloader detection)
 //!   - `protocol::*` — wiki-versioned dispatch tables and coverage
 //!   - `features::*` — exploit guard, commands, etc.
-//!   - `services::*` — HTTP API, server-management TCP, telemetry
-//!   - `data::*` — DB layer and persisted models
+//!   - `services::*` — server-management TCP, telemetry
 //!
 //! Everything user-facing lives in `proxy`; the rest are leaves of
-//! that tree.
+//! that tree. The proxy holds no persistent state and exposes no
+//! inbound HTTP/REST surface by design — it's a pure relay; anything
+//! needing storage or an admin API is a plugin's job.
 
 pub mod buffer_pool;
 pub mod chat_signing;
@@ -34,7 +35,6 @@ pub mod telemetry;
 pub mod version_check;
 
 pub mod control_plane;
-pub mod data;
 pub mod features;
 pub mod net;
 pub mod protocol;
@@ -42,7 +42,6 @@ pub mod security;
 pub mod services;
 
 pub use control_plane::{ControlPlaneConfig, ControlPlaneServer, ControlPlaneState};
-pub use data::{db, permissions};
 pub use features::{commands, exploit_guard, server_selector, transfer};
 pub use net::{
     connection, connection_pool, connection_throttle, limbo, limbo_packets, login_packets,
@@ -52,7 +51,7 @@ pub use protocol::{
     ConverterBuilder, ConverterInfo, CoverageStatus, ProtocolCoverage, VersionPair,
 };
 pub use security::{EncryptionAlgorithm, EncryptionKey, EncryptionManager};
-pub use services::{http_api, server_management};
+pub use services::server_management;
 
 pub use proxy::{accept_loop, ProxyState};
 pub use services::server_management::ServerManagementServer;

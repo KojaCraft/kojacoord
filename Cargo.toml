@@ -87,9 +87,6 @@ anyhow = "1"
 toml = "0.8"
 figment = { version = "0.10", features = ["toml", "env"] }
 
-# database
-sqlx = { version = "0.8", features = ["mysql", "runtime-tokio-rustls", "chrono", "uuid"] }
-
 # logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -110,11 +107,21 @@ dashmap = "6"
 # ip networks
 ipnet = { version = "2", features = ["serde"] }
 
+# NOTE: deliberately no `panic = "abort"` here. Every client connection
+# (and every backend relay half) runs in its own `tokio::spawn`ed task —
+# with the default unwinding panic runtime, a panic in one connection's
+# packet handling (an index-out-of-bounds, an `unwrap()` on attacker-
+# controlled input, etc.) only tears down that one task; the JoinHandle
+# observes it as a JoinError and every other player's connection is
+# unaffected. `panic = "abort"` turns the same panic into a hard process
+# abort — a single malformed packet from any one client would kick every
+# player on the proxy. That's a trivial remote DoS on a server whose
+# whole job is parsing untrusted network input, so it's not worth the
+# marginal binary-size/unwind-table savings.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
 
 [profile.private_api]

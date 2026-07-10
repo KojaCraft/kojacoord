@@ -11,24 +11,28 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::server::ServerRegistry;
 
-/// One TCP probe; returns `true` if we got a SYN-ACK inside the
-/// timeout. The stream is dropped immediately — we never send a packet
-/// across it.
-async fn probe_server(address: std::net::SocketAddr, timeout_secs: u64) -> bool {
-    matches!(
-        timeout(
-            Duration::from_secs(timeout_secs),
-            TcpStream::connect(address)
-        )
-        .await,
-        Ok(Ok(_))
+/// One TCP probe; returns the connect latency in milliseconds on success
+/// (a SYN-ACK inside the timeout), `None` on failure/timeout. The stream is
+/// dropped immediately — we never send a packet across it. The latency
+/// feeds `BackendServer::last_latency_ms`, used by `[[server_groups]]`'s
+/// `"latency"` selection strategy.
+async fn probe_server(address: std::net::SocketAddr, timeout_secs: u64) -> Option<u64> {
+    let started = Instant::now();
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        TcpStream::connect(address),
     )
+    .await
+    {
+        Ok(Ok(_)) => Some(started.elapsed().as_millis() as u64),
+        _ => None,
+    }
 }
 
 /// Spawn the probe loop. Runs forever in the background; never exits
@@ -49,11 +53,12 @@ pub fn start_health_probes(registry: Arc<ServerRegistry>) {
                     continue;
                 }
 
-                let is_healthy =
+                let latency_ms =
                     probe_server(server.address, server.health_probe_timeout_secs).await;
 
-                if is_healthy {
+                if let Some(latency_ms) = latency_ms {
                     // Probe succeeded
+                    server.last_latency_ms.store(latency_ms, Ordering::Relaxed);
                     let fail_count = server.health_fail_count.load(Ordering::Relaxed);
                     if fail_count > 0 {
                         // Reset failure count

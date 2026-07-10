@@ -1,4 +1,3 @@
-pub mod http_api;
 pub mod server_management;
 
 /// Constant-time comparison of two secrets.

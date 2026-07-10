@@ -24,7 +24,6 @@ COPY crates ./crates
 COPY src ./src
 
 # Build in release mode
-ENV SQLX_OFFLINE=true
 RUN cargo build --release
 
 # Runtime stage
@@ -40,7 +39,7 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 kojacoord
 
 # Create directories
-RUN mkdir -p /app/data /app/plugins /app/logs \
+RUN mkdir -p /app/plugins /app/logs \
     && chown -R kojacoord:kojacoord /app
 
 WORKDIR /app
@@ -51,12 +50,17 @@ COPY --from=builder /build/target/release/kojacoord-proxy /app/kojacoord-proxy
 # Switch to non-root user
 USER kojacoord
 
-# Expose default Minecraft proxy port and API ports
-EXPOSE 25565 8080 8081
+# Expose the Minecraft proxy port and the server-management control-plane
+# port. The proxy holds no persistent state and exposes no inbound
+# HTTP/REST surface by design — there is no admin API port to expose here.
+EXPOSE 25565 8080
 
-# Health check
+# Health check: a raw TCP-connect against the Minecraft port. There's no
+# HTTP endpoint in the container to curl (see above), so this is the only
+# universally-available liveness signal; relies on bash's /dev/tcp, which
+# ships in this base image.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8081/api/health || exit 1
+    CMD bash -c 'echo > /dev/tcp/127.0.0.1/25565' || exit 1
 
 # Run the proxy
 CMD ["/app/kojacoord-proxy"]

@@ -1,86 +1,93 @@
 # Security Policy
 
-## Supported Versions
+Kojacoord terminates untrusted TCP connections from the public internet and
+speaks a binary protocol to them before any authentication happens — that's
+the part of this project that actually needs a security policy, so this
+document is about that, not a generic template.
 
-| Version | Supported          |
-|---------|--------------------|
-| 0.1.x   | :white_check_mark: |
+## Supported versions
 
-## Reporting a Vulnerability
+Pre-1.0. Only the latest release gets security fixes; there's no maintained
+LTS branch yet.
 
-If you discover a security vulnerability in Kojacoord Proxy, please report it responsibly.
+## Reporting a vulnerability
 
-### How to Report
+Don't open a public issue for it. Email
+[security@kojacoord.net](mailto:security@kojacoord.net) instead, with:
 
-**Do not** open a public issue for security vulnerabilities.
+- What the vulnerability is and where (file/function if you have it)
+- Steps to reproduce
+- What it lets an attacker actually do
+- A patch or mitigation, if you have one — not required
 
-Instead, send an email to: [security@example.com](mailto:security@example.com)
+You'll get an acknowledgment within 48 hours and a real response (not just
+"still looking") within 7 days. We'll credit you in the advisory unless you
+ask us not to. Give us a reasonable window to ship a fix before disclosing
+publicly; we're not going to drag that out to avoid embarrassment.
 
-Please include:
-- A description of the vulnerability
-- Steps to reproduce the issue
-- Potential impact of the vulnerability
-- Any suggested fixes (if available)
+## What's actually in scope
 
-### What to Expect
+The realistic attack surface here is: the Minecraft listener (anyone can
+connect), the packet parsers for every supported protocol version, the
+login/encryption handshake, and — if you've enabled them — the TCP
+server-management control plane and the gRPC control plane. Those last two
+are meant for trusted orchestration tooling, not the public internet; if
+you find a way to reach them without the configured auth token, that's a
+real bug.
 
-- We will acknowledge receipt of your report within 48 hours
-- We will provide a detailed response within 7 days
-- We will work with you to understand and validate the report
-- We will coordinate a release schedule for the fix
-- We will credit you in the security advisory (unless you request otherwise)
+Out of scope: anything that requires an already-compromised backend server,
+a plugin the operator chose to install, or physical/OS-level access to the
+box the proxy runs on. We'll still take the report, just don't expect it to
+be treated as urgent.
 
-### Disclosure Policy
+## What's actually built to hold up
 
-We follow responsible disclosure practices:
+Rather than a generic checklist, here's what's specific to this codebase:
 
-1. **Private Coordination**: Work with the reporter to understand and fix the issue
-2. **Fix Development**: Develop and test the fix
-3. **Release**: Deploy the fix in a security release
-4. **Public Disclosure**: Publish a security advisory after the fix is released
+- **No database, no admin HTTP surface.** The proxy holds no persistent
+  state and doesn't expose an inbound REST/admin API — the only thing it
+  listens on over HTTP is a read-only Prometheus metrics endpoint. That's
+  not a missing feature, it's less attack surface: there's no SQL to inject,
+  no admin panel to leave world-readable, no database credentials to leak.
+- **Per-connection panic isolation.** Every client connection runs in its
+  own task, and the release build does *not* use `panic = "abort"` — a
+  panic triggered by one malformed packet from one client tears down that
+  one connection, not the whole proxy. (This one's a real footgun in
+  network services that get it wrong: `panic = "abort"` turns "attacker
+  sends one bad packet" into "every player on the server gets disconnected.")
+- **Signed login, signed profiles.** Online-mode login uses RSA key
+  exchange + AES-CFB8 encryption per the vanilla protocol, and Mojang's
+  profile-property signatures are verified against the configured public
+  key before a skin/cape is trusted — so a MITM can't forge one in.
+- **Constant-time token comparisons.** Every control-plane auth check
+  (TCP server-management, gRPC control plane) compares tokens in constant
+  time, not with `==`, so a timing attack can't leak the token
+  byte-by-byte.
+- **Inbound abuse guards.** A sliding-window packet-rate ceiling and a
+  per-packet size cap on the client→backend direction, independent of
+  per-IP connection throttling (token-bucket, with automatic temporary
+  bans) and a pluggable IP-reputation blocklist (static CIDRs plus an
+  optional external provider, fail-open on provider timeout so a slow
+  third party can't become a denial-of-service vector).
+- **Known, accepted limitation:** legacy BungeeCord-style player-info
+  forwarding is unsigned by protocol design — it always has been, in every
+  implementation of it. If you enable it, your backend servers must be
+  firewalled to only accept connections from the proxy, or a player can
+  spoof another player's identity. Use Velocity-style forwarding (HMAC-signed)
+  instead unless you specifically need BungeeCord compatibility.
 
-### Security Best Practices
+## Dependencies
 
-For Users
-
-- Keep the proxy updated to the latest version
-- Use strong, unique auth tokens for API endpoints
-- Restrict API access to trusted networks
-- Review security advisories regularly
-- Use firewall rules to restrict access to management ports
-
-For Developers
-
-- Never commit secrets or credentials
-- Use environment variables for sensitive configuration
-- Validate all user inputs
-- Follow secure coding practices
-- Regularly update dependencies
-
-### Dependency Management
-
-We regularly update dependencies to address known vulnerabilities. Dependency updates are:
-
-- Tested thoroughly before merging
-- Released in patch versions when backward compatible
-- Released in minor versions when breaking changes are required
-
-### Security Features
-
-Kojacoord Proxy includes several security features:
-
-- RSA encryption for authentication handshakes
-- Configurable proxy connection prevention
-- Anti-cheat system with violation tracking
-- Secure API authentication with bearer tokens
-- TLS support for database connections
-- Input validation on all API endpoints
-- SQL injection prevention via prepared statements
-
-### Security Audits
-
-We welcome security audits of the codebase. If you're interested in conducting an audit, please contact us at [security@example.com](mailto:security@koja.net).
+`cargo audit` and `cargo deny` (advisories/bans/licenses/sources) both run
+in CI on every push/PR and on a weekly cron, so a newly disclosed advisory
+in a transitive dependency gets caught even with no code changes. Advisories
+we've deliberately chosen not to act on (no fix available upstream, or the
+affected code path isn't reachable with untrusted input) are listed with a
+written justification in [`.cargo/audit.toml`](.cargo/audit.toml) — that
+file is the actual source of truth, not this one.
 
 ## License
 
-Security vulnerabilities are disclosed under the terms of the MIT License. We request that researchers allow us time to address issues before public disclosure.
+Reported vulnerabilities are handled under the same MIT license as the rest
+of the project. We ask for a reasonable disclosure window; we're not asking
+for secrecy forever.
