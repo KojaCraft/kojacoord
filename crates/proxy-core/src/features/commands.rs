@@ -1,10 +1,11 @@
 //! Built-in slash-command handlers.
 //!
 //! Intercepts chat messages starting with `/` before they're
-//! forwarded to the backend. Includes the user-facing operator
-//! commands (`/tps`, `/list`, `/find`, `/alert`, ban management,
-//! etc.). Permission gates check against the player's role from
-//! `data::permissions` — backends never see the command.
+//! forwarded to the backend. Includes the user-facing proxy commands
+//! (`/server`, `/list`, `/find`, `/tps`, etc.) — backends never see
+//! them. The proxy itself has no notion of player rank/permissions;
+//! any command needing authorization is a plugin's job (it decides
+//! for itself, using its own storage).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,11 +43,9 @@ pub async fn handle_command(
     }
 
     match cmd.as_str() {
-        "ban" => handle_ban(parts, session, state, send_message).await,
         "server" | "servers" => handle_server(parts, session, state, send_message).await,
         "hub" | "lobby" | "spawn" => handle_hub(session, state, send_message).await,
         "glist" | "list" => handle_glist(state, send_message).await,
-        "alert" => handle_alert(parts, session, state, send_message).await,
         "find" => handle_find(parts, state, send_message).await,
         "koja" | "kojacoord" => handle_koja(session, send_message).await,
         "register" => handle_register(session, state, send_message).await,
@@ -81,35 +80,20 @@ async fn dispatch_plugin_command(
         return CommandResult::NotACommand;
     };
 
-    let (uuid, name, rank, server) = {
+    let (uuid, name) = {
         let s = session.read().await;
-        (
-            s.uuid,
-            s.username.clone(),
-            s.rank.clone(),
-            s.current_server.clone(),
-        )
+        (s.uuid, s.username.clone())
     };
 
-    // Permission gate: a command with a declared node requires the
-    // sender to hold it. Resolved through the LuckPerms-shaped service
-    // (per-user nodes + group inheritance + server context), which
-    // falls back to role nodes when the user has no specific opinion.
-    if let Some(node) = &spec.permission {
-        if !state
-            .permissions
-            .has_permission(&uuid, &rank, node, server.as_deref())
-        {
-            send_message("§cYou don't have permission to use that.".to_owned());
-            return CommandResult::Handled;
-        }
-    }
-
+    // The proxy no longer resolves permissions itself (no role/permission
+    // registry) — every plugin command is forwarded regardless of the
+    // command's declared node. A plugin that wants gating checks the
+    // sender's authorization itself (its own storage, LuckPerms, whatever)
+    // inside its command handler; `spec.permission` is still passed along
+    // below so the plugin knows which node it declared.
     let sender = kojacoord_plugin_system::CommandSender {
         uuid: Some(uuid),
         name,
-        // The proxy already gated the top-level node above; pass the
-        // role's wildcard so the plugin can self-gate sub-commands.
         permissions: spec.permission.clone().into_iter().collect(),
         is_console: false,
     };
@@ -161,78 +145,6 @@ async fn apply_command_response(
             let _ = sender_uuid;
         },
     }
-}
-
-async fn handle_ban(
-    parts: Vec<&str>,
-    session: SharedSession,
-    state: Arc<ProxyState>,
-    send_message: &mut impl FnMut(String),
-) -> CommandResult {
-    let (rank, banner) = {
-        let s = session.read().await;
-        (s.rank.clone(), s.username.clone())
-    };
-    if !state.roles.rank_has_permission(&rank, "command.ban") {
-        send_message("§cYou don't have permission to use that.".to_owned());
-        return CommandResult::Handled;
-    }
-
-    let target_name = parts.get(1).copied().unwrap_or("");
-    if target_name.is_empty() {
-        send_message("§cUsage: /ban <player> [reason]".to_owned());
-        return CommandResult::Handled;
-    }
-    let reason = parts
-        .get(2..)
-        .map(|p| p.join(" "))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Banned by an operator".to_owned());
-
-    let Some(db) = &state.db else {
-        send_message("§cBans are unavailable (no database).".to_owned());
-        return CommandResult::Handled;
-    };
-
-    let mut target_uuid = None;
-    {
-        for entry in state.sessions.iter() {
-            let sess = entry.value();
-            let uuid = entry.key();
-            if let Ok(s) = sess.try_read() {
-                if s.username.eq_ignore_ascii_case(target_name) {
-                    target_uuid = Some(*uuid);
-                    break;
-                }
-            }
-        }
-    }
-    if target_uuid.is_none() {
-        target_uuid = db.uuid_for_username(target_name).await.ok().flatten();
-    }
-    let Some(uuid) = target_uuid else {
-        send_message(format!("§cNo player named '{}' was found.", target_name));
-        return CommandResult::Handled;
-    };
-
-    if let Err(e) = db.insert_ban(uuid, &reason, &banner, None).await {
-        tracing::warn!(error = %e, "failed to insert ban");
-        send_message("§cFailed to record the ban.".to_owned());
-        return CommandResult::Handled;
-    }
-
-    let kick_json = serde_json::json!({
-        "text": format!("You have been banned: {}", reason),
-        "color": "red"
-    })
-    .to_string();
-    state.kick_player(&uuid, &kick_json).await;
-
-    send_message(format!("§aBanned §f{}§a — {}", target_name, reason));
-    state
-        .broadcast_system_message(&format!("§c{} was banned by {}.", target_name, banner))
-        .await;
-    CommandResult::Handled
 }
 
 async fn handle_server(
@@ -346,34 +258,6 @@ async fn handle_glist(
     CommandResult::Handled
 }
 
-async fn handle_alert(
-    parts: Vec<&str>,
-    session: SharedSession,
-    state: Arc<ProxyState>,
-    send_message: &mut impl FnMut(String),
-) -> CommandResult {
-    let rank = {
-        let s = session.read().await;
-        s.rank.clone()
-    };
-    if !state.roles.rank_has_permission(&rank, "command.alert") {
-        send_message("§cYou don't have permission to use that.".to_owned());
-        return CommandResult::Handled;
-    }
-
-    let msg = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
-    if msg.is_empty() {
-        send_message("§cUsage: /alert <message>".to_owned());
-        return CommandResult::Handled;
-    }
-    let sess = session.read().await;
-    let broadcast = format!("§4§l[ALERT] §c{}", msg);
-
-    tracing::info!("[ALERT] from {}: {}", sess.username, broadcast);
-    send_message("§aAlert broadcast sent.".to_owned());
-    CommandResult::Handled
-}
-
 async fn handle_find(
     parts: Vec<&str>,
     state: Arc<ProxyState>,
@@ -473,15 +357,13 @@ fn is_proxy_command(input: &str) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("").to_lowercase();
     matches!(
         cmd.as_str(),
-        "ban"
-            | "server"
+        "server"
             | "servers"
             | "hub"
             | "lobby"
             | "spawn"
             | "glist"
             | "list"
-            | "alert"
             | "find"
             | "koja"
             | "kojacoord"

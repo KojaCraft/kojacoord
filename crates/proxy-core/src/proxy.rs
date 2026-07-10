@@ -21,8 +21,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
-use crate::permissions::RoleRegistry;
-
 use kojacoord_auth::{AuthConfig, AuthPipelineConfig};
 use kojacoord_cluster::{ClusterCoordinator, ServiceDiscovery};
 use kojacoord_config::ProxyConfig;
@@ -143,15 +141,6 @@ pub struct ProxyState {
     pub buffer_pool: Arc<BufferPool>,
     pub metrics: Arc<ProxyMetrics>,
     pub auth_pipeline_config: Arc<AuthPipelineConfig>,
-    pub db: Option<Arc<crate::db::Db>>,
-
-    pub roles: Arc<RoleRegistry>,
-
-    /// LuckPerms-shaped permission resolver: per-user nodes (with
-    /// negation + server context) layered over group inheritance, on
-    /// top of [`roles`](Self::roles). Use this for player permission
-    /// checks; `roles.rank_has_permission` remains for role-only gates.
-    pub permissions: Arc<crate::permissions::PermissionService>,
 
     pub outbound: Arc<DashMap<Uuid, mpsc::UnboundedSender<Bytes>>>,
     pub backend_outbound: Arc<DashMap<Uuid, mpsc::UnboundedSender<Bytes>>>,
@@ -201,6 +190,21 @@ pub struct ProxyState {
 
     pub connection_throttle: Arc<ConnectionThrottle>,
 
+    /// Static CIDR blocklist + optional external reputation-provider lookup,
+    /// checked in `accept_loop` right after `connection_throttle`.
+    pub ip_reputation: Arc<crate::net::ip_reputation::IpReputationFilter>,
+
+    /// Live maintenance-mode flag. Seeded from `config.maintenance.enabled`
+    /// at startup; the TCP server-management control-plane's
+    /// `MaintenanceToggle` command flips this directly so an operator can
+    /// enable/disable maintenance mode without a config edit or restart.
+    pub maintenance_enabled: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Full-server connection queueing (see `net::queue`). Checked by
+    /// `limbo::LimboHandler::try_connect_backend` before dialing a backend
+    /// that's at `max_players` capacity.
+    pub queue_manager: Arc<crate::net::queue::QueueManager>,
+
     /// Rate limiter for plugin channel messages (chat, commands, etc.)
     pub plugin_channel_rate_limiter: Arc<PluginChannelRateLimiter>,
 
@@ -235,6 +239,16 @@ pub struct ProxyState {
     /// Pre-built JSON suffix for status responses, regenerated every second.
     pub cached_status: arc_swap::ArcSwap<CachedStatus>,
 
+    /// Server-list-ping favicon: the ready-to-embed
+    /// `data:image/png;base64,...` string read from `favicon.png` in the
+    /// process's working directory, or `None` if that file doesn't exist
+    /// (or isn't a PNG) — the status response then omits `favicon`
+    /// entirely rather than sending something broken. Loaded once at
+    /// startup and re-checked on `reload_config` (SIGHUP / config change),
+    /// not on every status-refresh tick — the file essentially never
+    /// changes at runtime.
+    pub favicon: arc_swap::ArcSwap<Option<String>>,
+
     /// Protocol coverage tracker for converter management
     pub protocol_coverage: Arc<ProtocolCoverage>,
 
@@ -251,6 +265,44 @@ pub struct ProxyState {
 /// Snapshot of the status-response JSON suffix (players + description).
 pub struct CachedStatus {
     pub suffix: String,
+}
+
+/// Read `favicon.png` from the current working directory and encode it as
+/// the `data:image/png;base64,...` URI the Java status-ping protocol
+/// expects in the `favicon` field. Returns `None` — silently, at debug
+/// level — if the file doesn't exist; returns `None` with a warning if it
+/// exists but doesn't look like a PNG (checked via magic bytes), so a
+/// stray non-image `favicon.png` can't get sent to clients as garbage.
+const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+const FAVICON_PATH: &str = "favicon.png";
+
+fn looks_like_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PNG_MAGIC)
+}
+
+fn load_favicon() -> Option<String> {
+    let bytes = match std::fs::read(FAVICON_PATH) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                "no favicon.png in the working directory — server-list ping will omit favicon"
+            );
+            return None;
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read favicon.png — omitting favicon from server-list ping");
+            return None;
+        },
+    };
+
+    if !looks_like_png(&bytes) {
+        tracing::warn!("favicon.png doesn't look like a PNG file (bad magic bytes) — omitting favicon from server-list ping");
+        return None;
+    }
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:image/png;base64,{encoded}"))
 }
 
 impl ProxyState {
@@ -281,6 +333,9 @@ impl ProxyState {
                     health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     region: s.region.clone(),
+                    max_players: s.max_players.unwrap_or(0),
+                    weight: s.weight,
+                    last_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 })
                 .await;
         }
@@ -311,86 +366,6 @@ impl ProxyState {
             Arc::clone(&session_semaphore),
             auth_config,
         )?);
-
-        let db = if config.database.url.trim().is_empty() {
-            let sqlite_path = "data/proxy.db";
-            tracing::info!("No MySQL URL configured — using SQLite at {}", sqlite_path);
-            // sqlx won't create missing parent directories, and the
-            // default config ships with `data/` relative; ensure it
-            // exists so first-run installs don't fail with
-            // "unable to open database file".
-            if let Some(parent) = std::path::Path::new(sqlite_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        tracing::warn!(
-                            error = %e,
-                            path = %parent.display(),
-                            "Failed to create SQLite parent directory"
-                        );
-                    }
-                }
-            }
-            match crate::data::db::Db::connect_sqlite(sqlite_path).await {
-                Ok(db) => {
-                    tracing::info!("Connected to SQLite database");
-                    Some(Arc::new(db))
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to connect to SQLite — running without persistence");
-                    None
-                },
-            }
-        } else {
-            match crate::data::db::Db::connect(
-                &config.database.url,
-                config.database.max_connections,
-            )
-            .await
-            {
-                Ok(db) => {
-                    tracing::info!("Connected to MySQL database");
-                    Some(Arc::new(db))
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to connect to MySQL — running without persistence");
-                    None
-                },
-            }
-        };
-
-        let roles = match &db {
-            Some(db) => match db.load_roles().await {
-                Ok(rows) if !rows.is_empty() => {
-                    tracing::info!(count = rows.len(), "Loaded roles from database");
-                    RoleRegistry::from_rows(rows)
-                },
-                Ok(_) => {
-                    tracing::warn!("No roles in database — using built-in default");
-                    RoleRegistry::builtin_default()
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to load roles — using built-in default");
-                    RoleRegistry::builtin_default()
-                },
-            },
-            None => RoleRegistry::builtin_default(),
-        };
-        let roles = Arc::new(roles);
-
-        // LuckPerms-shaped resolver: group inheritance edges from the DB
-        // (empty when no DB), layered over the role registry. Per-user
-        // nodes are loaded lazily on join.
-        let group_parents = match &db {
-            Some(db) => db.load_group_parents().await.unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load group inheritance — none applied");
-                Vec::new()
-            }),
-            None => Vec::new(),
-        };
-        let permissions = Arc::new(crate::permissions::PermissionService::new(
-            Arc::clone(&roles),
-            group_parents,
-        ));
 
         let (cluster_coordinator, service_discovery) = if config.cluster.enabled {
             let local_node_id = Uuid::new_v4();
@@ -489,6 +464,22 @@ impl ProxyState {
             0,
         ));
 
+        let ip_reputation = Arc::new(crate::net::ip_reputation::IpReputationFilter::new(
+            &config.ip_reputation,
+            http_client.clone(),
+        ));
+
+        let maintenance_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
+            config.maintenance.enabled,
+        ));
+
+        // `max_queue_size: 0` (unlimited) when queueing is disabled outright
+        // doesn't fully disable it — `limbo` also checks `config.queue.enabled`
+        // before ever calling into this at all.
+        let queue_manager = Arc::new(crate::net::queue::QueueManager::new(
+            config.queue.max_queue_size,
+        ));
+
         let plugin_channel_rate_limiter = Arc::new(PluginChannelRateLimiter::default());
 
         let player_metrics = Arc::new(PlayerMetricsRegistry::new(1000)); // Store up to 1000 trace entries per player
@@ -543,6 +534,9 @@ impl ProxyState {
                 target: r.target.clone(),
             })
             .collect();
+        let geoip_resolver =
+            crate::region_selector::GeoIpResolver::load(config.geoip.database_path.as_deref());
+        let server_groups = config.server_groups.clone();
 
         Ok(Self {
             config: Arc::new(config),
@@ -551,13 +545,15 @@ impl ProxyState {
             rsa_key,
             http_client,
             session_semaphore,
-            routing: Arc::new(RoutingRules::with_rules(default_server, route_rules)),
+            routing: Arc::new(RoutingRules::with_rules_geoip_and_groups(
+                default_server,
+                route_rules,
+                geoip_resolver,
+                server_groups,
+            )),
             buffer_pool: Arc::new(BufferPool::new()),
             metrics: Arc::new(ProxyMetrics::new()),
             auth_pipeline_config,
-            db,
-            roles,
-            permissions,
             outbound: Arc::new(DashMap::new()),
             backend_outbound: Arc::new(DashMap::new()),
             started_at: std::time::Instant::now(),
@@ -574,6 +570,9 @@ impl ProxyState {
             hot_reload_rx: std::sync::Mutex::new(Some(hot_reload_rx)),
             tps_tracker,
             connection_throttle,
+            ip_reputation,
+            maintenance_enabled,
+            queue_manager,
             plugin_channel_rate_limiter,
             serverlist_cooldown: Arc::new(DashMap::new()),
             player_metrics,
@@ -588,6 +587,7 @@ impl ProxyState {
                     r#"},"players":{"max":0,"online":0,"sample":[]},"description":{"text":""}}"#
                         .to_string(),
             })),
+            favicon: arc_swap::ArcSwap::new(Arc::new(load_favicon())),
             protocol_coverage,
             encryption_manager,
             control_plane_state,
@@ -640,6 +640,9 @@ impl ProxyState {
                             health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                             health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                             region: s.region.clone(),
+                            max_players: s.max_players.unwrap_or(0),
+                            weight: s.weight,
+                            last_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         })
                         .await;
                     tracing::info!("Hot-reloaded (updated) server: {}", s.name);
@@ -663,6 +666,9 @@ impl ProxyState {
                         health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                         health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         region: s.region.clone(),
+                        max_players: s.max_players.unwrap_or(0),
+                        weight: s.weight,
+                        last_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     })
                     .await;
                 tracing::info!("Hot-reloaded new server: {}", s.name);
@@ -691,13 +697,30 @@ impl ProxyState {
     pub async fn reload_config(&self, new_config: &kojacoord_config::ProxyConfig) {
         tracing::info!("Hot-reloading configuration...");
 
+        // Re-check favicon.png too — cheap, and lets an operator drop one in
+        // (or update/remove it) without a full restart.
+        self.favicon.store(Arc::new(load_favicon()));
+
         // MOTD lives in `listeners.motd` (string) or `listeners.motd_json`
         // (full JSON component). Rebuild the cached status suffix.
         let motd = &new_config.listeners.motd;
+        let favicon_field = self
+            .favicon
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|f| {
+                format!(
+                    r#","favicon":{}"#,
+                    serde_json::to_string(f).unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
         let new_suffix = format!(
-            r#"}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":{}}}}}"#,
+            r#"}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":{}}}{}}}"#,
             new_config.proxy.max_players,
             serde_json::to_string(motd).unwrap_or_else(|_| "\"A Minecraft Server\"".into()),
+            favicon_field,
         );
         self.cached_status
             .store(Arc::new(CachedStatus { suffix: new_suffix }));
@@ -1228,7 +1251,7 @@ impl ProxyState {
                 name,
                 address,
                 port,
-                max_players: _,
+                max_players,
             } => {
                 let addr = match format!("{}:{}", address, port).parse::<std::net::SocketAddr>() {
                     Ok(a) => a,
@@ -1257,6 +1280,9 @@ impl ProxyState {
                     health_fail_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     health_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     region: String::new(),
+                    max_players: max_players as usize,
+                    weight: 1,
+                    last_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 };
                 self.server_registry.register(server).await;
                 tracing::info!(plugin = %plugin_name, "Registered server {} at {}:{}", name, address, port);
@@ -1301,94 +1327,6 @@ impl ProxyState {
             },
             PluginCommand::BroadcastMessage { message } => {
                 self.broadcast_system_message(&message).await;
-            },
-            PluginCommand::MutePlayer {
-                uuid,
-                reason,
-                duration_secs,
-            } => {
-                let expires_at = match duration_secs {
-                    Some(secs) if secs > 0 => {
-                        Some(chrono::Utc::now().naive_utc() + chrono::Duration::seconds(secs))
-                    },
-                    _ => None,
-                };
-                if let Some(db) = &self.db {
-                    if let Err(e) = db.insert_mute(uuid, &reason, plugin_name, expires_at).await {
-                        tracing::warn!(plugin = %plugin_name, error = %e, "plugin mute failed");
-                    }
-                }
-                let mute_state = crate::session::MuteState {
-                    reason: reason.clone(),
-                    expires_at,
-                };
-                if let Some(sess) = self.sessions.get(&uuid) {
-                    sess.write().await.mute = Some(mute_state.clone());
-                }
-                let notice = crate::relay::build_mute_notice(&mute_state);
-                self.send_system_message_to(&uuid, &notice).await;
-                tracing::info!(plugin = %plugin_name, "Muted player {}", uuid);
-            },
-            PluginCommand::UnmutePlayer { uuid } => {
-                if let Some(db) = &self.db {
-                    if let Err(e) = db.clear_mute(uuid).await {
-                        tracing::warn!(plugin = %plugin_name, error = %e, "plugin unmute failed");
-                    }
-                }
-                if let Some(sess) = self.sessions.get(&uuid) {
-                    sess.write().await.mute = None;
-                }
-                self.send_system_message_to(&uuid, "§aYour mute has been lifted.")
-                    .await;
-                tracing::info!(plugin = %plugin_name, "Unmuted player {}", uuid);
-            },
-            PluginCommand::BanPlayer {
-                uuid,
-                reason,
-                duration_secs,
-            } => {
-                let expires_at = match duration_secs {
-                    Some(secs) if secs > 0 => {
-                        Some(chrono::Utc::now().naive_utc() + chrono::Duration::seconds(secs))
-                    },
-                    _ => None,
-                };
-                if let Some(db) = &self.db {
-                    if let Err(e) = db.insert_ban(uuid, &reason, plugin_name, expires_at).await {
-                        tracing::warn!(plugin = %plugin_name, error = %e, "plugin ban failed");
-                    }
-                }
-                let json =
-                    serde_json::json!({ "text": format!("You have been banned: {}", reason), "color": "red" })
-                        .to_string();
-                self.kick_player(&uuid, &json).await;
-                tracing::info!(plugin = %plugin_name, "Banned player {}", uuid);
-            },
-            PluginCommand::WarnPlayer { uuid, reason } => {
-                if let Some(db) = &self.db {
-                    if let Err(e) = db.insert_warning(uuid, &reason, plugin_name).await {
-                        tracing::warn!(plugin = %plugin_name, error = %e, "plugin warn failed");
-                    }
-                }
-                self.send_system_message_to(&uuid, &format!("§e§lWarning: §r§7{}", reason))
-                    .await;
-                tracing::info!(plugin = %plugin_name, "Warned player {}", uuid);
-            },
-            PluginCommand::UpdatePlayerStatus {
-                uuid,
-                server,
-                online,
-            } => {
-                if let Some(db) = &self.db {
-                    // Pass server through as-is: `None` clears the column (NULL)
-                    // on disconnect rather than writing an empty string.
-                    if let Err(e) = db
-                        .update_player_status(uuid, server.as_deref(), online)
-                        .await
-                    {
-                        tracing::warn!(plugin = %plugin_name, error = %e, "Failed to update player status");
-                    }
-                }
             },
             PluginCommand::SetLimboCustomization {
                 welcome_message,
@@ -1471,13 +1409,23 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         }
     }
 
-    if state.config.http_api.enabled {
-        let api_state = Arc::clone(&state);
-        let bind = state.config.http_api.bind.clone();
-        let token = state.config.http_api.auth_token.clone();
+    if state.config.query.enabled {
+        let query_server = crate::net::query::QueryServer::new(Arc::clone(&state));
+        let bind = state.config.query.bind.clone();
+        tokio::spawn({
+            let query_server = Arc::clone(&query_server);
+            async move {
+                if let Err(e) = query_server.serve(bind).await {
+                    tracing::error!(error = %e, "Query (GS4) server stopped");
+                }
+            }
+        });
+        // Periodically evict expired GS4 challenge tokens.
         tokio::spawn(async move {
-            if let Err(e) = crate::http_api::serve(api_state, bind, token).await {
-                tracing::error!(error = %e, "HTTP API server stopped");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                query_server.evict_stale();
             }
         });
     }
@@ -1497,6 +1445,30 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
             loop {
                 interval.tick().await;
                 throttle.evict_stale().await;
+            }
+        }
+    });
+
+    // Periodically evict expired IP-reputation-provider verdicts.
+    tokio::spawn({
+        let ip_reputation = Arc::clone(&state.ip_reputation);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                ip_reputation.evict_stale();
+            }
+        }
+    });
+
+    // Periodically drop empty per-server connection-queue entries.
+    tokio::spawn({
+        let queue_manager = Arc::clone(&state.queue_manager);
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                queue_manager.evict_empty();
             }
         }
     });
@@ -1609,11 +1581,28 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
                     "sample": sample,
                 });
 
+                // Read-only here (no disk I/O per tick) — `favicon.png` is
+                // only re-read from disk in `reload_config`, since it
+                // essentially never changes at runtime.
+                let favicon_field = state
+                    .favicon
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .map(|f| {
+                        format!(
+                            r#","favicon":{}"#,
+                            serde_json::to_string(f).unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+
                 let suffix = [
                     r#"},"players":"#,
                     &serde_json::to_string(&players_json).unwrap_or_else(|_| "{}".to_string()),
                     r#","description":"#,
                     &serde_json::to_string(&description).unwrap_or_else(|_| "{}".to_string()),
+                    &favicon_field,
                     r#"}"#,
                 ]
                 .join("");
@@ -1633,6 +1622,16 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
         // per-connection work.
         if let Err(reason) = state.connection_throttle.check(peer_addr.ip()).await {
             tracing::debug!(peer = %peer, reason, "throttled connection rejected");
+            drop(stream);
+            continue;
+        }
+
+        // Static CIDR blocklist + (if configured) external reputation
+        // provider. Checked after the cheap in-memory throttle so a
+        // hot-looping abusive IP gets temp-banned by the throttle before
+        // ever reaching this (potentially network-bound) check.
+        if let Err(reason) = state.ip_reputation.check(peer_addr.ip()).await {
+            tracing::debug!(peer = %peer, reason, "connection rejected by IP reputation filter");
             drop(stream);
             continue;
         }
@@ -1663,5 +1662,24 @@ pub async fn accept_loop(state: Arc<ProxyState>) -> Result<(), anyhow::Error> {
             }
             state.metrics.record_disconnection();
         });
+    }
+}
+
+#[cfg(test)]
+mod favicon_tests {
+    use super::*;
+
+    #[test]
+    fn png_magic_is_recognized() {
+        let mut png = PNG_MAGIC.to_vec();
+        png.extend_from_slice(b"...fake rest of a png...");
+        assert!(looks_like_png(&png));
+    }
+
+    #[test]
+    fn non_png_is_rejected() {
+        assert!(!looks_like_png(b"GIF89a not a png"));
+        assert!(!looks_like_png(b""));
+        assert!(!looks_like_png(&PNG_MAGIC[..4])); // truncated magic
     }
 }

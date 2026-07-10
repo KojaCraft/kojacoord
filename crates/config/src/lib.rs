@@ -29,14 +29,28 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub routing: RoutingConfig,
 
+    /// Named backend pools (`routing::select_from_group`) — see
+    /// `ServerGroupConfig`.
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub server_groups: Vec<ServerGroupConfig>,
+
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
+
+    #[serde(default)]
+    pub ip_reputation: IpReputationConfig,
+
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
+
+    #[serde(default)]
+    pub queue: QueueConfig,
+
+    #[serde(default)]
+    pub query: QueryConfig,
 
     #[serde(default)]
     pub server_management: ServerManagementConfig,
-
-    #[serde(default)]
-    pub http_api: HttpApiConfig,
 
     #[serde(default)]
     pub cluster: ClusterConfig,
@@ -178,6 +192,16 @@ pub struct ProxySection {
 
     #[serde(default = "default_public_key")]
     pub mojang_public_key: String,
+
+    /// Batch S→C (backend→client) packet writes: when several packets are
+    /// already sitting in the backend-read buffer together (a chunk-loading
+    /// burst, a teleport), accumulate them and flush once instead of one
+    /// `write`+`flush` per packet. Transparent to the wire format — this
+    /// only changes how many write syscalls it takes to send the same
+    /// bytes in the same order. Pure escape hatch: set `false` to instantly
+    /// revert to the old per-packet-flush behavior without a code rollback.
+    #[serde(default = "bool_true")]
+    pub batch_s2c_writes: bool,
 }
 
 impl Default for ProxySection {
@@ -207,6 +231,7 @@ impl Default for ProxySection {
             eula_accepted: false,
             auth_url: default_auth_url(),
             mojang_public_key: default_public_key(),
+            batch_s2c_writes: true,
         }
     }
 }
@@ -340,6 +365,37 @@ pub struct ServerEntry {
 
     #[serde(default)]
     pub backend_type: BackendType,
+
+    /// Relative weight for `[[server_groups]]` `"weighted"` selection —
+    /// higher gets proportionally more new connections. Meaningless outside
+    /// a group. Default 1 (equal weighting).
+    #[serde(default = "default_server_weight")]
+    pub weight: u32,
+}
+
+fn default_server_weight() -> u32 {
+    1
+}
+
+/// A named pool of interchangeable backends (e.g. several "survival-N"
+/// instances behind one logical name) that `[[routing.rules]].target` /
+/// `[routing].default_server` can reference instead of a single literal
+/// server name — see `routing::select_from_group`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerGroupConfig {
+    pub name: String,
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub strategy: GroupStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupStrategy {
+    #[default]
+    LeastConnections,
+    Weighted,
+    Latency,
 }
 
 /// Top-level routing config (see `[routing]` / `[[routing.rules]]` in the
@@ -369,13 +425,145 @@ pub struct RouteRuleConfig {
     pub target: String,
 }
 
+/// GeoIP database for region-aware lobby selection
+/// (`region_selector::GeoIpResolver`). Optional — with no `database_path`
+/// configured, every client IP buckets to `"global"`, the same as before a
+/// GeoIP database existed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DatabaseConfig {
+pub struct GeoIpConfig {
+    /// Path to a MaxMind GeoIP2/GeoLite2 `.mmdb` file (City-level databases
+    /// additionally enable an east/west US split). MaxMind requires a free
+    /// account to download GeoLite2; this only reads whatever file path is
+    /// configured, no license-key handling needed here.
     #[serde(default)]
-    pub url: String,
+    pub database_path: Option<String>,
+}
 
-    #[serde(default = "default_db_pool_size")]
-    pub max_connections: u32,
+/// IP reputation / hosting-provider blocklist (`net::ip_reputation`),
+/// checked in `accept_loop` right after `connection_throttle`, before any
+/// per-connection work starts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpReputationConfig {
+    /// CIDR ranges (IPv4/IPv6, e.g. `"10.0.0.0/8"`) to reject outright.
+    /// Checked synchronously, no I/O — always available regardless of
+    /// whether an external provider is configured below.
+    #[serde(default)]
+    pub blocklist_cidrs: Vec<String>,
+
+    /// Optional external reputation provider. The proxy makes an
+    /// *outbound* `GET {provider_url}?ip=<addr>` (the proxy acting as an
+    /// HTTP client, not exposing an inbound endpoint) expecting a JSON body
+    /// with a `blocked` boolean field. Leave unset to use the static
+    /// blocklist only.
+    #[serde(default)]
+    pub provider_url: Option<String>,
+
+    /// Sent as `Authorization: Bearer <api_key>` to `provider_url`, if set.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// How long a provider verdict is cached per-IP before re-querying.
+    #[serde(default = "default_ip_reputation_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+
+    /// Provider lookup timeout. A slow/unreachable provider fails OPEN
+    /// (connection allowed) rather than stalling `accept_loop` — this
+    /// bounds how long any single lookup can block that.
+    #[serde(default = "default_ip_reputation_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_ip_reputation_cache_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_ip_reputation_timeout_ms() -> u64 {
+    300
+}
+
+/// Built-in maintenance mode: blocks non-bypassed logins with a
+/// configurable kick message. `enabled` here is only the *boot-time*
+/// default — the live value is an in-memory flag
+/// (`ProxyState::maintenance_enabled`) that operators can flip instantly
+/// over the TCP server-management control-plane (`MaintenanceToggle`)
+/// without editing this file or restarting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_maintenance_kick_message")]
+    pub kick_message: String,
+
+    /// Player UUIDs (hyphenated, case-insensitive) that may still log in
+    /// while maintenance mode is on — staff, testers, etc.
+    #[serde(default)]
+    pub bypass_uuids: Vec<String>,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kick_message: default_maintenance_kick_message(),
+            bypass_uuids: Vec::new(),
+        }
+    }
+}
+
+fn default_maintenance_kick_message() -> String {
+    "The network is currently down for maintenance. Please check back soon.".to_string()
+}
+
+/// Full-server connection queueing (`net::queue`). When a target backend is
+/// at its configured `[[servers]].max_players`, a connecting player is held
+/// in limbo with a live position message instead of being rejected/rerouted,
+/// and let through in arrival order as slots free up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueConfig {
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+
+    /// Reject with a clear message once a single server's queue reaches this
+    /// size, rather than growing it unbounded. `0` = unlimited.
+    #[serde(default)]
+    pub max_queue_size: usize,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_queue_size: 0,
+        }
+    }
+}
+
+/// GameSpy4 (UT3) query protocol (`net::query`) — the same `enable-query`
+/// protocol vanilla servers speak, letting third-party server-list
+/// aggregators that ping via UDP query see this proxy correctly. Opt-in
+/// (unlike the Java status ping, which needs no config): off by default so
+/// enabling it is a deliberate choice to open another UDP listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_query_bind")]
+    pub bind: String,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_query_bind(),
+        }
+    }
+}
+
+fn default_query_bind() -> String {
+    "0.0.0.0:25565".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -466,38 +654,6 @@ fn default_telemetry_endpoint() -> String {
 fn default_telemetry_interval() -> u64 {
     // Every 30 minutes is plenty for adoption metrics and is gentle on the endpoint.
     1800
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpApiConfig {
-    #[serde(default = "bool_true")]
-    pub enabled: bool,
-
-    #[serde(default = "default_http_bind")]
-    pub bind: String,
-
-    #[serde(default = "default_http_token")]
-    pub auth_token: String,
-}
-
-impl Default for HttpApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: bool_true(),
-            bind: default_http_bind(),
-            auth_token: default_http_token(),
-        }
-    }
-}
-
-fn default_http_bind() -> String {
-    "127.0.0.1:8081".into()
-}
-
-fn default_http_token() -> String {
-    // Intentionally empty: a real secret must be configured (or is auto-generated
-    // on first run). Validation rejects empty/placeholder tokens at startup.
-    String::new()
 }
 
 fn default_public_key() -> String {
@@ -609,9 +765,6 @@ fn default_session_timeout() -> u64 {
 }
 fn default_max_conns_per_ip() -> u32 {
     8
-}
-fn default_db_pool_size() -> u32 {
-    10
 }
 fn bool_true() -> bool {
     true
@@ -771,8 +924,7 @@ impl ProxyConfig {
 
         // Environment overrides use `__` to denote nesting so secrets can be
         // injected without baking them into the TOML, e.g.
-        //   KOJA_HTTP_API__AUTH_TOKEN, KOJA_SERVER_MANAGEMENT__AUTH_TOKEN,
-        //   KOJA_DATABASE__URL, KOJA_FORWARDING__VELOCITY_SECRET
+        //   KOJA_SERVER_MANAGEMENT__AUTH_TOKEN, KOJA_FORWARDING__VELOCITY_SECRET
         let config: ProxyConfig = Figment::new()
             .merge(Toml::file(path.as_ref()))
             .merge(Env::prefixed("KOJA_").split("__").global())
@@ -795,13 +947,6 @@ impl ProxyConfig {
             self.server_management.auth_token = generate_secret();
             changed = true;
         }
-        if self.http_api.enabled
-            && (self.http_api.auth_token.trim().is_empty()
-                || is_forbidden_secret(&self.http_api.auth_token))
-        {
-            self.http_api.auth_token = generate_secret();
-            changed = true;
-        }
         changed
     }
 
@@ -822,11 +967,6 @@ impl ProxyConfig {
                 "server_management.auth_token",
                 &self.server_management.auth_token,
             )?;
-        }
-
-        // HTTP API control plane.
-        if self.http_api.enabled {
-            validate_secret("http_api.auth_token", &self.http_api.auth_token)?;
         }
 
         // Velocity modern forwarding relies entirely on the shared HMAC secret;

@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: kojacoord-proxy-ingress
-  namespace: default
+  namespace: kojacoord-system
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
@@ -21,13 +21,6 @@ spec:
   - host: proxy.example.com
     http:
       paths:
-      - path: /api
-        pathType: Prefix
-        backend:
-          service:
-            name: kojacoord-proxy-internal
-            port:
-              number: 8081
       - path: /
         pathType: Prefix
         backend:
@@ -35,33 +28,3 @@ spec:
             name: kojacoord-proxy-internal
             port:
               number: 25577
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: kojacoord-api-ingress
-  namespace: default
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
-    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
-    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type"
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
-spec:
-  ingressClassName: nginx
-  tls:
-  - hosts:
-    - api.example.com
-    secretName: kojacoord-api-tls
-  rules:
-  - host: api.example.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: kojacoord-proxy-internal
-            port:
-              number: 8081

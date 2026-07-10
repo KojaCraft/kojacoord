@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kojacoord_protocol::{codec::Encode, types::VarInt, Decode};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 
@@ -38,12 +39,15 @@ use crate::{
     modloader,
     packet_builder::{
         build_brand_packet, build_disconnect_packet, build_plugin_message_packet,
-        build_serverbound_plugin_message_packet, build_system_message_packet,
+        build_system_message_packet,
     },
     packet_ids::{
         cb_play, cb_plugin_message_id, chat_packet_ids_for, sb_play, sb_plugin_message_id,
     },
-    packet_io::{read_client_packet, read_packet, write_client_packet, write_packet},
+    packet_io::{
+        encode_packet, is_pre_netty_proto, read_client_packet, read_packet, write_client_packet,
+        write_packet,
+    },
     plugin_decoder,
     proxy::ProxyState,
     server_selector,
@@ -85,6 +89,31 @@ pub enum RelayExit {
         client_stream: crate::connection::McStream,
         reason: String,
     },
+}
+
+/// Tag an error as having originated from the *backend* socket rather
+/// than the client's. `connection.rs`'s `client_gone()` check uses
+/// this to tell "client hung up, nobody to notify" apart from
+/// "backend died, the client is still here and needs a real kick
+/// message" — see [`ConnectionError::Backend`].
+fn from_backend(e: ConnectionError) -> ConnectionError {
+    ConnectionError::Backend(Box::new(e))
+}
+
+/// Encode a packet exactly as [`write_client_packet`] would put it on the
+/// wire — raw bytes for pre-netty (1.6.x) clients, varint-length-framed and
+/// optionally zlib-compressed otherwise — but return the bytes instead of
+/// writing them anywhere. Used by the S→C write-batching path in
+/// [`PacketRelay::run`] to accumulate several already-encoded frames before
+/// a single `write_all`; kept as its own tiny function (rather than
+/// reworking `write_client_packet` itself) so every other caller of that
+/// function across the codebase is completely unaffected by this change.
+fn encode_for_client(raw: &[u8], proto: u32, threshold: i32) -> BytesMut {
+    if is_pre_netty_proto(proto) {
+        BytesMut::from(raw)
+    } else {
+        encode_packet(raw, threshold)
+    }
 }
 
 macro_rules! kick {
@@ -212,30 +241,11 @@ impl PacketRelay {
             .backend_outbound
             .insert(player_uuid, backend_out_tx.clone());
 
-        // Query pending purchases and deliver them immediately!
-        if let Some(db) = &self.state.db {
-            let db = Arc::clone(db);
-            let username = self.session.read().await.username.clone();
-            let backend_out_tx = backend_out_tx.clone();
-            let proto = self.protocol_version;
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                if let Ok(purchases) = db.get_pending_purchases(&username).await {
-                    for purchase in purchases {
-                        let payload = purchase.product_slug.as_bytes();
-                        let pkt_raw = build_serverbound_plugin_message_packet(
-                            "kojacoord:purchase",
-                            payload,
-                            proto,
-                        );
-                        if backend_out_tx.send(pkt_raw).is_ok() {
-                            let _ = db.mark_purchase_delivered(purchase.id).await;
-                            tracing::info!(username = %username, product = %purchase.product_slug, "Delivered pending purchase to backend");
-                        }
-                    }
-                }
-            });
-        }
+        // Pending-purchase delivery used to live here (query the DB 200ms
+        // after connect, push a plugin message to the backend). Dropped
+        // along with the rest of proxy-owned persistence — a plugin/backend
+        // that needs to deliver a purchase can do so over its own storage
+        // and the existing plugin-message channel.
         let cw_out = Arc::clone(&cw_master);
         let stop_out_wait = Arc::clone(&stop);
         let stop_out_sig = Arc::clone(&stop);
@@ -305,14 +315,37 @@ impl PacketRelay {
 
         let s2c = async move {
             let result: Result<(), ConnectionError> = async move {
-            loop {
+            // S→C write batching (see relay.rs module docs / the
+            // `batch_s2c_writes` config comment): when several backend
+            // packets already arrived together in `br`'s read buffer (a
+            // chunk-loading burst, a teleport), accumulate their encoded
+            // frames here and flush once instead of once per packet.
+            // `PENDING_FLUSH_CAP` is a defensive cap so a change to
+            // `BufReader`'s capacity elsewhere can't make this grow
+            // unboundedly; in practice `br_mut.buffer().is_empty()` (no
+            // more already-buffered backend bytes) is what triggers most
+            // flushes, so a lone packet still goes out immediately — this
+            // never adds latency versus today's per-packet flush.
+            let batch_writes = state_s2c.config.proxy.batch_s2c_writes;
+            let mut pending_s2c = BytesMut::new();
+            const PENDING_FLUSH_CAP: usize = 32 * 1024;
+
+            let loop_result: Result<(), ConnectionError> = loop {
                 if stopped_s2c_chk.load(Ordering::Acquire) {
-                    return Ok(());
+                    break Ok(());
                 }
                 let payload = tokio::select! {
                     biased;
-                    _ = stop_s2c_wait.notified() => return Ok(()),
+                    _ = stop_s2c_wait.notified() => break Ok(()),
                     _ = state_s2c.shutdown_notify.notified() => {
+                        // Flush anything already queued so it reaches the
+                        // client before the shutdown Disconnect, preserving
+                        // wire order.
+                        if !pending_s2c.is_empty() {
+                            let mut cw = cw_s2c.lock().await;
+                            let _ = cw.write_all(&pending_s2c).await;
+                            pending_s2c.clear();
+                        }
                         // Proxy is shutting down — send the configured
                         // Disconnect packet to the client before we
                         // drop the socket. Without this the client
@@ -321,9 +354,9 @@ impl PacketRelay {
                         let raw = crate::packet_builder::build_disconnect_packet(&reason, proto);
                         let mut cw = cw_s2c.lock().await;
                         let _ = write_client_packet(&mut *cw, &raw, proto, client_thresh).await;
-                        return Ok(());
+                        break Ok(());
                     },
-                    r = read_packet(&mut *br_mut, backend_thresh) => r?,
+                    r = read_packet(&mut *br_mut, backend_thresh) => r.map_err(from_backend)?,
                 };
 
                 state_s2c.metrics.record_packet(payload.len());
@@ -345,6 +378,13 @@ impl PacketRelay {
                     Ok(v) => {
                         if v.0 < 0 || v.0 > 255 {
                             tracing::warn!(raw_id = v.0, "S→C packet ID out of u8 range — treating as passthrough");
+                            // Cold path, bypasses the batching accumulator —
+                            // flush it first so wire order still matches.
+                            if !pending_s2c.is_empty() {
+                                let mut cw = cw_s2c.lock().await;
+                                cw.write_all(&pending_s2c).await?;
+                                pending_s2c.clear();
+                            }
                             let mut cw = cw_s2c.lock().await;
                             write_client_packet(&mut *cw, &payload, proto, client_thresh).await?;
                             continue;
@@ -365,8 +405,18 @@ impl PacketRelay {
                 );
 
                 if pkt_id == cb_chunk_id {
-                    let mut cw = cw_s2c.lock().await;
-                    write_client_packet(&mut *cw, &payload, proto, client_thresh).await?;
+                    if batch_writes {
+                        let frame = encode_for_client(&payload, proto, client_thresh);
+                        pending_s2c.extend_from_slice(&frame);
+                        if pending_s2c.len() >= PENDING_FLUSH_CAP || br_mut.buffer().is_empty() {
+                            let mut cw = cw_s2c.lock().await;
+                            cw.write_all(&pending_s2c).await?;
+                            pending_s2c.clear();
+                        }
+                    } else {
+                        let mut cw = cw_s2c.lock().await;
+                        write_client_packet(&mut *cw, &payload, proto, client_thresh).await?;
+                    }
                     continue;
                 }
 
@@ -389,6 +439,15 @@ impl PacketRelay {
                                     &resp,
                                     proto,
                                 );
+                                // A different packet is about to go out on
+                                // this connection — flush anything already
+                                // queued first so wire order still matches
+                                // logical order.
+                                if !pending_s2c.is_empty() {
+                                    let mut cw = cw_s2c.lock().await;
+                                    cw.write_all(&pending_s2c).await?;
+                                    pending_s2c.clear();
+                                }
                                 write_client_packet(&mut *cw_s2c.lock().await, &pkt_raw, proto, client_thresh).await?;
                             }
                             continue;
@@ -413,11 +472,18 @@ impl PacketRelay {
                         reason = %reason,
                         "backend sent Disconnect — handing player to limbo"
                     );
+                    // Flush anything already queued before we stop writing —
+                    // the outer pipeline hands the client to limbo next.
+                    if !pending_s2c.is_empty() {
+                        let mut cw = cw_s2c.lock().await;
+                        let _ = cw.write_all(&pending_s2c).await;
+                        pending_s2c.clear();
+                    }
                     *kick_reason_s2c.lock().await = Some(reason);
                     // Mirror what the outer post-block does — the
                     // outer scope still owns its own clones, so this
                     // just speeds up the stop signal.
-                    return Ok(());
+                    break Ok(());
                 }
 
                 // Verbatim forward (no cross-version conversion). Plugin
@@ -432,17 +498,35 @@ impl PacketRelay {
                     player_uuid,
                 ) {
                     Ok(data) => {
-                        let mut cw = cw_s2c.lock().await;
-                        write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
+                        if batch_writes {
+                            let frame = encode_for_client(&data, proto, client_thresh);
+                            pending_s2c.extend_from_slice(&frame);
+                            if pending_s2c.len() >= PENDING_FLUSH_CAP || br_mut.buffer().is_empty() {
+                                let mut cw = cw_s2c.lock().await;
+                                cw.write_all(&pending_s2c).await?;
+                                pending_s2c.clear();
+                            }
+                        } else {
+                            let mut cw = cw_s2c.lock().await;
+                            write_client_packet(&mut *cw, &data, proto, client_thresh).await?;
+                        }
                     }
                     Err(_) => {
                         tracing::trace!(pkt_id, "S→C dropped by plugin hook");
                     }
                 }
+            };
+
+            // Only reached on a clean `break Ok(())` above — any `?`
+            // propagation short-circuits this whole `async move` block
+            // before we get here, so there's no risk of flushing into an
+            // already-broken write half.
+            if !pending_s2c.is_empty() {
+                let mut cw = cw_s2c.lock().await;
+                cw.write_all(&pending_s2c).await?;
             }
 
-            #[allow(unreachable_code)]
-            Ok::<(), ConnectionError>(())
+            loop_result
             }.await;
 
             stopped_s2c_set.store(true, Ordering::Release);
@@ -471,7 +555,7 @@ impl PacketRelay {
                         backend_pkt = backend_out_rx.recv() => {
                             match backend_pkt {
                                 Some(raw) => {
-                                    write_packet(&mut *bw_mut, &raw, backend_thresh).await?;
+                                    write_packet(&mut *bw_mut, &raw, backend_thresh).await.map_err(from_backend)?;
                                     continue;
                                 }
                                 None => return Ok(()),
@@ -498,7 +582,7 @@ impl PacketRelay {
                         Ok(v) => {
                             if v.0 < 0 || v.0 > 255 {
                                 tracing::warn!(raw_id = v.0, "C→S packet ID out of u8 range — treating as passthrough");
-                                write_packet(&mut *bw_mut, &payload, backend_thresh).await?;
+                                write_packet(&mut *bw_mut, &payload, backend_thresh).await.map_err(from_backend)?;
                                 continue;
                             }
                             v.0 as u8
@@ -705,7 +789,7 @@ impl PacketRelay {
                                         &resp,
                                         proto,
                                     );
-                                    write_packet(&mut *bw_mut, &pkt_raw, backend_thresh).await?;
+                                    write_packet(&mut *bw_mut, &pkt_raw, backend_thresh).await.map_err(from_backend)?;
                                 }
                                 continue;
                             }
@@ -739,30 +823,6 @@ impl PacketRelay {
                                     "exploit_guard: illegal chat — kicking"
                                 );
                                 kick!(cw_c2s, reason, proto, client_thresh);
-                            }
-
-                            // Mute enforcement. A muted player may still run
-                            // commands (so they can /appeal, /msg staff, etc.)
-                            // but every non-command chat line is swallowed and
-                            // they are reminded of the mute and its duration.
-                            if !treat_as_command {
-                                let active_mute = {
-                                    let s = session_c2s.read().await;
-                                    s.mute.as_ref().filter(|m| m.is_active()).cloned()
-                                };
-                                if let Some(mute) = active_mute {
-                                    let notice = build_mute_notice(&mute);
-                                    let raw = build_system_message_packet(&notice, proto);
-                                    write_client_packet(
-                                        &mut *cw_c2s.lock().await,
-                                        &raw,
-                                        proto,
-                                        client_thresh,
-                                    )
-                                    .await?;
-                                    tracing::debug!("dropped chat from muted player");
-                                    continue;
-                                }
                             }
 
                             if let Some(mode) = chat_signing_mode {
@@ -848,11 +908,11 @@ impl PacketRelay {
                                 {
                                     return Ok(());
                                 }
-                                let (rank, name) = {
-                                    let s = session_c2s.read().await;
-                                    (s.rank.clone(), s.username.clone())
-                                };
-                                let line = state_c2s.roles.format_chat(&rank, &name, &text);
+                                // Rank-prefixed formatting used to come from the
+                                // (now-removed) role registry; plain "name: text" is
+                                // all the proxy itself knows how to render.
+                                let name = session_c2s.read().await.username.clone();
+                                let line = format!("{}: {}", name, text);
                                 state_c2s.broadcast_system_message(&line).await;
                                 continue;
                             }
@@ -880,7 +940,7 @@ impl PacketRelay {
                     } else {
                         payload.clone()
                     };
-                    write_packet(&mut *bw_mut, &payload_to_send, backend_thresh).await?;
+                    write_packet(&mut *bw_mut, &payload_to_send, backend_thresh).await.map_err(from_backend)?;
                 }
 
                 #[allow(unreachable_code)]
@@ -988,7 +1048,12 @@ async fn request_switch<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let reject = |reason: &str| format!(r#"{{"text":"{}","color":"red"}}"#, reason);
+    // `server` is client-controlled (server-selector / transfer plugin
+    // message payload) and gets embedded in this message below — build
+    // it with `serde_json` rather than hand-rolled string formatting so
+    // a server name containing `"` or `\` can't break out of the chat
+    // JSON and corrupt or inject into the rendered component.
+    let reject = |reason: &str| serde_json::json!({ "text": reason, "color": "red" }).to_string();
 
     let message = match state.server_registry.get(server) {
         Some(b) if b.is_online() => {
@@ -1071,60 +1136,4 @@ async fn handle_transfer_command(
             .ok()
         },
     }
-}
-
-/// Best-effort decode of a clientbound PluginMessage payload's channel
-/// name. Returns `None` if the payload doesn't decode as a VarInt-id +
-/// VarInt-prefixed UTF-8 channel — which is the case for almost every
-/// non-plugin-message packet, so the caller passes a packet body and
-/// this function safely returns `None` for bodies that aren't actually
-/// plugin messages.
-///
-/// The shape we look for matches modern (1.13+) plugin messages:
-/// `[VarInt id][VarInt channel_len][channel UTF-8 bytes][...payload]`.
-/// Pre-1.13 plugin messages used a UCS-2 BE channel; those aren't
-/// detected here, which is correct because ViaVersion's
-/// `vv:proxy_details` channel only appears on modern (post-1.13)
-/// connections where the proxy actually needs to translate.
-/// Build the plain-text chat line shown to a muted player when they try to
-/// speak. Permanent mutes (no `expires_at`) say so explicitly; timed mutes
-/// render the remaining time in a human-readable form. Plain text (not a
-/// JSON component) because [`build_system_message_packet`] wraps it.
-pub(crate) fn build_mute_notice(mute: &crate::session::MuteState) -> String {
-    let duration = match mute.expires_at {
-        None => "permanently".to_string(),
-        Some(exp) => {
-            let remaining = exp
-                .signed_duration_since(chrono::Utc::now().naive_utc())
-                .num_seconds()
-                .max(0);
-            format!("for {}", format_remaining(remaining))
-        },
-    };
-    format!(
-        "§cYou are muted {} and cannot chat. §7Reason: {}",
-        duration, mute.reason
-    )
-}
-
-/// Render a remaining-seconds count as e.g. `2d 3h 4m`, `5m 10s`, `30s`.
-fn format_remaining(total_secs: i64) -> String {
-    let days = total_secs / 86_400;
-    let hours = (total_secs % 86_400) / 3_600;
-    let mins = (total_secs % 3_600) / 60;
-    let secs = total_secs % 60;
-    let mut parts = Vec::new();
-    if days > 0 {
-        parts.push(format!("{}d", days));
-    }
-    if hours > 0 {
-        parts.push(format!("{}h", hours));
-    }
-    if mins > 0 {
-        parts.push(format!("{}m", mins));
-    }
-    if secs > 0 || parts.is_empty() {
-        parts.push(format!("{}s", secs));
-    }
-    parts.join(" ")
 }

@@ -414,6 +414,7 @@ impl<'a> LimboHandler<'a> {
                     ka_id = ka_id.wrapping_add(1);
                     tracing::trace!(player = %username, keepalive_id = ka_id, "Sending keepalive");
                     self.send_keepalive(ka_id).await?;
+                    self.send_queue_position_update().await?;
                 }
                 // Clone the Notify Arc out of self before the select!
                 // so the `self.read_and_discard()` mutable borrow on
@@ -906,19 +907,82 @@ impl<'a> LimboHandler<'a> {
         self.send_built(built).await
     }
 
-    async fn try_connect_backend(&self) -> Option<TcpStream> {
-        let username = self.session.read().await.username.clone();
+    /// If queueing is enabled and this player is currently queued for their
+    /// candidate backend, send a "Position in queue: N" chat line. A no-op
+    /// (not an error) when queueing is off, no candidate resolves, or the
+    /// player isn't actually queued (e.g. the backend isn't full).
+    async fn send_queue_position_update(&mut self) -> Result<(), ConnectionError> {
+        if !self.state.config.queue.enabled {
+            return Ok(());
+        }
+        let Some(backend) = self.candidate_backend() else {
+            return Ok(());
+        };
+        let uuid = self.session.read().await.uuid;
+        let Some(position) = self.state.queue_manager.position(&backend.name, uuid).await else {
+            return Ok(());
+        };
 
-        let backend = match &self.target_server {
+        let text = format!(
+            "§ePosition in queue for §f{}§e: §6{}",
+            backend.name, position
+        );
+        let raw = crate::packet_builder::build_system_message_packet(&text, self.protocol_version);
+        crate::packet_io::write_client_packet(
+            &mut *self.stream,
+            &raw,
+            self.protocol_version,
+            self.compression_threshold,
+        )
+        .await
+    }
+
+    /// Resolve the backend limbo would currently try to connect to — the
+    /// pinned `target_server` if set, otherwise whatever the routing rules
+    /// pick right now. Shared by `try_connect_backend` and the queue
+    /// position-update check, so both agree on "which server am I waiting
+    /// for" without dialing anything.
+    fn candidate_backend(&self) -> Option<Arc<crate::server::BackendServer>> {
+        match &self.target_server {
             Some(name) => {
                 let b = self.state.server_registry.get(name)?;
                 if !b.is_online() {
                     return None;
                 }
-                b
+                Some(b)
             },
-            None => self.state.routing.select(&self.state.server_registry)?,
-        };
+            None => self.state.routing.select(&self.state.server_registry),
+        }
+    }
+
+    async fn try_connect_backend(&self) -> Option<TcpStream> {
+        let username = self.session.read().await.username.clone();
+
+        let backend = self.candidate_backend()?;
+
+        // Full-server connection queueing: never dial a backend at capacity.
+        // Enqueue (idempotent — a no-op if already queued) and keep polling;
+        // limbo's own loop already retries every `POLL_INTERVAL`. Once the
+        // backend has a free slot, only the queue's front player is let
+        // through, so multiple queued limbo pollers don't race the same slot.
+        if self.state.config.queue.enabled {
+            let uuid = self.session.read().await.uuid;
+            if backend.is_full() {
+                if let Err(reason) = self.state.queue_manager.enqueue(&backend.name, uuid).await {
+                    tracing::debug!(player = %username, server = %backend.name, reason, "connection queue full");
+                }
+                return None;
+            }
+            if !self
+                .state
+                .queue_manager
+                .is_front_or_unqueued(&backend.name, uuid)
+                .await
+            {
+                return None;
+            }
+        }
+
         tracing::debug!(
             player = %username,
             server = %backend.name,
@@ -958,6 +1022,10 @@ impl<'a> LimboHandler<'a> {
                     server = %backend.name,
                     "Backend connection successful (limbo)"
                 );
+                if self.state.config.queue.enabled {
+                    let uuid = self.session.read().await.uuid;
+                    self.state.queue_manager.remove(&backend.name, uuid).await;
+                }
                 Some(stream)
             },
             Err(e) => {

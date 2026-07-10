@@ -13,10 +13,13 @@
 //! A rule with neither matcher set matches everything (and so acts as a
 //! catch-all if placed last).
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::region_selector::select_lobby_by_region;
+use kojacoord_config::{GroupStrategy, ServerGroupConfig};
+
+use crate::region_selector::{select_lobby_by_region, GeoIpResolver};
 use crate::server::{BackendServer, ServerRegistry};
 
 /// A single routing rule. All matchers that ARE set must match; any matcher
@@ -40,6 +43,11 @@ pub struct RouteRule {
 pub struct RoutingRules {
     pub default_server: String,
     pub rules: Vec<RouteRule>,
+    geoip: GeoIpResolver,
+    /// Named backend pools, keyed by `ServerGroupConfig.name`. A
+    /// `RouteRule.target` / `default_server` that names a group resolves
+    /// through [`Self::resolve_target`] instead of a literal server lookup.
+    server_groups: HashMap<String, ServerGroupConfig>,
 }
 
 impl RoutingRules {
@@ -47,6 +55,8 @@ impl RoutingRules {
         Self {
             default_server,
             rules: Vec::new(),
+            geoip: GeoIpResolver::disabled(),
+            server_groups: HashMap::new(),
         }
     }
 
@@ -54,13 +64,49 @@ impl RoutingRules {
         Self {
             default_server,
             rules,
+            geoip: GeoIpResolver::disabled(),
+            server_groups: HashMap::new(),
+        }
+    }
+
+    /// Full constructor: region-aware lobby selection backed by a loaded
+    /// (or absent) GeoIP database, plus named backend-pool resolution.
+    pub fn with_rules_geoip_and_groups(
+        default_server: String,
+        rules: Vec<RouteRule>,
+        geoip: GeoIpResolver,
+        server_groups: Vec<ServerGroupConfig>,
+    ) -> Self {
+        Self {
+            default_server,
+            rules,
+            geoip,
+            server_groups: server_groups
+                .into_iter()
+                .map(|g| (g.name.clone(), g))
+                .collect(),
+        }
+    }
+
+    /// Resolve a `RouteRule.target` / `default_server` value to a live
+    /// backend: if `name` names a `[[server_groups]]` entry, pick a member
+    /// per its configured strategy; otherwise treat it as a literal
+    /// `[[servers]].name` (the pre-existing, still-fully-supported
+    /// behaviour — this only adds a lookup, never removes one).
+    fn resolve_target(&self, name: &str, registry: &ServerRegistry) -> Option<Arc<BackendServer>> {
+        match self.server_groups.get(name) {
+            Some(group) => select_from_group(group, registry),
+            None => registry.get(name).filter(|s| s.is_online()),
         }
     }
 
     /// Legacy default-only selection (used when player context isn't known
     /// yet — e.g. for the routing-rule fallback or the first lobby pass).
     pub fn select(&self, registry: &ServerRegistry) -> Option<Arc<BackendServer>> {
-        select_default_then_any(&self.default_server, registry)
+        if let Some(s) = self.resolve_target(&self.default_server, registry) {
+            return Some(s);
+        }
+        registry.all().into_iter().find(|s| s.is_online())
     }
 
     /// Select with region-aware fallback for lobby servers
@@ -76,7 +122,7 @@ impl RoutingRules {
             let region_mappings = std::collections::HashMap::new();
 
             if let Some(region_server_name) =
-                select_lobby_by_region(ip, &available_servers, &region_mappings)
+                select_lobby_by_region(ip, &available_servers, &self.geoip, &region_mappings)
             {
                 if let Some(server) = registry.get(&region_server_name) {
                     if server.is_online() {
@@ -104,34 +150,86 @@ impl RoutingRules {
             if !rule_matches(rule, player_name, client_ip) {
                 continue;
             }
-            if let Some(s) = registry.get(&rule.target) {
-                if s.is_online() {
-                    tracing::debug!(
-                        rule = %rule.label,
-                        target = %rule.target,
-                        player = %player_name,
-                        "routing rule matched"
-                    );
-                    return Some(s);
-                }
-                tracing::trace!(
+            if let Some(s) = self.resolve_target(&rule.target, registry) {
+                tracing::debug!(
                     rule = %rule.label,
                     target = %rule.target,
-                    "routing rule matched but target offline; trying next"
+                    player = %player_name,
+                    "routing rule matched"
                 );
+                return Some(s);
             }
+            tracing::trace!(
+                rule = %rule.label,
+                target = %rule.target,
+                "routing rule matched but target unavailable; trying next"
+            );
         }
         self.select(registry)
     }
 }
 
-fn select_default_then_any(default: &str, registry: &ServerRegistry) -> Option<Arc<BackendServer>> {
-    if let Some(s) = registry.get(default) {
-        if s.is_online() {
-            return Some(s);
-        }
+/// Pick a member of `group` per its configured strategy. Only online,
+/// non-full (`BackendServer::is_full`) members are eligible — a full
+/// member is exactly what `net::queue` exists to handle via the group's
+/// *individual* servers, not by silently overflowing onto another member.
+fn select_from_group(
+    group: &ServerGroupConfig,
+    registry: &ServerRegistry,
+) -> Option<Arc<BackendServer>> {
+    let candidates: Vec<Arc<BackendServer>> = group
+        .members
+        .iter()
+        .filter_map(|name| registry.get(name))
+        .filter(|s| s.is_online() && !s.is_full())
+        .collect();
+
+    match group.strategy {
+        GroupStrategy::LeastConnections => candidates.into_iter().min_by_key(|s| s.player_count()),
+        GroupStrategy::Latency => {
+            // Members with no latency reading yet (0 = "unknown", either no
+            // successful probe yet or health probing disabled) sort last —
+            // prefer a server we've actually measured over an unknown one.
+            candidates.into_iter().min_by_key(|s| {
+                let latency = s.latency_ms();
+                if latency == 0 {
+                    u64::MAX
+                } else {
+                    latency
+                }
+            })
+        },
+        GroupStrategy::Weighted => weighted_pick(&candidates),
     }
-    registry.all().into_iter().find(|s| s.is_online())
+}
+
+/// Weighted-random pick: each candidate's chance is proportional to its
+/// `weight` (default 1 — equal odds). A member with `weight == 0` is never
+/// picked. Falls back to a uniform pick if every candidate is weight 0
+/// (misconfiguration) rather than returning `None` outright.
+fn weighted_pick(candidates: &[Arc<BackendServer>]) -> Option<Arc<BackendServer>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let total_weight: u64 = candidates.iter().map(|s| s.weight as u64).sum();
+    if total_weight == 0 {
+        return candidates.first().cloned();
+    }
+    let mut roll = {
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..total_weight)
+    };
+    for candidate in candidates {
+        let w = candidate.weight as u64;
+        if roll < w {
+            return Some(candidate.clone());
+        }
+        roll -= w;
+    }
+    // Unreachable given the sum/roll invariant above, but fall back to the
+    // last candidate rather than panicking if float/int edge cases ever
+    // let the loop fall through.
+    candidates.last().cloned()
 }
 
 fn rule_matches(rule: &RouteRule, player_name: &str, client_ip: Option<IpAddr>) -> bool {
@@ -187,8 +285,10 @@ fn glob_match_ci(pattern: &str, name: &str) -> bool {
 }
 
 /// CIDR membership check. Accepts `"<ip>/<prefix>"` for either IPv4 or IPv6.
-/// Bad input returns `false` rather than panicking.
-fn cidr_matches(cidr: &str, ip: IpAddr) -> bool {
+/// Bad input returns `false` rather than panicking. `pub(crate)` so
+/// `net::ip_reputation`'s static blocklist can reuse the same matcher
+/// instead of re-implementing CIDR parsing.
+pub(crate) fn cidr_matches(cidr: &str, ip: IpAddr) -> bool {
     let Some((net_str, prefix_str)) = cidr.split_once('/') else {
         // Bare IP — treat as a /32 or /128 host match.
         if let Ok(parsed) = net_str_parse(cidr) {
@@ -318,5 +418,105 @@ mod tests {
         assert!(!rule_matches(&rule, "alice", Some(internal)));
         // Missing IP context with a CIDR-restricted rule = no match.
         assert!(!rule_matches(&rule, "vip_alice", None));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_backend(
+        name: &str,
+        weight: u32,
+        latency_ms: u64,
+        player_count: usize,
+        max_players: usize,
+    ) -> Arc<BackendServer> {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+        Arc::new(BackendServer {
+            name: name.to_string(),
+            address: "127.0.0.1:25565".parse().unwrap(),
+            restricted: false,
+            forwarding_override: None,
+            player_count: Arc::new(AtomicUsize::new(player_count)),
+            online: Arc::new(AtomicBool::new(true)),
+            connection_pool: None,
+            backend_type: Default::default(),
+            compression_threshold: 0,
+            cipher_suites: String::new(),
+            health_probe_interval_secs: 0,
+            health_probe_timeout_secs: 5,
+            health_probe_fail_threshold: 3,
+            health_fail_count: Arc::new(AtomicU32::new(0)),
+            health_unhealthy: Arc::new(AtomicBool::new(false)),
+            region: String::new(),
+            max_players,
+            weight,
+            last_latency_ms: Arc::new(AtomicU64::new(latency_ms)),
+        })
+    }
+
+    fn group(members: &[&str], strategy: GroupStrategy) -> ServerGroupConfig {
+        ServerGroupConfig {
+            name: "test-group".into(),
+            members: members.iter().map(|s| s.to_string()).collect(),
+            strategy,
+        }
+    }
+
+    /// Build a registry directly from pre-built backends, bypassing
+    /// `ServerRegistry::register`'s async connection-pool setup — irrelevant
+    /// for these pure-selection-logic tests (`connection_pool: None` above).
+    fn registry_of(servers: Vec<Arc<BackendServer>>) -> ServerRegistry {
+        let registry = ServerRegistry::new();
+        for s in servers {
+            registry.insert_raw(s);
+        }
+        registry
+    }
+
+    #[test]
+    fn select_from_group_least_connections_picks_emptiest_member() {
+        let registry = registry_of(vec![
+            test_backend("a", 1, 0, 10, 0),
+            test_backend("b", 1, 0, 2, 0),
+        ]);
+        let g = group(&["a", "b"], GroupStrategy::LeastConnections);
+        let picked = select_from_group(&g, &registry).unwrap();
+        assert_eq!(picked.name, "b");
+    }
+
+    #[test]
+    fn select_from_group_latency_prefers_measured_and_lower() {
+        // Members with 0 latency (unmeasured) must never win over a
+        // measured one, and among measured members the lowest wins.
+        let registry = registry_of(vec![
+            test_backend("a", 1, 0, 0, 0), // unmeasured
+            test_backend("b", 1, 50, 0, 0),
+            test_backend("c", 1, 10, 0, 0),
+        ]);
+        let g = group(&["a", "b", "c"], GroupStrategy::Latency);
+        let picked = select_from_group(&g, &registry).unwrap();
+        assert_eq!(picked.name, "c");
+    }
+
+    #[test]
+    fn select_from_group_skips_full_members() {
+        let registry = registry_of(vec![
+            test_backend("full", 1, 0, 5, 5),
+            test_backend("ok", 1, 0, 0, 0),
+        ]);
+        let g = group(&["full", "ok"], GroupStrategy::LeastConnections);
+        let picked = select_from_group(&g, &registry).unwrap();
+        assert_eq!(picked.name, "ok");
+    }
+
+    #[test]
+    fn select_from_group_weighted_never_picks_zero_weight_when_alternative_exists() {
+        let registry = registry_of(vec![
+            test_backend("zero", 0, 0, 0, 0),
+            test_backend("some", 5, 0, 0, 0),
+        ]);
+        let g = group(&["zero", "some"], GroupStrategy::Weighted);
+        for _ in 0..20 {
+            let picked = select_from_group(&g, &registry).unwrap();
+            assert_eq!(picked.name, "some");
+        }
     }
 }

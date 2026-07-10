@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kojacoord-config
-  namespace: default
+  namespace: kojacoord-system
 data:
   config.toml: |
     [proxy]
@@ -24,10 +24,6 @@ data:
     restricted = false
     backend_type = "vanilla"
 
-    [database]
-    # Injected at runtime via KOJA_DATABASE__URL from the kojacoord-secrets Secret.
-    max_connections = 10
-
     [anticheat]
     enabled = true
     strict_mode = false
@@ -38,11 +34,6 @@ data:
     # via KOJA_SERVER_MANAGEMENT__AUTH_TOKEN from the kojacoord-secrets Secret.
     enabled = true
     bind = "0.0.0.0:8080"
-
-    [http_api]
-    # auth_token injected via KOJA_HTTP_API__AUTH_TOKEN from the Secret.
-    enabled = true
-    bind = "0.0.0.0:8081"
 
     [cluster]
     enabled = false

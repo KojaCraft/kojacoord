@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kojacoord-proxy
-  namespace: default
+  namespace: kojacoord-system
   labels:
     app: kojacoord-proxy
     version: v1
@@ -23,6 +23,19 @@ spec:
       - name: kojacoord-proxy
         image: kojacoord/proxy:latest
         imagePullPolicy: IfNotPresent
+        # `namespace.yaml` enforces the `restricted` Pod Security Standard on
+        # kojacoord-system, which REQUIRES allowPrivilegeEscalation: false, all
+        # capabilities dropped, and a seccomp profile — without these the
+        # admission controller rejects this pod outright. None of them cost the
+        # proxy anything: it's a plain TCP/HTTP service, doesn't need to escalate
+        # privileges, use raw sockets, or run custom seccomp syscalls.
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          seccompProfile:
+            type: RuntimeDefault
         ports:
         - name: minecraft
           containerPort: 25577
@@ -30,16 +43,11 @@ spec:
         - name: server-mgmt
           containerPort: 8080
           protocol: TCP
-        - name: http-api
-          containerPort: 8081
-          protocol: TCP
         env:
-        - name: SQLX_OFFLINE
-          value: "true"
         - name: RUST_LOG
           value: "info"
-        # Secrets (DB URL, control-plane tokens) are injected from a Secret as
-        # KOJA_*__* env vars, which override the TOML config at startup.
+        # Control-plane tokens are injected from a Secret as KOJA_*__* env
+        # vars, which override the TOML config at startup.
         envFrom:
         - secretRef:
             name: kojacoord-secrets
@@ -47,8 +55,6 @@ spec:
         - name: config
           mountPath: /app/config.toml
           subPath: config.toml
-        - name: data
-          mountPath: /app/data
         - name: plugins
           mountPath: /app/plugins
         - name: logs
@@ -60,18 +66,20 @@ spec:
           limits:
             memory: "1Gi"
             cpu: "1000m"
+        # The proxy has no inbound HTTP surface to probe (see
+        # `services/http_api.rs` removal — it's a pure TCP relay), so a raw
+        # TCP-connect check against the Minecraft port is the only
+        # universally-available liveness signal.
         livenessProbe:
-          httpGet:
-            path: /api/health
-            port: 8081
+          tcpSocket:
+            port: 25577
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
         readinessProbe:
-          httpGet:
-            path: /api/health
-            port: 8081
+          tcpSocket:
+            port: 25577
           initialDelaySeconds: 10
           periodSeconds: 5
           timeoutSeconds: 3
@@ -80,9 +88,6 @@ spec:
       - name: config
         configMap:
           name: kojacoord-config
-      - name: data
-        persistentVolumeClaim:
-          claimName: kojacoord-data
       - name: plugins
         persistentVolumeClaim:
           claimName: kojacoord-plugins
@@ -106,21 +111,8 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: kojacoord-data
-  namespace: default
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 1Gi
-  storageClassName: standard
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
   name: kojacoord-plugins
-  namespace: default
+  namespace: kojacoord-system
 spec:
   accessModes:
     - ReadWriteOnce
@@ -133,7 +125,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: kojacoord-logs
-  namespace: default
+  namespace: kojacoord-system
 spec:
   accessModes:
     - ReadWriteOnce

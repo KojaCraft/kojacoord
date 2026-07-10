@@ -11,7 +11,7 @@
 //! from different tasks without coordination.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kojacoord_config::{BackendType, ForwardingMode};
@@ -43,6 +43,17 @@ pub struct BackendServer {
     pub health_unhealthy: Arc<AtomicBool>,
     /// Region for this server (e.g., "us-east", "eu-west", "asia")
     pub region: String,
+    /// Capacity for [`net::queue`](crate::net::queue)'s full-server
+    /// connection queueing. `0` means unlimited (never queues).
+    pub max_players: usize,
+    /// Relative weight for `[[server_groups]]` `"weighted"` selection.
+    /// Meaningless outside a group. Default 1 (equal weighting).
+    pub weight: u32,
+    /// Last measured TCP-connect latency in milliseconds, updated by
+    /// `health_probe`'s existing probe loop. `0` until the first successful
+    /// probe (or if health probing is disabled for this server) — treated
+    /// as "unknown, don't prefer or penalize" by `"latency"` group selection.
+    pub last_latency_ms: Arc<AtomicU64>,
 }
 
 impl BackendServer {
@@ -52,6 +63,16 @@ impl BackendServer {
 
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
+    }
+
+    /// True once `player_count` has reached the configured `max_players`.
+    /// Always `false` when `max_players == 0` (unlimited).
+    pub fn is_full(&self) -> bool {
+        self.max_players != 0 && self.player_count() >= self.max_players
+    }
+
+    pub fn latency_ms(&self) -> u64 {
+        self.last_latency_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -70,6 +91,15 @@ impl ServerRegistry {
         let pool = Arc::new(BackendConnectionPool::new(server.address, 10));
         server.connection_pool = Some(pool);
         self.servers.insert(server.name.clone(), Arc::new(server));
+    }
+
+    /// Insert an already-built `Arc<BackendServer>` directly, skipping the
+    /// connection-pool setup `register` does. Only meaningful for tests
+    /// that construct a `BackendServer` with `connection_pool: None` on
+    /// purpose (routing/selection-logic tests don't need a live pool).
+    #[cfg(test)]
+    pub(crate) fn insert_raw(&self, server: Arc<BackendServer>) {
+        self.servers.insert(server.name.clone(), server);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<BackendServer>> {

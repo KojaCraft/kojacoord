@@ -12,7 +12,7 @@ use crate::transfer::TransferCommand;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -59,6 +59,15 @@ pub struct PlayerTransfer {
 pub struct ServerEvacuation {
     pub from_server: String,
     pub to_server: String,
+    pub auth_token: String,
+}
+
+/// Flip the live maintenance-mode flag (`ProxyState::maintenance_enabled`)
+/// without a config edit or restart. `bypass_uuids`/`kick_message` still
+/// come from config — only the on/off switch is live over this channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceToggle {
+    pub enabled: bool,
     pub auth_token: String,
 }
 
@@ -129,6 +138,8 @@ impl ServerManagementServer {
             self.handle_player_transfer(transfer, &mut stream).await?;
         } else if let Ok(evacuation) = serde_json::from_str::<ServerEvacuation>(&line) {
             self.handle_evacuation(evacuation, &mut stream).await?;
+        } else if let Ok(toggle) = serde_json::from_str::<MaintenanceToggle>(&line) {
+            self.handle_maintenance_toggle(toggle, &mut stream).await?;
         } else {
             warn!("Failed to parse message as any known type");
             stream.write_all(b"ERROR: Invalid message format\n").await?;
@@ -190,6 +201,9 @@ impl ServerManagementServer {
             health_fail_count: Arc::new(AtomicU32::new(0)),
             health_unhealthy: Arc::new(AtomicBool::new(false)),
             region: String::new(),
+            max_players: registration.max_players as usize,
+            weight: 1,
+            last_latency_ms: Arc::new(AtomicU64::new(0)),
         };
 
         self.state.server_registry.register(server).await;
@@ -322,6 +336,41 @@ impl ServerManagementServer {
         );
         stream
             .write_all(format!("OK: Evacuated {} players\n", count).as_bytes())
+            .await?;
+
+        Ok(())
+    }
+
+    async fn handle_maintenance_toggle(
+        &self,
+        toggle: MaintenanceToggle,
+        stream: &mut TcpStream,
+    ) -> anyhow::Result<()> {
+        if !crate::services::constant_time_eq(
+            toggle.auth_token.as_bytes(),
+            self.auth_token.as_bytes(),
+        ) {
+            warn!("Invalid auth token for maintenance toggle");
+            stream.write_all(b"ERROR: Invalid auth token\n").await?;
+            return Ok(());
+        }
+
+        self.state
+            .maintenance_enabled
+            .store(toggle.enabled, Ordering::Relaxed);
+        info!(enabled = toggle.enabled, "Maintenance mode toggled");
+        stream
+            .write_all(
+                format!(
+                    "OK: Maintenance mode {}\n",
+                    if toggle.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
+                .as_bytes(),
+            )
             .await?;
 
         Ok(())

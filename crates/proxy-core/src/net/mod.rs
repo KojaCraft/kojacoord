@@ -10,6 +10,7 @@
 pub mod connection;
 pub mod connection_pool;
 pub mod connection_throttle;
+pub mod ip_reputation;
 pub mod limbo;
 pub mod limbo_packets;
 pub mod login_packets;
@@ -22,5 +23,7 @@ pub mod plugin_decoder;
 
 /// PROXY protocol support for reading real client IPs from upstream load balancers.
 pub mod proxy_protocol;
+pub mod query;
+pub mod queue;
 pub mod registry_data;
 pub mod relay;

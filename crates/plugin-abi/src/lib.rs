@@ -214,33 +214,6 @@ pub enum PluginCommand {
     BroadcastMessage {
         message: String,
     },
-    /// Mute a player's chat. `duration_secs` is `None` (or `<= 0`) for a
-    /// permanent mute.
-    MutePlayer {
-        uuid: Uuid,
-        reason: String,
-        duration_secs: Option<i64>,
-    },
-    /// Lift a player's mute (DB + live session).
-    UnmutePlayer {
-        uuid: Uuid,
-    },
-    /// Ban a player. `duration_secs` is `None` (or `<= 0`) for a permanent ban.
-    BanPlayer {
-        uuid: Uuid,
-        reason: String,
-        duration_secs: Option<i64>,
-    },
-    /// Record a warning against a player and, if online, deliver the reason.
-    WarnPlayer {
-        uuid: Uuid,
-        reason: String,
-    },
-    UpdatePlayerStatus {
-        uuid: Uuid,
-        server: Option<String>,
-        online: bool,
-    },
     /// Customize the limbo world shown to players while no backend is
     /// available. Each field is `None` to leave that aspect at its default.
     SetLimboCustomization {
